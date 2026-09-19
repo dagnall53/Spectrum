@@ -2,6 +2,7 @@ import sys
 import threading
 import numpy as np
 import os, ctypes
+import time
 target_dir = r"C:\Spectrum"
 # add the Current directory as it contains the crucial dll and retry
 # os.add_dll_directory(target_dir)
@@ -12,7 +13,7 @@ from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 
 init_done = False
-
+ENABLE_DRIVER_SELECTION=False
 # # ---- SWEEP PROFILE ( variables) ----
 START_FREQ = 95e6       # 150 kHz
 STOP_FREQ  = 102e6        # 30 MHz
@@ -35,35 +36,67 @@ class EmcScanner(QtWidgets.QMainWindow):
             QtCore.Q_ARG(str, msg)
         )
     
+    # Use this to build centers across the sweep band
+    # start_hz, stop_hz, sample_rate are floats
+    def build_centers(self, start_hz, stop_hz, sample_rate):
+                # first center is half a block above start
+                first = start_hz + (sample_rate / 2.0)
+                # stop is exclusive; np.arange will stop before stop_hz
+                return np.arange(first, stop_hz, sample_rate, dtype=np.float64)
+
+    def draw_block_markers(self):
+            # remove old markers
+            for item in self._block_markers:
+                    try:
+                            self.plot.removeItem(item)
+                    except Exception:
+                            pass
+            self._block_markers.clear()
+             # draw new markers for each center
+            half = SAMPLE_RATE / 2.0
+            for c in self.centers:
+                    left = c - half
+                    right = c + half
+                    # vertical lines at left and right
+                    line_l = pg.InfiniteLine(pos=left, angle=90, pen=pg.mkPen('g', width=1))
+                    line_r = pg.InfiniteLine(pos=right, angle=90, pen=pg.mkPen('g', width=1))
+                    self.plot.addItem(line_l)
+                    self.plot.addItem(line_r)
+                    self._block_markers.append(line_l)
+                    self._block_markers.append(line_r)
+
+
     def __init__(self):
         super().__init__()
 
         # ---- Driver selection at startup ----
         driver_dirs = {
-            "Default (MSVC RTL-SDR Blog V4)": "C:/Spectrum/drivers/default",
-            "MS64 (libusb alt)": "C:/Spectrum/drivers/ms64",
-            "SDRSharp drivers Copy": "C:/Spectrum/drivers/sdrsharp",
-            "Experimental": "C:/Spectrum/drivers/experimental"
+                "Default (MSVC RTL-SDR Blog V4)": "C:/Spectrum/drivers/default",
+                "MS64 (libusb alt)": "C:/Spectrum/drivers/ms64",
+                "SDRSharp drivers Copy": "C:/Spectrum/drivers/sdrsharp",
+                "Experimental": "C:/Spectrum/drivers/experimental"
         }
 
-        items = list(driver_dirs.keys())
-        choice, ok = QtWidgets.QInputDialog.getItem(
-            self,
-            "Select RTL-SDR Driver",
-            "Choose driver set:",
-            items,
-            0,
-            False
-        )
-
-        if ok:
-            self.driver_path = driver_dirs[choice]
+        if ENABLE_DRIVER_SELECTION:
+                items = list(driver_dirs.keys())
+                choice, ok = QtWidgets.QInputDialog.getItem(
+                        self,
+                        "Select RTL-SDR Driver",
+                        "Choose driver set:",
+                        items,
+                        0,
+                        False
+                )
+                if ok:
+                        self.driver_path = driver_dirs[choice]
+                else:
+                        self.driver_path = driver_dirs["Default (MSVC RTL-SDR Blog V4)"]
         else:
-            self.driver_path = driver_dirs["Default (MSVC RTL-SDR Blog V4)"]
+                # Deterministic default path when selection is disabled
+                self.driver_path = driver_dirs["Default (MSVC RTL-SDR Blog V4)"]
 
+        # Ensure DLL path is active before importing the driver
         os.add_dll_directory(self.driver_path)
-        # Now import the driver AFTER the DLL path is set
-
 
         # ---- Window title ----
         self.setWindowTitle("EMC FAST Sweep 150 kHz – 30 MHz")
@@ -72,7 +105,14 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sdr = None
 
         # Sweep centers
-        self.centers = np.arange(START_FREQ, STOP_FREQ, SAMPLE_RATE, dtype=np.float64)
+        self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
+                # Diagnostic: show centers and expected block ranges (MHz)
+        print("INIT Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
+        block_width_hz = SAMPLE_RATE
+        ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
+        print("     Diagnostic: expected block ranges (MHz):",
+              [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
+
 
         # ---- GUI ----
         cw = QtWidgets.QWidget()
@@ -110,14 +150,14 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.plot.addItem(self.mouse_text)
 
         def mouse_info(evt):
-            vb = self.plot.getViewBox()
-            if vb is None:
-                return
-            pos = vb.mapSceneToView(evt)
-            freq = pos.x()
-            level = pos.y()
-            self.mouse_text.setText(f"{freq:,.0f} Hz\n{level:.1f} dB")
-            self.mouse_text.setPos(freq, level)
+                vb = self.plot.getViewBox()
+                if vb is None:
+                        return
+                pos = vb.mapSceneToView(evt)
+                freq = pos.x()
+                level = pos.y()
+                self.mouse_text.setText(f"{freq:,.0f} Hz\n{level:.1f} dB")
+                self.mouse_text.setPos(freq, level)
 
         self.plot.scene().sigMouseMoved.connect(mouse_info)
 
@@ -125,6 +165,12 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         self.plot_signals = PlotSignals()
         self.plot_signals.update.connect(self.set_plot_data)
+
+        # Add this in __init__ after creating self.plot
+        self._block_markers = []   # list of (line_left, line_right) or shaded items
+
+
+
 
         # ---- Control buttons ----
         ctrl_layout = QtWidgets.QHBoxLayout()
@@ -190,15 +236,17 @@ class EmcScanner(QtWidgets.QMainWindow):
         real_print = builtins.print
 
         def gui_print(*args, **kwargs):
-            text = " ".join(str(a) for a in args)
-            self.log(text)
-            real_print(*args, **kwargs)
+                text = " ".join(str(a) for a in args)
+                self.log(text)
+                real_print(*args, **kwargs)
 
         builtins.print = gui_print
 
         # ---- Final startup log ----
         self.log(f"Using driver path: {self.driver_path}")
         self.log("Setup complete")
+
+
 
     def init_sdr(self):
         # --- Always close any previous handle ---
@@ -308,7 +356,16 @@ class EmcScanner(QtWidgets.QMainWindow):
         if START_FREQ == STOP_FREQ:   
             self.centers = np.array([START_FREQ], dtype=np.float64)
         else:
-            self.centers = np.arange(START_FREQ, STOP_FREQ, SAMPLE_RATE, dtype=np.float64)
+            self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
+        # Diagnostic: show centers and expected block ranges (MHz)
+        print("PRESET Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
+        block_width_hz = SAMPLE_RATE
+        ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
+        print("       Diagnostic: expected block ranges (MHz):",
+              [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
+        # after self.centers = ... in __init__, set_preset, start_continuous:
+        self.draw_block_markers()
+
 
     
         # Reapply SDR settings (without re‑opening device)
@@ -362,47 +419,70 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(" STOP SWEEP ")
         self.stop_flag.set()
 
-
     def sweep_loop(self):
         window = np.hanning(NFFT)
-
-        fft_bw = SAMPLE_RATE
-        half_bw = fft_bw / 2.0
-
         for i, fc in enumerate(self.centers):
-            if self.stop_flag.is_set():
-                break
+                if self.stop_flag.is_set():
+                        break
+                # Diagnostic: about to tune this block
+                print(f"sweep_loop: i={i}, planned_center={fc/1e6:.6f} MHz")
+                # Tune and settle
+                self.sdr.center_freq = float(fc)
+                # Diagnostic: confirm device reports center (if API supports get)
+                try:
+                        reported = getattr(self.sdr, "center_freq", None)
+                        if reported is not None:
+                                print(f"sweep_loop: device center_freq={reported/1e6:.6f} MHz")
+                except Exception:
+                        pass
+                time.sleep(0.05)   # allow tuner/AGC to settle
 
-            # Tune
-            self.sdr.center_freq = fc
 
-            # Read samples
-            samples = self.sdr.read_samples(NFFT)
-            # enforce correct length
-            samples = samples[:NFFT]
-            samples = samples.real.astype(np.float32) / 128.0
+                # Read samples and enforce length
+                samples = self.sdr.read_samples(NFFT)
+                samples = samples[:NFFT]
 
-            # FFT
-            spec = np.fft.fftshift(np.fft.fft(samples * window))
-            spec = spec / NFFT
-            psd = 20 * np.log10(np.abs(spec) + 1e-12)
-            psd = psd + 33.5
+                # Preserve complex IQ and normalize
+                if np.iscomplexobj(samples):
+                        samples = samples.astype(np.complex64) / 128.0
+                else:
+                        if samples.dtype == np.uint8:
+                                f = samples.astype(np.float32) - 128.0
+                        else:
+                                f = samples.astype(np.float32)
+                        if (f.size % 2) != 0:
+                                f = f[:-1]
+                        f = f.reshape(-1, 2)
+                        samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
 
-            # Frequency axis for this FFT block
-            freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / SAMPLE_RATE))
-            freqs = freqs + fc
+                # FFT
+                spec = np.fft.fftshift(np.fft.fft(samples * window))
+                spec = spec / NFFT
+                psd = 20 * np.log10(np.abs(spec) + 1e-12) + 33.5
 
-            # Store block in stitched spectrum
-            start = i * NFFT
-            stop = start + NFFT
+                # Frequency axis for this FFT block (use same fc)
+                freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / SAMPLE_RATE)) + float(fc)
 
-            self.freq_axis[start:stop] = freqs
-            self.power_axis[start:stop] = psd
+                # Diagnostic: show block frequency span and storage indices
+                fmin = freqs.min()
+                fmax = freqs.max()
+                start = i * NFFT
+                stop = start + NFFT
+                print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz stored at [{start}:{stop}]")
 
-            if i % 5 == 0:
-                self.update_plot()
+
+                # Store block in stitched spectrum
+                start = i * NFFT
+                stop = start + NFFT
+                self.freq_axis[start:stop] = freqs
+                self.power_axis[start:stop] = psd
+
+                if i % 5 == 0:
+                        self.update_plot()
 
         self.update_plot()
+
+
     def start_continuous(self):
         if self.sweep_thread and self.sweep_thread.is_alive():
             return
@@ -415,11 +495,24 @@ class EmcScanner(QtWidgets.QMainWindow):
         if START_FREQ == STOP_FREQ:
             self.centers = np.array([START_FREQ], dtype=np.float64)
         else:
-            self.centers = np.arange(START_FREQ, STOP_FREQ, SAMPLE_RATE, dtype=np.float64)
+            self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
+
+        # after self.centers = ... in __init__, set_preset, start_continuous:
+        self.draw_block_markers()
+
 
         # If single-center, tune SDR to that center; if multi-center, tune to first center
         if len(self.centers) >= 1:
             self.sdr.center_freq = float(self.centers[0])
+
+        # Diagnostic: show centers and expected block ranges (MHz)
+        print("Start Continuous Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
+        block_width_hz = SAMPLE_RATE
+        ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
+        print("         Diagnostic: expected block ranges (MHz):",
+              [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
+
+
 
         # Allocate buffers sized to the number of FFT blocks we will stitch
         total_bins = len(self.centers) * NFFT
@@ -429,35 +522,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Start repeating sweep in a thread
         self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
         self.sweep_thread.start()
-
-    # def start_continuous(self):
-
-        # if self.sweep_thread and self.sweep_thread.is_alive():
-            # return
-
-        # self.log("=== CONTINUOUS MODE STARTED ===")
-
-        # self.stop_flag.clear()
-        # self.init_sdr()
-
-        # # Force tuner to the current preset start frequency
-        # self.sdr.center_freq = START_FREQ
-
-        # # Continuous mode = single FFT at that frequency
-        # self.centers = np.array([START_FREQ], dtype=np.float64)
-
-        # # Allocate arrays for single capture
-
-        # self.centers = np.arange(START_FREQ, STOP_FREQ, SAMPLE_RATE, dtype=np.float64)
-
-        # total_bins = len(self.centers) * NFFT
-        # self.freq_axis = np.full(total_bins, np.nan, dtype=np.float64)
-        # self.power_axis = np.full(total_bins, -200.0, dtype=np.float64)
-
-
-        # self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
-        # self.sweep_thread.start()
-
 
     def continuous_loop(self):
         while not self.stop_flag.is_set():
