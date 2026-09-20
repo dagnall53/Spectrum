@@ -246,8 +246,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(f"Using driver path: {self.driver_path}")
         self.log("Setup complete")
 
-
-
     def init_sdr(self):
         # --- Always close any previous handle ---
         if self.sdr is not None:
@@ -314,8 +312,8 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.log("Setup 30M range")
 
         elif mode == "MVHF":
-            START_FREQ = 156e6
-            STOP_FREQ  = 162e6
+            START_FREQ = 150e6 #156e6
+            STOP_FREQ  = 172e6 #162e6
             #STEP_HZ    = 2.4e6
             SAMPLE_RATE = 2.4e6
             GAIN = 30
@@ -394,101 +392,61 @@ class EmcScanner(QtWidgets.QMainWindow):
         else:
             self.cispr_curve.hide()
 
-
     def start_sweep(self):
+        # Start a single fast stitched sweep (one-shot)
         if self.sweep_thread and self.sweep_thread.is_alive():
             return
         self.log("=== FAST SWEEP STARTED ===")
         self.log(f"Range: {START_FREQ/1e6:.3f} → {STOP_FREQ/1e6:.3f} MHz")
-        # self.log(f"Step: {STEP_HZ} Hz")
         self.log(f"Sample rate: {SAMPLE_RATE/1e6:.3f} MS/s")
         self.log(f"Gain: {GAIN} dB")
+
+        # Build centers from current preset (same logic as start_continuous)
+        if START_FREQ == STOP_FREQ:
+            self.centers = np.array([START_FREQ], dtype=np.float64)
+        else:
+            self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
+
+        # Diagnostic: show centers and expected block ranges (MHz)
+        print("start_sweep Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
+        block_width_hz = SAMPLE_RATE
+        ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
+        print("     Diagnostic: expected block ranges (MHz):",
+            [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
         self.log(f"Total hops: {len(self.centers)}")
 
-        self.stop_flag.clear()
-        self.init_sdr()
-
+        # Allocate and clear stitched arrays for this sweep
         total_bins = len(self.centers) * NFFT
+        if total_bins == 0:
+            print("start_sweep: no centers defined, aborting sweep")
+            return
+
         self.freq_axis = np.full(total_bins, np.nan, dtype=np.float64)
         self.power_axis = np.full(total_bins, -200.0, dtype=np.float64)
+        print(f"start_sweep: allocated freq_axis/power_axis length {total_bins}")
 
+        # Draw markers for visual debugging (safe call)
+        try:
+            self.draw_block_markers()
+        except Exception:
+            pass
+
+        # Start sweep thread
+        self.stop_flag.clear()
+        # init_sdr should be idempotent; it will skip reopen if already open
+        self.init_sdr()
         self.sweep_thread = threading.Thread(target=self.sweep_loop, daemon=True)
         self.sweep_thread.start()
 
-    def stop_sweep(self):
-        self.log(" STOP SWEEP ")
-        self.stop_flag.set()
-
-    def sweep_loop(self):
-        window = np.hanning(NFFT)
-        for i, fc in enumerate(self.centers):
-                if self.stop_flag.is_set():
-                        break
-                # Diagnostic: about to tune this block
-                print(f"sweep_loop: i={i}, planned_center={fc/1e6:.6f} MHz")
-                # Tune and settle
-                self.sdr.center_freq = float(fc)
-                # Diagnostic: confirm device reports center (if API supports get)
-                try:
-                        reported = getattr(self.sdr, "center_freq", None)
-                        if reported is not None:
-                                print(f"sweep_loop: device center_freq={reported/1e6:.6f} MHz")
-                except Exception:
-                        pass
-                time.sleep(0.05)   # allow tuner/AGC to settle
-
-
-                # Read samples and enforce length
-                samples = self.sdr.read_samples(NFFT)
-                samples = samples[:NFFT]
-
-                # Preserve complex IQ and normalize
-                if np.iscomplexobj(samples):
-                        samples = samples.astype(np.complex64) / 128.0
-                else:
-                        if samples.dtype == np.uint8:
-                                f = samples.astype(np.float32) - 128.0
-                        else:
-                                f = samples.astype(np.float32)
-                        if (f.size % 2) != 0:
-                                f = f[:-1]
-                        f = f.reshape(-1, 2)
-                        samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
-
-                # FFT
-                spec = np.fft.fftshift(np.fft.fft(samples * window))
-                spec = spec / NFFT
-                psd = 20 * np.log10(np.abs(spec) + 1e-12) + 33.5
-
-                # Frequency axis for this FFT block (use same fc)
-                freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / SAMPLE_RATE)) + float(fc)
-
-                # Diagnostic: show block frequency span and storage indices
-                fmin = freqs.min()
-                fmax = freqs.max()
-                start = i * NFFT
-                stop = start + NFFT
-                print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz stored at [{start}:{stop}]")
-
-
-                # Store block in stitched spectrum
-                start = i * NFFT
-                stop = start + NFFT
-                self.freq_axis[start:stop] = freqs
-                self.power_axis[start:stop] = psd
-
-                if i % 5 == 0:
-                        self.update_plot()
-
-        self.update_plot()
-
 
     def start_continuous(self):
+        # Start continuous repeating stitched sweep
         if self.sweep_thread and self.sweep_thread.is_alive():
             return
 
         self.log("=== CONTINUOUS MODE STARTED ===")
         self.stop_flag.clear()
+        # init_sdr should be idempotent; it will skip reopen if already open
         self.init_sdr()
 
         # Build centers from current preset (same logic as start_sweep)
@@ -497,31 +455,198 @@ class EmcScanner(QtWidgets.QMainWindow):
         else:
             self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
 
-        # after self.centers = ... in __init__, set_preset, start_continuous:
-        self.draw_block_markers()
-
-
-        # If single-center, tune SDR to that center; if multi-center, tune to first center
-        if len(self.centers) >= 1:
-            self.sdr.center_freq = float(self.centers[0])
-
         # Diagnostic: show centers and expected block ranges (MHz)
-        print("Start Continuous Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
+        print("start_continuous Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
         block_width_hz = SAMPLE_RATE
         ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
         print("         Diagnostic: expected block ranges (MHz):",
-              [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
+            [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
 
-
-
-        # Allocate buffers sized to the number of FFT blocks we will stitch
+        # Allocate and clear stitched arrays for continuous mode
         total_bins = len(self.centers) * NFFT
+        if total_bins == 0:
+            print("start_continuous: no centers defined, aborting")
+            return
+
         self.freq_axis = np.full(total_bins, np.nan, dtype=np.float64)
         self.power_axis = np.full(total_bins, -200.0, dtype=np.float64)
+        print(f"start_continuous: allocated freq_axis/power_axis length {total_bins}")
+
+        # Draw markers for visual debugging (safe call)
+        try:
+            self.draw_block_markers()
+        except Exception:
+            pass
+
+        # If single-center, tune SDR to that center; if multi-center, tune to first center
+        if len(self.centers) >= 1:
+            try:
+                self.sdr.center_freq = float(self.centers[0])
+            except Exception:
+                pass
 
         # Start repeating sweep in a thread
         self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
         self.sweep_thread.start()
+
+
+    def sweep_loop(self):
+        # Defensive checks at start
+        if self.centers is None or len(self.centers) == 0:
+            print("sweep_loop: no centers defined, exiting")
+            return
+
+        expected_bins = len(self.centers) * NFFT
+        if self.freq_axis is None or self.power_axis is None or self.freq_axis.size != expected_bins:
+            print(f"sweep_loop: stitched arrays missing or wrong size; reallocating to {expected_bins}")
+            self.freq_axis = np.full(expected_bins, np.nan, dtype=np.float64)
+            self.power_axis = np.full(expected_bins, -200.0, dtype=np.float64)
+
+        # Diagnostic: show SDR object identity so we can detect mid-sweep reinitialisation
+        try:
+            print("sweep_loop: sdr object id:", id(self.sdr))
+        except Exception:
+            print("sweep_loop: sdr object not present")
+
+        window = np.hanning(NFFT)
+        # optional counter to throttle GUI updates if needed
+        update_counter = 0
+
+        for i, fc in enumerate(self.centers):
+            if self.stop_flag.is_set():
+                break
+
+            # Diagnostic: about to tune this block
+            print(f"sweep_loop: i={i}, planned_center={fc/1e6:.6f} MHz")
+            try:
+                print(f"sweep_loop: block {i} using sdr id {id(self.sdr)}")
+            except Exception:
+                pass
+
+            # Tune and settle
+            try:
+                self.sdr.center_freq = float(fc)
+            except Exception as e:
+                print("sweep_loop: error setting center_freq:", e)
+
+            # Diagnostic: confirm device reports center (if API supports get)
+            try:
+                reported = getattr(self.sdr, "center_freq", None)
+                if reported is not None:
+                    print(f"sweep_loop: device center_freq={reported/1e6:.6f} MHz")
+            except Exception:
+                pass
+
+            # allow tuner/AGC to settle and flush driver buffers
+            time.sleep(0.12)
+            try:
+                _ = self.sdr.read_samples(512)
+                _ = self.sdr.read_samples(512)
+            except Exception as e:
+                print("sweep_loop: flush read_samples error:", e)
+
+            # Read samples and enforce length
+            samples = self.sdr.read_samples(NFFT)
+            samples = samples[:NFFT]
+
+            # Preserve complex IQ and normalize
+            if np.iscomplexobj(samples):
+                samples = samples.astype(np.complex64) / 128.0
+            else:
+                if samples.dtype == np.uint8:
+                    f = samples.astype(np.float32) - 128.0
+                else:
+                    f = samples.astype(np.float32)
+                if (f.size % 2) != 0:
+                    f = f[:-1]
+                f = f.reshape(-1, 2)
+                samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
+
+            # FFT
+            spec = np.fft.fftshift(np.fft.fft(samples * window))
+            spec = spec / NFFT
+            psd = 20 * np.log10(np.abs(spec) + 1e-12) + 33.5
+
+            # Frequency axis for this FFT block (use same fc)
+            freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / SAMPLE_RATE)) + float(fc)
+
+            # Diagnostic: block peak info and sample checksum
+            peak_idx = np.nanargmax(psd)
+            peak_freq = freqs[peak_idx]
+            peak_level = psd[peak_idx]
+            psd_checksum = np.sum(np.round(psd, 3))
+            print(f"DIAG block {i}: peak {peak_freq/1e6:.6f} MHz @ {peak_level:.1f} dB, checksum {psd_checksum:.3f}")
+            print("DIAG block sample freqs[0:6] (MHz):", (freqs[:6]/1e6).tolist())
+            print("DIAG block sample psd[0:6]:", psd[:6].tolist())
+
+            # Diagnostic: show block frequency span and planned storage indices
+            fmin = freqs.min()
+            fmax = freqs.max()
+            start = i * NFFT
+            stop = start + NFFT
+            print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz planned store [{start}:{stop}]")
+
+            # Safety checks before writing into stitched arrays
+            if self.freq_axis is None or self.power_axis is None:
+                print("sweep_loop: ERROR - stitched arrays not allocated")
+                break
+
+            if stop > self.freq_axis.size:
+                print(f"sweep_loop: ERROR - block {i} stop index {stop} exceeds array length {self.freq_axis.size}")
+                break
+
+            # Detect accidental overwrite (indicates logic bug)
+            existing_mask = ~np.isnan(self.freq_axis[start:stop])
+            if existing_mask.any():
+                print(f"sweep_loop: WARNING - block {i} would overwrite existing data at indices {start}:{stop}")
+
+            # Diagnostic: compute checksums and peaks for comparison
+            peak_idx = np.nanargmax(psd)
+            peak_freq = freqs[peak_idx]
+            peak_level = psd[peak_idx]
+            psd_checksum = float(np.sum(np.round(psd, 6)))
+            print(f"sweep_loop DIAG: block {i} peak {peak_freq/1e6:.6f} MHz @ {peak_level:.2f} dB checksum {psd_checksum:.6f}")
+
+            # Compare with previous block if present and non-empty
+            if i > 0:
+                prev = self.power_axis[start-NFFT:start]
+                if not np.all(prev == -200.0):
+                    prev_checksum = float(np.sum(np.round(prev, 6)))
+                    prev_peak_idx = int(np.nanargmax(prev))
+                    prev_peak_freq = float(self.freq_axis[start-NFFT:start][prev_peak_idx])
+                    print(f"sweep_loop DIAG: prev block {i-1} peak {prev_peak_freq/1e6:.6f} MHz checksum {prev_checksum:.6f}")
+                    if abs(psd_checksum - prev_checksum) < 1e-6:
+                        print(f"sweep_loop: WARNING - block {i} PSD checksum equals previous block -> skipping write")
+                        continue
+
+            # Store block in stitched spectrum (single atomic write)
+            self.freq_axis[start:stop] = freqs
+            self.power_axis[start:stop] = psd
+
+            # show current block overlay (debug only)
+            try:
+                if hasattr(self, "debug_block_curve"):
+                    self.debug_block_curve.setData(freqs, psd)
+            except Exception:
+                pass
+
+            # Immediately update the plot so GUI reflects the stored block
+            self.update_plot()
+
+            # Throttle if necessary (kept here for easy tuning)
+            update_counter += 1
+            if update_counter >= 1:
+                update_counter = 0
+
+        # Final update after sweep completes
+        self.update_plot()
+
+
+
+
+    def stop_sweep(self):
+        self.log(" STOP SWEEP ")
+        self.stop_flag.set()
 
     def continuous_loop(self):
         while not self.stop_flag.is_set():
@@ -530,6 +655,14 @@ class EmcScanner(QtWidgets.QMainWindow):
     def update_plot(self):
         if self.freq_axis is None or self.power_axis is None:
             return
+        # Verify frequency uniqueness before plotting
+        idx = np.argsort(self.freq_axis)
+        f = self.freq_axis[idx].copy()
+        p = self.power_axis[idx].copy()
+
+        # Diagnostic: check for duplicate frequency bins
+        if np.any(np.diff(f[~np.isnan(f)]) == 0):
+                print("update_plot: WARNING - duplicate frequency values detected in freq_axis")
 
         idx = np.argsort(self.freq_axis)
     
