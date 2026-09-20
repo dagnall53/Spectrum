@@ -26,7 +26,8 @@ class PlotSignals(QtCore.QObject):
     update = QtCore.pyqtSignal(object, object)
 
 class EmcScanner(QtWidgets.QMainWindow):
-    
+
+
     def log(self, msg):
         # Thread‑safe append to debug window
         QtCore.QMetaObject.invokeMethod(
@@ -68,7 +69,10 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-
+        self.cispr_offset_db = 0.0
+        self.cispr_gain_comp = 0.0
+        self.cispr_effective_offset = 0.0
+        
         # ---- Driver selection at startup ----
         driver_dirs = {
                 "Default (MSVC RTL-SDR Blog V4)": "C:/Spectrum/drivers/default",
@@ -137,8 +141,19 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.plot.setLabel('left', 'Level', units='dB')
         
         self.curve = self.plot.plot(pen='y')
-        self.cispr_curve = self.plot.plot(pen=pg.mkPen('r', style=QtCore.Qt.DashLine))
+        # ---- Right-hand CISPR axis ----
+        self.plot.showAxis('right')
+        self.plot.setLabel('right', 'CISPR (dBµV)')
+        self.plot.getAxis('right').setPen(pg.mkPen(color='red', width=2))
+
+        # CISPR curve (drawn using right axis)
+        self.cispr_curve = pg.PlotCurveItem(
+            pen=pg.mkPen(color='red', style=QtCore.Qt.DashLine, width=2),
+            name="CISPR"
+        )
+        self.plot.addItem(self.cispr_curve)
         self.cispr_curve.hide()
+
         left_layout.addWidget(self.plot)
         # ---- Fixed Y-axis (no autoscale) ----
         self.plot.setYRange(-120, 20)
@@ -196,30 +211,46 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self.save_csv)
         self.chk_cispr.toggled.connect(self.toggle_cispr)
 
+        # ---- CISPR Offset Control (user calibration) ----
+        self.cispr_offset_spin = QtWidgets.QDoubleSpinBox()
+        self.cispr_offset_spin.setRange(-200.0, 200.0)
+        self.cispr_offset_spin.setSingleStep(1.0)
+        self.cispr_offset_spin.setDecimals(1)
+        self.cispr_offset_spin.setValue(self.cispr_offset_db)   # initial value from __init__
+        self.cispr_offset_spin.setSuffix(" dB")
+        self.cispr_offset_spin.setToolTip("Visual offset to align CISPR (accounts for antenna/attenuation)")
+
+        # place the control in the same control row
+        ctrl_layout.addWidget(QtWidgets.QLabel("CISPR Offset"))
+        ctrl_layout.addWidget(self.cispr_offset_spin)
+
+        # connect to handler that updates effective offset and redraws CISPR curve
+        self.cispr_offset_spin.valueChanged.connect(self.update_cispr_offset)
+
+
         # ---- Right-hand preset panel ----
         preset_panel = QtWidgets.QVBoxLayout()
         main_layout.addLayout(preset_panel)
 
-        btn_30m = QtWidgets.QPushButton("30M HF")
-        btn_mvfh = QtWidgets.QPushButton("Marine VHF")
-        btn_vhf  = QtWidgets.QPushButton("Broadcast VHF")
-        btn_fmwb = QtWidgets.QPushButton("100.3M Wideband")
-        btn_mvfhwb = QtWidgets.QPushButton("Marine VHF Wideband")
+        # Define presets as a list so we can index them and extend easily
+        # Each entry: (internal_name, label, start_hz, stop_hz, sample_rate, gain, hf_mode_flag)
+        self.presets = [
+                ("30M", "30M HF",      150e3,      30e6,   2.4e6, 120, True),
+                ("MVHF", "Marine VHF", 156e6,      162e6,  2.4e6, 30,  False),
+                ("VHF",  "Broadcast VHF", 88e6,    108e6,  2.4e6, 37,  False),
+                ("VHF HG",  "High Gain  Bcst VHF", 88e6,    108e6,  2.4e6, 120,  False),
+                ("FM_WB","100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 37, False),
+                ("MVHF_WB","Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 37, False),
+        ]
 
-
-        preset_panel.addWidget(btn_30m)
-        preset_panel.addWidget(btn_mvfh)
-        preset_panel.addWidget(btn_vhf)
-        preset_panel.addWidget(btn_fmwb)
-        preset_panel.addWidget(btn_mvfhwb)
+        # Create buttons in a loop so adding presets is trivial
+        for idx, (_, label, *_rest) in enumerate(self.presets):
+                btn = QtWidgets.QPushButton(label)
+                preset_panel.addWidget(btn)
+                # bind the index into the lambda to avoid late-binding trap
+                btn.clicked.connect(lambda _, i=idx: self.set_preset(i))
 
         preset_panel.addStretch()
-
-        btn_30m.clicked.connect(lambda: self.set_preset("30M"))
-        btn_mvfh.clicked.connect(lambda: self.set_preset("MVHF"))
-        btn_vhf.clicked.connect(lambda: self.set_preset("VHF"))
-        btn_fmwb.clicked.connect(lambda: self.set_preset("FM_WB"))
-        btn_mvfhwb.clicked.connect(lambda: self.set_preset("MVHF_WB"))
 
 
         # ---- Sweep state ----
@@ -299,81 +330,125 @@ class EmcScanner(QtWidgets.QMainWindow):
             print("Error setting sampling mode:", e)    
 
 
-    def set_preset(self, mode):
+    def set_preset(self, mode_index):
+        """
+        Set preset by index (preferred) or by name (string).
+        Accepts:
+        - integer index into self.presets (if defined)
+        - string internal name (e.g., "MVHF")
+        Falls back to built-in preset table if self.presets is not present.
+        """
         global START_FREQ, STOP_FREQ, SAMPLE_RATE, GAIN
 
-        if mode == "30M":
-            START_FREQ = 150e3
-            STOP_FREQ  = 30e6
-            #STEP_HZ    = 2000
-            SAMPLE_RATE = 2.4e6
-            GAIN = 120
-            self.hf_mode = True
-            self.log("Setup 30M range")
+        # Built-in preset table (used if self.presets not defined)
+        builtin_presets = [
+            ("30M",     "30M HF",      150e3,      30e6,     2.4e6, 120, True),
+            ("MVHF",    "Marine VHF",  156e6,      162e6,    2.4e6, 30,  False),
+            ("VHF",     "Broadcast VHF", 88e6,     108e6,    2.4e6, 37,  False),
+            ("FM_WB",   "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 37, False),
+            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 37, False),
+        ]
 
-        elif mode == "MVHF":
-            START_FREQ = 150e6 #156e6
-            STOP_FREQ  = 172e6 #162e6
-            #STEP_HZ    = 2.4e6
-            SAMPLE_RATE = 2.4e6
-            GAIN = 30
-            self.hf_mode = False
-            self.log("Setup Marine VHF range")
+        # Resolve active presets list (prefer self.presets if present)
+        presets = getattr(self, "presets", builtin_presets)
 
-        elif mode == "VHF":
-            START_FREQ = 88e6
-            STOP_FREQ  = 108e6
-            #STEP_HZ    = 2.4e6
-            SAMPLE_RATE = 2.4e6
-            GAIN = 37
-            self.hf_mode = False
-            self.log("Setup VHF FM range")
-            
-        elif mode == "FM_WB":
-            START_FREQ = 100.3e6
-            STOP_FREQ  = 100.3e6   # single capture
-            #STEP_HZ    = 1         # no stepping
-            SAMPLE_RATE = 2.4e6
-            GAIN = 37
-            self.hf_mode = False
-            self.log("Setup 100.3 MHz wideband view")
-        elif mode == "MVHF_WB":
-            START_FREQ = 156.875e6
-            STOP_FREQ  = 156.875e6    # single capture
-            #STEP_HZ    = 1            # no stepping
-            SAMPLE_RATE = 2.4e6
-            GAIN = 37                 # similar to FM_WB
-            self.hf_mode = False
-            self.log("Setup Marine VHF Channel 77 wideband view")
+        # Resolve index if a name was passed
+        if isinstance(mode_index, str):
+            found = [i for i, p in enumerate(presets) if p[0] == mode_index]
+            if not found:
+                print(f"set_preset: unknown preset name {mode_index!r}")
+                return
+            idx = found[0]
+        else:
+            try:
+                idx = int(mode_index)
+            except Exception:
+                print(f"set_preset: invalid preset identifier {mode_index!r}")
+                return
 
+        # Validate index
+        if idx < 0 or idx >= len(presets):
+            print(f"set_preset: preset index {idx} out of range")
+            return
 
-        print(f"Preset selected: {mode}")
-        print(f"Range: {START_FREQ/1e6:.3f} MHz → {STOP_FREQ/1e6:.3f} MHz")
+        # Unpack preset tuple
+        name, label, start_hz, stop_hz, sample_rate, gain, hf_mode_flag = presets[idx]
 
-        # if mode == "FM_WB" or mode == "MVHF_WB":
-        if START_FREQ == STOP_FREQ:   
+        # Apply to globals and instance state
+        START_FREQ = float(start_hz)
+        STOP_FREQ  = float(stop_hz)
+        SAMPLE_RATE = float(sample_rate)
+        GAIN = float(gain)
+        self.hf_mode = bool(hf_mode_flag)
+        # ---- CISPR OFFSET UPDATE (ALWAYS EXECUTED) ----
+        # Gain compensation: CISPR curve must visually track mode gain
+        self.cispr_gain_comp = GAIN
+
+        # Effective offset = user offset - gain compensation
+        self.cispr_effective_offset = self.cispr_offset_db - self.cispr_gain_comp
+        # ------------------------------------------------
+        # Log selection
+        print(f"Preset selected: {label} (index {idx}, name {name})")
+        print(f"Range: {START_FREQ/1e6:.6f} MHz → {STOP_FREQ/1e6:.6f} MHz")
+        print(f"SAMPLE_RATE: {SAMPLE_RATE/1e6:.3f} MS/s, GAIN: {GAIN}")
+
+        # Rebuild centers using canonical builder
+        if START_FREQ == STOP_FREQ:
             self.centers = np.array([START_FREQ], dtype=np.float64)
         else:
             self.centers = self.build_centers(START_FREQ, STOP_FREQ, SAMPLE_RATE)
+
         # Diagnostic: show centers and expected block ranges (MHz)
         print("PRESET Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
         block_width_hz = SAMPLE_RATE
         ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
         print("       Diagnostic: expected block ranges (MHz):",
-              [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
-        # after self.centers = ... in __init__, set_preset, start_continuous:
-        self.draw_block_markers()
+            [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
 
+        # Update visual markers (safe call)
+        try:
+            self.draw_block_markers()
+        except Exception:
+            pass
 
-    
-        # Reapply SDR settings (without re‑opening device)
+        # Reapply SDR settings (without re-opening device)
         if self.sdr is not None:
             try:
                 self.sdr.sample_rate = SAMPLE_RATE
                 self.sdr.set_agc_mode(False)
                 self.sdr.gain = GAIN
+                # set direct sampling / tuner mode according to hf_mode
+                try:
+                    if self.hf_mode:
+                        self.sdr.set_direct_sampling(2)
+                        print("HF mode enabled (direct sampling input 2)")
+                    else:
+                        self.sdr.set_direct_sampling(0)
+                        print("VHF/UHF tuner mode enabled")
+                except Exception:
+                    # some drivers may not support set_direct_sampling; ignore errors
+                    pass
             except Exception as e:
                 print("Error applying preset SDR settings:", e)
+
+    def update_cispr_offset(self, val):
+        """
+        Slot for the CISPR offset spinbox.
+        Updates the stored user offset, recomputes the effective offset
+        (user offset minus current gain compensation) and refreshes the CISPR curve.
+        """
+        self.cispr_offset_db = float(val)
+        # cispr_gain_comp is updated in set_preset(); ensure it exists
+        if not hasattr(self, "cispr_gain_comp"):
+            self.cispr_gain_comp = 0.0
+        self.cispr_effective_offset = self.cispr_offset_db - self.cispr_gain_comp
+
+        # Redraw CISPR curve (safe no-op if CISPR data not present)
+        try:
+            self.update_cispr_curve()
+        except Exception:
+            pass
+
 
     def build_cispr_curve(self):
         # CISPR 16-1-1 style placeholder curve (dBµV)
@@ -438,7 +513,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sweep_thread = threading.Thread(target=self.sweep_loop, daemon=True)
         self.sweep_thread.start()
 
-
     def start_continuous(self):
         # Start continuous repeating stitched sweep
         if self.sweep_thread and self.sweep_thread.is_alive():
@@ -488,7 +562,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Start repeating sweep in a thread
         self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
         self.sweep_thread.start()
-
 
     def sweep_loop(self):
         # Defensive checks at start
@@ -641,9 +714,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Final update after sweep completes
         self.update_plot()
 
-
-
-
     def stop_sweep(self):
         self.log(" STOP SWEEP ")
         self.stop_flag.set()
@@ -652,9 +722,61 @@ class EmcScanner(QtWidgets.QMainWindow):
         while not self.stop_flag.is_set():
             self.sweep_loop()   # run one sweep
 
+    def update_cispr_curve(self):
+        """
+        Interpolate CISPR limits to the current freq axis and apply effective offset.
+        Safe no-op if required data is missing.
+        """
+        # Guards
+        if self.freq_axis is None:
+            return
+        if not hasattr(self, "cispr_freqs") or not hasattr(self, "cispr_limits"):
+            return
+
+        # Ensure numpy arrays
+        try:
+            fa = np.asarray(self.freq_axis, dtype=np.float64)
+            freqs = np.asarray(self.cispr_freqs, dtype=np.float64)
+            limits = np.asarray(self.cispr_limits, dtype=np.float64)
+        except Exception:
+            return
+
+        # Interpolate CISPR limits to the current frequency axis
+        try:
+            L_interp = np.interp(fa, freqs, limits)
+        except Exception:
+            return
+
+        # Ensure gain compensation and effective offset exist
+        gain_comp = float(getattr(self, "cispr_gain_comp", 0.0))
+        user_offset = float(getattr(self, "cispr_offset_db", 0.0))
+        self.cispr_effective_offset = user_offset - gain_comp
+
+        # Apply effective offset (visual calibration)
+        L_interp = L_interp + float(self.cispr_effective_offset)
+
+        # Update the CISPR curve item
+        try:
+            self.cispr_curve.setData(fa, L_interp)
+        except Exception as e:
+            # If the plot item isn't ready, ignore but log
+            print("update_cispr_curve: setData error:", e)
+
+        # Keep visibility in sync with checkbox
+        try:
+            if hasattr(self, "chk_cispr") and not self.chk_cispr.isChecked():
+                self.cispr_curve.hide()
+            else:
+                self.cispr_curve.show()
+        except Exception:
+            pass
+
     def update_plot(self):
+
+        # Basic guards
         if self.freq_axis is None or self.power_axis is None:
             return
+
         # Verify frequency uniqueness before plotting
         idx = np.argsort(self.freq_axis)
         f = self.freq_axis[idx].copy()
@@ -662,16 +784,33 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # Diagnostic: check for duplicate frequency bins
         if np.any(np.diff(f[~np.isnan(f)]) == 0):
-                print("update_plot: WARNING - duplicate frequency values detected in freq_axis")
+            print("update_plot: WARNING - duplicate frequency values detected in freq_axis")
 
         idx = np.argsort(self.freq_axis)
-    
+
         f = self.freq_axis[idx].copy()
         p = self.power_axis[idx].copy()
         valid = ~np.isnan(self.freq_axis)
-  
+
+        # --- Minimal additions for CISPR support ---
+        # store the cleaned axis so CISPR interpolation has a stable reference
+        # (this does not change your emitted data or sweep logic)
+        try:
+            self.freq_axis = f
+            self.power_axis = p
+        except Exception:
+            pass
+        # --------------------------------------------
+
+        # Emit the plot update (unchanged)
         self.plot_signals.update.emit(f, p)
 
+        # --- draw/update CISPR curve (safe no-op if data missing) ---
+        try:
+            self.update_cispr_curve()
+        except Exception as e:
+            print("update_plot: update_cispr_curve error:", e)
+        # ----------------------------------------------------------
 
     @QtCore.pyqtSlot(object, object)
     def set_plot_data(self, f, p):
