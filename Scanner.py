@@ -71,7 +71,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         super().__init__()
         self.cispr_offset_db = 0.0
         self.cispr_gain_comp = 0.0
-        self.cispr_effective_offset = 0.0
+        self.cispr_effective_offset = 20.0
         
         # ---- Driver selection at startup ----
         driver_dirs = {
@@ -141,7 +141,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.plot.setLabel('left', 'Level', units='dB')
         
         self.curve = self.plot.plot(pen='y')
-        # ---- Right-hand CISPR axis ----
+        # ---- Right-hand CISPR axis with safe ViewBox (paste in place of your edited block) ----
         self.plot.showAxis('right')
         self.plot.setLabel('right', 'CISPR (dBµV)')
         self.plot.getAxis('right').setPen(pg.mkPen(color='red', width=2))
@@ -155,6 +155,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_curve.hide()
 
         left_layout.addWidget(self.plot)
+
         # ---- Fixed Y-axis (no autoscale) ----
         self.plot.setYRange(-120, 20)
         self.plot.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
@@ -226,6 +227,9 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # connect to handler that updates effective offset and redraws CISPR curve
         self.cispr_offset_spin.valueChanged.connect(self.update_cispr_offset)
+        # Force an initial update so the curve reflects the current spinbox value immediately
+        self.update_cispr_offset(self.cispr_offset_spin.value())
+        self.cispr_curve.show()
 
 
         # ---- Right-hand preset panel ----
@@ -329,7 +333,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         except Exception as e:
             print("Error setting sampling mode:", e)    
 
-
     def set_preset(self, mode_index):
         """
         Set preset by index (preferred) or by name (string).
@@ -386,6 +389,8 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # Effective offset = user offset - gain compensation
         self.cispr_effective_offset = self.cispr_offset_db - self.cispr_gain_comp
+        #self.update_cispr_curve()
+        #self.update_right_axis_ticks()
         # ------------------------------------------------
         # Log selection
         print(f"Preset selected: {label} (index {idx}, name {name})")
@@ -431,24 +436,114 @@ class EmcScanner(QtWidgets.QMainWindow):
             except Exception as e:
                 print("Error applying preset SDR settings:", e)
 
-    def update_cispr_offset(self, val):
+    def update_right_axis_ticks(self):
         """
-        Slot for the CISPR offset spinbox.
-        Updates the stored user offset, recomputes the effective offset
-        (user offset minus current gain compensation) and refreshes the CISPR curve.
+        Recompute right-axis tick labels so they show CISPR units (left_value - effective_offset).
+        Call whenever the view Y-range or effective offset changes.
         """
-        self.cispr_offset_db = float(val)
-        # cispr_gain_comp is updated in set_preset(); ensure it exists
-        if not hasattr(self, "cispr_gain_comp"):
-            self.cispr_gain_comp = 0.0
-        self.cispr_effective_offset = self.cispr_offset_db - self.cispr_gain_comp
-
-        # Redraw CISPR curve (safe no-op if CISPR data not present)
         try:
-            self.update_cispr_curve()
+            axis = self.plot.getAxis('right')
+            vb = self.plot.getViewBox()
+            # current Y range of the main (left) axis
+            yr = vb.viewRange()[1]  # [ymin, ymax]
+            ymin, ymax = float(yr[0]), float(yr[1])
+            if ymax <= ymin:
+                return
+
+            # choose a small number of ticks (5) and compute positions in left-axis coords
+            n_ticks = 5
+            positions = np.linspace(ymin, ymax, n_ticks)
+
+            # effective offset (user offset minus gain compensation)
+            eff = float(getattr(self, "cispr_effective_offset", 0.0))
+
+            # Build ticks as list of (position, label) where label = left_value - eff
+            ticks = [(float(pos), f"{(pos - eff):.1f}") for pos in positions]
+
+            # setTicks expects a list of levels; provide single level
+            axis.setTicks([ticks])
+            # show/hide axis according to checkbox
+            try:
+                axis.setVisible(bool(getattr(self, "chk_cispr", None) and self.chk_cispr.isChecked()))
+            except Exception:
+                pass
+        except Exception:
+            # defensive: don't crash GUI
+            pass
+
+    def update_cispr_curve(self):
+        """
+        Draw CISPR limits in the right-hand ViewBox (CISPR units).
+        To keep the red line fixed relative to the right axis while moving
+        relative to the left FFT axis, set the right ViewBox Y range to
+        (left_ymin - effective, left_ymax - effective).
+        """
+        # compute X axis to draw on (fallback to current view X range)
+        if getattr(self, "freq_axis", None) is None or getattr(self.freq_axis, "size", 0) == 0:
+            try:
+                vb = self.plot.getViewBox()
+                xr = vb.viewRange()[0]
+                fa = np.linspace(float(xr[0]), float(xr[1]), 512, dtype=np.float64)
+            except Exception:
+                return
+        else:
+            fa = np.asarray(self.freq_axis, dtype=np.float64)
+
+        if not hasattr(self, "cispr_freqs") or not hasattr(self, "cispr_limits"):
+            return
+
+        try:
+            freqs = np.asarray(self.cispr_freqs, dtype=np.float64)
+            limits = np.asarray(self.cispr_limits, dtype=np.float64)
+            L_interp = np.interp(fa, freqs, limits)
+        except Exception:
+            return
+
+        # compute effective offset (user offset minus gain compensation)
+        gain_comp = float(getattr(self, "cispr_gain_comp", 0.0))
+        user_offset = float(getattr(self, "cispr_offset_db", 0.0))
+        effective = user_offset - gain_comp
+        self.cispr_effective_offset = effective
+
+        # Plot the CISPR curve in CISPR units (no offset applied to the data)
+        try:
+            self.cispr_curve.setData(fa, L_interp)
+        except Exception as e:
+            print("update_cispr_curve: setData error:", e)
+
+        # show/hide according to checkbox
+        try:
+            if hasattr(self, "chk_cispr") and not self.chk_cispr.isChecked():
+                self.cispr_curve.hide()
+            else:
+                self.cispr_curve.show()
         except Exception:
             pass
 
+        # Shift the right ViewBox Y range so that a CISPR value L appears at left value L + effective
+        try:
+            vb_main = self.plot.getViewBox()
+            vb_right = getattr(self, "_vb_right", None)
+            if vb_right is not None and vb_main is not None:
+                yr = vb_main.viewRange()[1]   # [ymin, ymax]
+                left_ymin, left_ymax = float(yr[0]), float(yr[1])
+                vb_right.setYRange(left_ymin - effective, left_ymax - effective, padding=0)
+                try:
+                    self.plot.getAxis('right').setVisible(bool(getattr(self, "chk_cispr", None) and self.chk_cispr.isChecked()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def update_cispr_offset(self, val):
+        # store user offset
+        self.cispr_offset_db = float(val)
+        # ensure gain compensation exists
+        self.cispr_gain_comp = float(getattr(self, "cispr_gain_comp", 0.0))
+        # compute effective offset
+        self.cispr_effective_offset = self.cispr_offset_db - self.cispr_gain_comp
+        # force redraw of CISPR curve (safe no-op if data missing)
+        self.update_cispr_curve()
 
     def build_cispr_curve(self):
         # CISPR 16-1-1 style placeholder curve (dBµV)
@@ -722,54 +817,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         while not self.stop_flag.is_set():
             self.sweep_loop()   # run one sweep
 
-    def update_cispr_curve(self):
-        """
-        Interpolate CISPR limits to the current freq axis and apply effective offset.
-        Safe no-op if required data is missing.
-        """
-        # Guards
-        if self.freq_axis is None:
-            return
-        if not hasattr(self, "cispr_freqs") or not hasattr(self, "cispr_limits"):
-            return
-
-        # Ensure numpy arrays
-        try:
-            fa = np.asarray(self.freq_axis, dtype=np.float64)
-            freqs = np.asarray(self.cispr_freqs, dtype=np.float64)
-            limits = np.asarray(self.cispr_limits, dtype=np.float64)
-        except Exception:
-            return
-
-        # Interpolate CISPR limits to the current frequency axis
-        try:
-            L_interp = np.interp(fa, freqs, limits)
-        except Exception:
-            return
-
-        # Ensure gain compensation and effective offset exist
-        gain_comp = float(getattr(self, "cispr_gain_comp", 0.0))
-        user_offset = float(getattr(self, "cispr_offset_db", 0.0))
-        self.cispr_effective_offset = user_offset - gain_comp
-
-        # Apply effective offset (visual calibration)
-        L_interp = L_interp + float(self.cispr_effective_offset)
-
-        # Update the CISPR curve item
-        try:
-            self.cispr_curve.setData(fa, L_interp)
-        except Exception as e:
-            # If the plot item isn't ready, ignore but log
-            print("update_cispr_curve: setData error:", e)
-
-        # Keep visibility in sync with checkbox
-        try:
-            if hasattr(self, "chk_cispr") and not self.chk_cispr.isChecked():
-                self.cispr_curve.hide()
-            else:
-                self.cispr_curve.show()
-        except Exception:
-            pass
 
     def update_plot(self):
 
@@ -810,7 +857,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.update_cispr_curve()
         except Exception as e:
             print("update_plot: update_cispr_curve error:", e)
-        # ----------------------------------------------------------
+        
 
     @QtCore.pyqtSlot(object, object)
     def set_plot_data(self, f, p):
