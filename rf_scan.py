@@ -9,6 +9,13 @@ target_dir = r"C:\Spectrum"
 # os.add_dll_directory(target_dir)
 # print(f"Called os.add_dll_directory({target_dir!r})")
 
+#--------------------------------------------------------------
+# Notes for calibration. 
+# With a 5W RF transmitter at 5m  with 30db attenuator fitted between TX and antenna, 
+# a signal strength of aproximately 87dBuv is expected.
+# when my atenuator arrives I hope to be able to properly link the CISPR and FFT scales. 
+
+#--------------------------------------------------------------
 
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
@@ -595,10 +602,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         screen height where the left axis reads (L + effective); equivalently,
         the right ViewBox's Y range is the left ViewBox's Y range shifted by
         -effective. Both the curve data and the axis range are computed from
-        the same "effective" value in this one function, so they can't drift
-        apart the way they could when two different code paths each redrew
-        the curve with their own offset (as set_plot_data() used to, with its
-        own hard-coded -80.0 "temporary visual calibration").
+        the same "effective" value in this one function.
         """
         # X axis to draw on: real stitched frequency data if we have it, else the
         # current view's X range (so the line still appears before a sweep runs).
