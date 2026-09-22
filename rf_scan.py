@@ -30,6 +30,16 @@ SAMPLE_RATE = 2.4e6      # Hz
 NFFT        = 4096
 GAIN        = 120     # or numeric (e.g. 30)
 
+# ---- Stitching / edge-masking ----
+# Each FFT block's outer edges show visible artefacts (front-end filter roll-off and/or
+# window-shape effects), which show up as a regular "wave" pattern once many blocks are
+# stitched edge-to-edge into one wideband trace. STITCH_EDGE_MASK_FRACTION is the fraction
+# of each block's bandwidth discarded from EACH edge before it is stored/displayed; only
+# the middle (1 - 2*STITCH_EDGE_MASK_FRACTION) of every block is kept. Centers are hopped
+# by that same "kept" width (see build_centers()) so the kept slices tile the sweep with
+# no gaps and no overlap. Adjust this constant if the FFT windowing/filtering changes.
+STITCH_EDGE_MASK_FRACTION = 0.15   # 15% discarded off each edge (30% of each block total)
+
 class PlotSignals(QtCore.QObject):
     update = QtCore.pyqtSignal(object, object)
 
@@ -48,10 +58,28 @@ class EmcScanner(QtWidgets.QMainWindow):
     # Use this to build centers across the sweep band
     # start_hz, stop_hz, sample_rate are floats
     def build_centers(self, start_hz, stop_hz, sample_rate):
-                # first center is half a block above start
-                first = start_hz + (sample_rate / 2.0)
-                # stop is exclusive; np.arange will stop before stop_hz
-                return np.arange(first, stop_hz, sample_rate, dtype=np.float64)
+        """
+        Build sweep centers so that, once each block's masked edges are discarded (see
+        STITCH_EDGE_MASK_FRACTION / self.stitch_edge_mask_fraction), the remaining "kept"
+        slices tile the sweep range with no gaps and no overlap.
+
+        Each block still captures the FULL sample_rate of bandwidth - the FFT size,
+        window, and sample rate are unchanged. Only the displayed/stored portion of each
+        block is narrower (the middle (1 - 2*mask_frac) of it), so centers hop by that
+        narrower "display" width instead of by the full sample_rate.
+        """
+        mask_frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
+        display_width = sample_rate * (1.0 - 2.0 * mask_frac)
+        if display_width <= 0:
+            # Degenerate configuration (mask_frac >= 0.5) - fall back to no masking
+            # rather than dividing by ~0 or producing a reversed/empty sweep.
+            display_width = sample_rate
+            mask_frac = 0.0
+        # first center is positioned so the first block's KEPT (displayed) slice starts
+        # exactly at start_hz, not the first block's raw captured edge.
+        first = start_hz + sample_rate * (0.5 - mask_frac)
+        # stop is exclusive; np.arange will stop before stop_hz
+        return np.arange(first, stop_hz, display_width, dtype=np.float64)
 
     def draw_block_markers(self):
             # remove old markers
@@ -61,18 +89,41 @@ class EmcScanner(QtWidgets.QMainWindow):
                     except Exception:
                             pass
             self._block_markers.clear()
-            # draw new markers for each center
-            half = self.SAMPLE_RATE / 2.0
+            # Raw captured block width (full sampled bandwidth, before masking) - green.
+            half_capture = self.SAMPLE_RATE / 2.0
+            # Kept/displayed width after edge masking (what actually reaches the stitched
+            # trace) - cyan dashed. Computed from the same integer bin count sweep_loop()
+            # actually uses, so these markers line up exactly with the real stitch boundary.
+            edge_bins = self.stitch_get_edge_bins()
+            kept_bins = NFFT - 2 * edge_bins
+            half_kept = kept_bins * self.SAMPLE_RATE / (2.0 * NFFT)
+            visible = bool(getattr(self, "markers_visible", True))
             for c in self.centers:
-                    left = c - half
-                    right = c + half
-                    # vertical lines at left and right
+                    left = c - half_capture
+                    right = c + half_capture
+                    # vertical lines at left and right (raw captured block edges)
                     line_l = pg.InfiniteLine(pos=left, angle=90, pen=pg.mkPen('g', width=1))
                     line_r = pg.InfiniteLine(pos=right, angle=90, pen=pg.mkPen('g', width=1))
+                    line_l.setVisible(visible)
+                    line_r.setVisible(visible)
                     self.plot.addItem(line_l)
                     self.plot.addItem(line_r)
                     self._block_markers.append(line_l)
                     self._block_markers.append(line_r)
+
+                    # kept/displayed slice edges (after edge masking)
+                    kept_left = c - half_kept
+                    kept_right = c + half_kept
+                    line_kl = pg.InfiniteLine(pos=kept_left, angle=90,
+                                               pen=pg.mkPen('c', width=1, style=QtCore.Qt.DashLine))
+                    line_kr = pg.InfiniteLine(pos=kept_right, angle=90,
+                                               pen=pg.mkPen('c', width=1, style=QtCore.Qt.DashLine))
+                    line_kl.setVisible(visible)
+                    line_kr.setVisible(visible)
+                    self.plot.addItem(line_kl)
+                    self.plot.addItem(line_kr)
+                    self._block_markers.append(line_kl)
+                    self._block_markers.append(line_kr)
     def __init__(self):
         super().__init__()
         # ---- CISPR state ----
@@ -94,6 +145,20 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_effective_offset = 0.0
         # in __init__, after super().__init__() and before threads start
         self._psd_to_dbuv_const = 33.5   # default conversion constant (tuner path default)
+
+        # ---- Stitching / edge-masking state ----
+        # Copied from the module-level default so it can still be tuned per-instance if
+        # ever needed, but the intent (per the user) is to adjust it in code, not via a
+        # GUI control - see STITCH_EDGE_MASK_FRACTION above and stitch_get_edge_bins().
+        self.stitch_edge_mask_fraction = STITCH_EDGE_MASK_FRACTION
+
+        # ---- Time-averaging state ----
+        # Mirrors the CISPR Offset pattern: a checkbox to switch it on/off, and a spinbox
+        # for how many consecutive FFT captures (per frequency block) to average together.
+        # Averaging is done in POWER (linear), never in dB - see avg_get_active_count()
+        # and sweep_loop(). avg_count=1 or avg_enabled=False both mean "no averaging".
+        self.avg_enabled = False
+        self.avg_count = 4
 
 
         # ---- Driver selection at startup ----
@@ -175,6 +240,16 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # main FFT curve (left axis)
         self.curve = self.plot.plot(pen='y')
+
+        # Reference trace (e.g. captured "system noise" baseline) - display only, on the
+        # same left (dB) axis as the live curve. Never subtracted from the live trace;
+        # it just sits underneath it so you can visually compare the two. Light blue so
+        # it reads as a background reference rather than competing with the live yellow
+        # trace. Hidden until Capture Reference is pressed.
+        self.reference_curve = self.plot.plot(pen=pg.mkPen(color=(173, 216, 230), width=1), name="Reference")
+        self.reference_curve.hide()
+        self.reference_freq = None
+        self.reference_power = None
 
         # ---- Right-hand CISPR axis using a separate ViewBox (safe) ----
         # This creates an independent right ViewBox so the right axis can show CISPR units
@@ -308,6 +383,57 @@ class EmcScanner(QtWidgets.QMainWindow):
         ctrl_layout.addWidget(self.cispr_offset_spin)
         ctrl_layout.addWidget(self.cispr_calibration_label)
 
+        # ---- Time-Averaging Control ----
+        # Same pattern as the CISPR Offset control: a checkbox to switch the feature on/off,
+        # plus a spinbox for how many consecutive FFT captures (per frequency block) are
+        # averaged together in power before conversion to dB. Reduces trace noise at the
+        # cost of a slower sweep (avg_count reads per hop instead of one).
+        self.chk_avg = QtWidgets.QCheckBox("Time Averaging")
+        self.avg_count_spin = QtWidgets.QSpinBox()
+        self.avg_count_spin.setRange(1, 64)
+        self.avg_count_spin.setValue(self.avg_count)
+        self.avg_count_spin.setSuffix(" avgs")
+        self.avg_count_spin.setToolTip(
+            "Number of consecutive FFT captures averaged together (in power, not dB) per "
+            "frequency block before moving to the next hop. Higher = smoother trace, slower "
+            "sweep. Only applied while Time Averaging is checked."
+        )
+        ctrl_layout.addWidget(self.chk_avg)
+        ctrl_layout.addWidget(self.avg_count_spin)
+        self.chk_avg.toggled.connect(self.avg_on_toggle)
+        self.avg_count_spin.valueChanged.connect(self.avg_on_count_changed)
+
+        # ---- Display-toggle row (markers, reference trace) ----
+        # A second control row, kept separate from the sweep/CISPR/averaging controls above
+        # purely to stop the first row from growing indefinitely wide.
+        ctrl_layout2 = QtWidgets.QHBoxLayout()
+        left_layout.addLayout(ctrl_layout2)
+
+        # Frequency block markers (green = raw captured block edges, cyan dashed = kept/
+        # displayed edges after edge masking - see draw_block_markers()). Useful for
+        # confirming the stitching, but visually intrusive once you're done checking it,
+        # so they can be switched off without discarding/rebuilding them.
+        self.markers_visible = True
+        self.chk_markers = QtWidgets.QCheckBox("Show Freq Markers")
+        self.chk_markers.setChecked(self.markers_visible)
+        self.chk_markers.setToolTip("Show/hide the green (raw block) and cyan dashed "
+                                     "(kept/stitched) vertical frequency markers.")
+        ctrl_layout2.addWidget(self.chk_markers)
+        self.chk_markers.toggled.connect(self.markers_toggle_visibility)
+
+        # Reference trace: a one-off snapshot of whatever is currently on the live curve
+        # (e.g. captured with the target system switched off, as a "system noise" baseline),
+        # kept on screen in light blue for visual comparison. Never subtracted from the
+        # live trace - see reference_capture().
+        self.btn_capture_ref = QtWidgets.QPushButton("Capture Reference")
+        self.chk_show_ref = QtWidgets.QCheckBox("Show Reference")
+        self.btn_capture_ref.setToolTip("Snapshot the current live trace as a reference "
+                                         "(e.g. system-noise baseline) for visual comparison only.")
+        ctrl_layout2.addWidget(self.btn_capture_ref)
+        ctrl_layout2.addWidget(self.chk_show_ref)
+        self.btn_capture_ref.clicked.connect(self.reference_capture)
+        self.chk_show_ref.toggled.connect(self.reference_toggle_visibility)
+
         # ---- Sweep state ----
         self.stop_flag = threading.Event()
         self.sweep_thread = None
@@ -338,7 +464,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             ("SF1", "4.5 2.048", 4.5e6, 4.5e6, 2.048e6, 60, False, 0.0),
             ("SF1", "4.5 2.8", 4.5e6, 4.5e6, 2.8e6, 60, False, 0.0),
             ("SF3", "2Mh B", 1e6, 1e6, 3.2e6, 60, True, 0.0),
-            ("SF4", "2M B", 1e6, 1e6, 3,2e6, 60, False, 0.0),
+            ("SF4", "2M B", 1e6, 1e6, 3.2e6, 60, False, 0.0),
             ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 60, True, 0.0),
             ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 60, False, 0.0),
             ("30M", "150k-30Mhz 1", 150e3, 30e6, 1.8e6, 120, False, 0.0),
@@ -746,6 +872,122 @@ class EmcScanner(QtWidgets.QMainWindow):
         except Exception as e:
             print("cispr_toggle_visibility: cispr_update_axis_ticks error:", e)
 
+    # =====================================================================
+    # Stitching (edge-masking) & Time-Averaging support
+    #
+    # stitch_get_edge_bins / stitch_get_kept_bins define exactly how many FFT bins are
+    # trimmed from each block before it enters the stitched display (see sweep_loop()
+    # and build_centers()). avg_* mirror the cispr_on_offset_changed/cispr_refresh_offset_ui
+    # pattern: simple GUI-thread setters for plain attributes that sweep_loop() (worker
+    # thread) only ever reads - no Qt scene objects are touched here, so unlike the
+    # cispr_* block above there is no GUI-thread restriction on these.
+    # =====================================================================
+
+    def stitch_get_edge_bins(self):
+        """Number of FFT bins discarded from EACH edge of a block before stitching."""
+        frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
+        frac = max(0.0, min(0.49, frac))  # guard against masking away the whole block
+        return int(round(NFFT * frac))
+
+    def stitch_get_kept_bins(self):
+        """Number of FFT bins actually stored/displayed per block, after edge masking."""
+        return NFFT - 2 * self.stitch_get_edge_bins()
+
+    def avg_on_toggle(self, checked):
+        """Time Averaging checkbox -> model. Read by sweep_loop() via avg_get_active_count()."""
+        self.avg_enabled = bool(checked)
+
+    def avg_on_count_changed(self, val):
+        """Averages spinbox -> model. Read by sweep_loop() via avg_get_active_count()."""
+        self.avg_count = int(val)
+
+    def avg_get_active_count(self):
+        """Number of FFT captures to average per block: 1 (no averaging) unless enabled."""
+        return max(1, int(getattr(self, "avg_count", 1))) if getattr(self, "avg_enabled", False) else 1
+
+    def _read_normalized_iq(self, n):
+        """
+        Read n IQ samples from the SDR and return them as normalized complex64, using the
+        same real-vs-complex / uint8-vs-float handling the sweep previously did inline.
+        Factored out so sweep_loop() can call it once per averaging capture without
+        duplicating this logic K times.
+        """
+        samples = self.sdr.read_samples(n)
+        samples = samples[:n]
+        if np.iscomplexobj(samples):
+            samples = samples.astype(np.complex64) / 128.0
+        else:
+            if samples.dtype == np.uint8:
+                f = samples.astype(np.float32) - 128.0
+            else:
+                f = samples.astype(np.float32)
+            if (f.size % 2) != 0:
+                f = f[:-1]
+            f = f.reshape(-1, 2)
+            samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
+        return samples
+
+    # =====================================================================
+    # Display toggles: frequency markers & reference trace
+    #
+    # Both are pure display features - neither touches the sweep/stitching logic above,
+    # and neither is safety-sensitive w.r.t. threading: markers_toggle_visibility() and
+    # reference_toggle_visibility() are only ever called from Qt checkbox signals (GUI
+    # thread), and reference_capture() only ever called from a Qt button signal (GUI
+    # thread), reading self.curve's already-set data rather than the worker thread's
+    # arrays - so there's nothing here that needs the cispr_*-style thread restriction.
+    # =====================================================================
+
+    def markers_toggle_visibility(self, checked):
+        """
+        Show/hide the green (raw block) and cyan dashed (kept/stitched) vertical frequency
+        markers without rebuilding them. draw_block_markers() also reads self.markers_visible
+        so newly (re)drawn markers - e.g. after a MODE change - come up in the same state.
+        """
+        self.markers_visible = bool(checked)
+        for item in self._block_markers:
+            try:
+                item.setVisible(self.markers_visible)
+            except Exception:
+                pass
+
+    def reference_capture(self):
+        """
+        Snapshot whatever is currently drawn on the live FFT curve and store it as the
+        reference trace (e.g. a "system noise" baseline captured with the target system
+        switched off). Runs on the GUI thread (button click), reading self.curve's
+        already-set data - safe, since only the GUI thread (set_plot_data) ever writes it.
+
+        This is a DISPLAY-ONLY snapshot: it is drawn in light blue for comparison and is
+        never subtracted from, or combined with, the live trace.
+        """
+        try:
+            f, p = self.curve.getData()
+        except Exception as e:
+            print("reference_capture: could not read live curve data:", e)
+            return
+        if f is None or p is None or len(f) == 0:
+            self.log("Capture Reference: no live data to capture yet")
+            return
+        self.reference_freq = np.array(f, dtype=np.float64, copy=True)
+        self.reference_power = np.array(p, dtype=np.float64, copy=True)
+        self.reference_curve.setData(self.reference_freq, self.reference_power)
+        self.reference_curve.setVisible(True)
+        self.log(f"Reference captured: {len(self.reference_freq)} points")
+        # Capturing implies you want to see it - reflect that in the checkbox without
+        # re-triggering this method via its own toggled signal.
+        if not self.chk_show_ref.isChecked():
+            self.chk_show_ref.blockSignals(True)
+            self.chk_show_ref.setChecked(True)
+            self.chk_show_ref.blockSignals(False)
+
+    def reference_toggle_visibility(self, checked):
+        """Show/hide the captured reference trace. Never affects the stored snapshot."""
+        try:
+            self.reference_curve.setVisible(bool(checked))
+        except Exception:
+            pass
+
     def start_sweep(self):
         # Start a single fast stitched sweep (one-shot), using the LIVE preset settings
         # (self.START_FREQ/self.STOP_FREQ/self.SAMPLE_RATE/self.sdr_gain) - i.e. whichever
@@ -756,6 +998,9 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(f"Range: {self.START_FREQ/1e6:.3f} → {self.STOP_FREQ/1e6:.3f} MHz")
         self.log(f"Sample rate: {self.SAMPLE_RATE/1e6:.3f} MS/s")
         self.log(f"Gain: {self.sdr_gain} dB")
+        self.log(f"Edge mask: {self.stitch_edge_mask_fraction*100:.0f}% per side "
+                 f"({self.stitch_get_kept_bins()}/{NFFT} bins kept per block)")
+        self.log(f"Time averaging: {'ON, ' + str(self.avg_get_active_count()) + ' captures/block' if self.avg_enabled else 'OFF'}")
 
         # Build centers from current preset (same logic as start_continuous)
         if self.START_FREQ == self.STOP_FREQ:
@@ -772,7 +1017,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(f"Total hops: {len(self.centers)}")
 
         # Allocate and clear stitched arrays for this sweep
-        total_bins = len(self.centers) * NFFT
+        total_bins = len(self.centers) * self.stitch_get_kept_bins()
         if total_bins == 0:
             print("start_sweep: no centers defined, aborting sweep")
             return
@@ -802,6 +1047,9 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
 
         self.log("=== CONTINUOUS MODE STARTED ===")
+        self.log(f"Edge mask: {self.stitch_edge_mask_fraction*100:.0f}% per side "
+                 f"({self.stitch_get_kept_bins()}/{NFFT} bins kept per block)")
+        self.log(f"Time averaging: {'ON, ' + str(self.avg_get_active_count()) + ' captures/block' if self.avg_enabled else 'OFF'}")
         self.stop_flag.clear()
         # init_sdr should be idempotent; it will skip reopen if already open, and always
         # re-applies self.SAMPLE_RATE/self.sdr_gain/self.hf_mode to the hardware.
@@ -821,7 +1069,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             [f"{a/1e6:.6f}-{b/1e6:.6f}" for a, b in ranges])
 
         # Allocate and clear stitched arrays for continuous mode
-        total_bins = len(self.centers) * NFFT
+        total_bins = len(self.centers) * self.stitch_get_kept_bins()
         if total_bins == 0:
             print("start_continuous: no centers defined, aborting")
             return
@@ -853,7 +1101,13 @@ class EmcScanner(QtWidgets.QMainWindow):
             print("sweep_loop: no centers defined, exiting")
             return
 
-        expected_bins = len(self.centers) * NFFT
+        # Number of bins actually stored per block AFTER edge masking (see
+        # stitch_get_kept_bins()) - this, not NFFT, is the real per-block stride into
+        # freq_axis/power_axis, since the masked-off edge bins are never stored.
+        edge_bins = self.stitch_get_edge_bins()
+        kept_bins = NFFT - 2 * edge_bins
+
+        expected_bins = len(self.centers) * kept_bins
         if self.freq_axis is None or self.power_axis is None or self.freq_axis.size != expected_bins:
             print(f"sweep_loop: stitched arrays missing or wrong size; reallocating to {expected_bins}")
             self.freq_axis = np.full(expected_bins, np.nan, dtype=np.float64)
@@ -868,6 +1122,14 @@ class EmcScanner(QtWidgets.QMainWindow):
         window = np.hanning(NFFT)
         # optional counter to throttle GUI updates if needed
         update_counter = 0
+
+        # How many consecutive FFT captures to average (in power) per block this sweep.
+        # Read once per sweep rather than once per block: averaging count is a GUI
+        # setting the operator can change mid-sweep, but re-reading it block-to-block
+        # would let a single sweep silently mix differently-averaged blocks together.
+        n_avg = self.avg_get_active_count()
+        if n_avg > 1:
+            print(f"sweep_loop: time averaging ON - {n_avg} captures/block")
 
         for i, fc in enumerate(self.centers):
             if self.stop_flag.is_set():
@@ -894,7 +1156,8 @@ class EmcScanner(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # allow tuner/AGC to settle and flush driver buffers
+            # allow tuner/AGC to settle and flush driver buffers (once per hop, not once
+            # per averaged capture - the tuner isn't retuned between averaging captures)
             time.sleep(0.12)
             try:
                 _ = self.sdr.read_samples(512)
@@ -902,31 +1165,46 @@ class EmcScanner(QtWidgets.QMainWindow):
             except Exception as e:
                 print("sweep_loop: flush read_samples error:", e)
 
-            # Read samples and enforce length
-            samples = self.sdr.read_samples(NFFT)
-            samples = samples[:NFFT]
+            # ---- Capture + average (in POWER, not dB) ----
+            # Averaging in the log domain would bias the result low; averaging the linear
+            # power |spec|^2 across n_avg independent captures and THEN converting to dB
+            # is the standard periodogram-averaging approach (as used e.g. in Welch's
+            # method) and is what actually reduces trace noise. With n_avg=1 (averaging
+            # off) this reduces to exactly the original single-capture formula, since
+            # 10*log10(|spec|^2) == 20*log10(|spec|).
+            power_acc = None
+            captures_done = 0
+            for _k in range(n_avg):
+                if self.stop_flag.is_set():
+                    break
+                samples = self._read_normalized_iq(NFFT)
+                spec = np.fft.fftshift(np.fft.fft(samples * window))
+                spec = spec / NFFT
+                power = np.abs(spec) ** 2
+                power_acc = power if power_acc is None else power_acc + power
+                captures_done += 1
 
-            # Preserve complex IQ and normalize
-            if np.iscomplexobj(samples):
-                samples = samples.astype(np.complex64) / 128.0
-            else:
-                if samples.dtype == np.uint8:
-                    f = samples.astype(np.float32) - 128.0
-                else:
-                    f = samples.astype(np.float32)
-                if (f.size % 2) != 0:
-                    f = f[:-1]
-                f = f.reshape(-1, 2)
-                samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
+            if captures_done == 0:
+                # Stopped before a single capture completed - nothing to store this block.
+                continue
 
-            # FFT
-            spec = np.fft.fftshift(np.fft.fft(samples * window))
-            spec = spec / NFFT
-            psd = 20 * np.log10(np.abs(spec) + 1e-12) + self._psd_to_dbuv_const
+            mean_power = power_acc / float(captures_done)
+            psd_full = 10.0 * np.log10(mean_power + 1e-12) + self._psd_to_dbuv_const
 
             # Frequency axis for this FFT block (use same fc). Use the LIVE sample rate
             # (self.SAMPLE_RATE), which set_preset() updates - not the module-level default.
-            freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / self.SAMPLE_RATE)) + float(fc)
+            freqs_full = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / self.SAMPLE_RATE)) + float(fc)
+
+            # ---- Mask the outer edges before this block enters the stitched display ----
+            # freqs_full/psd_full cover the FULL captured bandwidth (including the noisy/
+            # rolled-off edges); freqs/psd below are the trimmed "kept" slice that actually
+            # gets stored and stitched. edge_bins/kept_bins were computed once above.
+            if edge_bins > 0:
+                freqs = freqs_full[edge_bins:NFFT - edge_bins]
+                psd = psd_full[edge_bins:NFFT - edge_bins]
+            else:
+                freqs = freqs_full
+                psd = psd_full
 
             # Diagnostic: block peak info and sample checksum
             peak_idx = np.nanargmax(psd)
@@ -940,8 +1218,8 @@ class EmcScanner(QtWidgets.QMainWindow):
             # Diagnostic: show block frequency span and planned storage indices
             fmin = freqs.min()
             fmax = freqs.max()
-            start = i * NFFT
-            stop = start + NFFT
+            start = i * kept_bins
+            stop = start + kept_bins
             #print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz planned store [{start}:{stop}]")
 
             # Safety checks before writing into stitched arrays
@@ -967,24 +1245,26 @@ class EmcScanner(QtWidgets.QMainWindow):
 
             # Compare with previous block if present and non-empty
             if i > 0:
-                prev = self.power_axis[start-NFFT:start]
+                prev = self.power_axis[start-kept_bins:start]
                 if not np.all(prev == -200.0):
                     prev_checksum = float(np.sum(np.round(prev, 6)))
                     prev_peak_idx = int(np.nanargmax(prev))
-                    prev_peak_freq = float(self.freq_axis[start-NFFT:start][prev_peak_idx])
+                    prev_peak_freq = float(self.freq_axis[start-kept_bins:start][prev_peak_idx])
                     print(f"sweep_loop DIAG: prev block {i-1} peak {prev_peak_freq/1e6:.6f} MHz checksum {prev_checksum:.6f}")
                     if abs(psd_checksum - prev_checksum) < 1e-6:
                         print(f"sweep_loop: WARNING - block {i} PSD checksum equals previous block -> skipping write")
                         continue
 
-            # Store block in stitched spectrum (single atomic write)
+            # Store block in stitched spectrum (single atomic write) - the MASKED/kept
+            # slice only. The full, unmasked freqs_full/psd_full never get stored/stitched.
             self.freq_axis[start:stop] = freqs
             self.power_axis[start:stop] = psd
 
-            # show current block overlay (debug only)
+            # show current block overlay (debug only) - shows the FULL captured block,
+            # including the masked edges, so you can see exactly what's being trimmed off.
             try:
                 if hasattr(self, "debug_block_curve"):
-                    self.debug_block_curve.setData(freqs, psd)
+                    self.debug_block_curve.setData(freqs_full, psd_full)
             except Exception:
                 pass
 
