@@ -17,7 +17,7 @@ target_dir = r"C:\Spectrum"
 
 #--------------------------------------------------------------
 
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 
 init_done = False
@@ -54,7 +54,30 @@ class EmcScanner(QtWidgets.QMainWindow):
             QtCore.Qt.QueuedConnection,
             QtCore.Q_ARG(str, msg)
         )
-    
+
+    def update_status_panel(self):
+        """
+        Rebuild the stable status panel text from the current live settings. Called
+        whenever a setting actually changes (set_preset, averaging toggled/changed) -
+        NOT once per sweep block - and safe to call from either thread since QLabel's
+        setText is invoked via a queued call, matching the thread-safety pattern log() uses.
+        """
+        mode_label = getattr(self, "current_mode_label", "-")
+        avg_text = (f"ON ({self.avg_count})" if getattr(self, "avg_enabled", False)
+                    else "OFF")
+        text = (
+            f"Mode: {mode_label}\n"
+            f"Start: {self.START_FREQ/1e6:.3f} MHz    Stop: {self.STOP_FREQ/1e6:.3f} MHz\n"
+            f"Sample Rate: {self.SAMPLE_RATE/1e6:.3f} MS/s    Gain: {self.sdr_gain}\n"
+            f"Averaging: {avg_text}"
+        )
+        QtCore.QMetaObject.invokeMethod(
+            self.status_panel,
+            "setText",
+            QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG(str, text)
+        )
+
     # Use this to build centers across the sweep band
     # start_hz, stop_hz, sample_rate are floats
     def build_centers(self, start_hz, stop_hz, sample_rate):
@@ -160,6 +183,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.avg_enabled = False
         self.avg_count = 4
 
+        # Label of whichever preset/MODE is currently active, shown on the stable status
+        # panel (see update_status_panel()). "-" until a MODE button has been pressed.
+        self.current_mode_label = "-"
+
 
         # ---- Driver selection at startup ----
         driver_dirs = {
@@ -227,7 +254,23 @@ class EmcScanner(QtWidgets.QMainWindow):
         left_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(left_layout)
 
+        # ---- Status panel: stable, non-scrolling display of the current scan settings ----
+        # Unlike self.debug below (a scrolling log), this widget's text is always fully
+        # REPLACED (setText), never appended to - so it never scrolls or "jitters". It's
+        # refreshed by update_status_panel() whenever a setting actually changes (mode
+        # selected, averaging toggled/changed) - not on every sweep block.
+        self.status_panel = QtWidgets.QLabel()
+        self.status_panel.setStyleSheet(
+            "QLabel { background-color: #202020; color: #E0E0E0; padding: 4px; }"
+        )
+        self.status_panel.setFont(QtGui.QFont("Consolas", 9))
+        left_layout.addWidget(self.status_panel)
+
         # ---- Debug console ----
+        # Reserved for discrete lifecycle events (sweep started/stopped, mode changed) and
+        # errors/warnings only - see the print() redirect further down, which keeps routine
+        # per-block sweep diagnostics OUT of this window (console-only) so it stays stable
+        # instead of scrolling on every FFT block.
         self.debug = QtWidgets.QPlainTextEdit()
         self.debug.setReadOnly(True)
         self.debug.setMaximumHeight(120)
@@ -493,19 +536,31 @@ class EmcScanner(QtWidgets.QMainWindow):
             "checksum=", float(np.sum(np.round(np.asarray(self.cispr_limits, dtype=np.float64),3))))
 
         # ---- Redirect print() to debug window ----
+        # sweep_loop() (and friends) print a LOT of routine per-block diagnostics (tuning,
+        # checksums, peaks, etc.) - useful in the real console, but appending every one of
+        # them to the GUI debug window is exactly what made it feel "jittery"/constantly
+        # scrolling. So: everything still goes to the real console as before, but only
+        # messages that look like an error or warning are also forwarded to the GUI window.
+        # Routine diagnostics stay console-only; the debug window now only ever gets
+        # discrete lifecycle events (logged directly via self.log(), e.g. sweep started/
+        # stopped, mode changed) plus genuine errors/warnings - exactly the "stable unless
+        # something goes wrong" behaviour asked for.
         import builtins
         real_print = builtins.print
 
         def gui_print(*args, **kwargs):
             text = " ".join(str(a) for a in args)
-            self.log(text)
             real_print(*args, **kwargs)
+            lowered = text.lower()
+            if "error" in lowered or "warning" in lowered:
+                self.log(text)
 
         builtins.print = gui_print
 
         # ---- Final startup log ----
         self.log(f"Using driver path: {self.driver_path}")
         self.log("Setup complete")
+        self.update_status_panel()   # show initial (module-default) settings until a MODE is picked
 
 
 
@@ -631,6 +686,12 @@ class EmcScanner(QtWidgets.QMainWindow):
 
             # Reflect the new mode's calibration in the CISPR display and redraw the line.
             self.cispr_refresh_offset_ui()
+
+            # Refresh the stable status panel (Start/Stop/Sample Rate/Gain/Averaging) -
+            # this is the ONLY per-mode "log-like" update that matters for the operator
+            # once running, so it gets the stable panel rather than another scrolling line.
+            self.current_mode_label = _label
+            self.update_status_panel()
 
         except Exception as e:
             print("set_preset: unexpected error:", e)
@@ -896,10 +957,12 @@ class EmcScanner(QtWidgets.QMainWindow):
     def avg_on_toggle(self, checked):
         """Time Averaging checkbox -> model. Read by sweep_loop() via avg_get_active_count()."""
         self.avg_enabled = bool(checked)
+        self.update_status_panel()
 
     def avg_on_count_changed(self, val):
         """Averages spinbox -> model. Read by sweep_loop() via avg_get_active_count()."""
         self.avg_count = int(val)
+        self.update_status_panel()
 
     def avg_get_active_count(self):
         """Number of FFT captures to average per block: 1 (no averaging) unless enabled."""
@@ -995,12 +1058,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         if self.sweep_thread and self.sweep_thread.is_alive():
             return
         self.log("=== FAST SWEEP STARTED ===")
-        self.log(f"Range: {self.START_FREQ/1e6:.3f} → {self.STOP_FREQ/1e6:.3f} MHz")
-        self.log(f"Sample rate: {self.SAMPLE_RATE/1e6:.3f} MS/s")
-        self.log(f"Gain: {self.sdr_gain} dB")
-        self.log(f"Edge mask: {self.stitch_edge_mask_fraction*100:.0f}% per side "
-                 f"({self.stitch_get_kept_bins()}/{NFFT} bins kept per block)")
-        self.log(f"Time averaging: {'ON, ' + str(self.avg_get_active_count()) + ' captures/block' if self.avg_enabled else 'OFF'}")
+        # Range/Sample rate/Gain/Averaging are shown on the stable status panel (see
+        # update_status_panel()) rather than logged here - logging them on every sweep
+        # start would just duplicate what's already always visible above.
+        self.update_status_panel()
 
         # Build centers from current preset (same logic as start_continuous)
         if self.START_FREQ == self.STOP_FREQ:
@@ -1008,7 +1069,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         else:
             self.centers = self.build_centers(self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE)
 
-        # Diagnostic: show centers and expected block ranges (MHz)
+        # Diagnostic: show centers and expected block ranges (MHz) - console only (see
+        # the print() redirect above); not forwarded to the GUI debug window.
         print("start_sweep Diagnostic: centers (MHz):", (self.centers / 1e6).tolist())
         block_width_hz = self.SAMPLE_RATE
         ranges = [(c - block_width_hz/2.0, c + block_width_hz/2.0) for c in self.centers]
@@ -1047,9 +1109,9 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
 
         self.log("=== CONTINUOUS MODE STARTED ===")
-        self.log(f"Edge mask: {self.stitch_edge_mask_fraction*100:.0f}% per side "
-                 f"({self.stitch_get_kept_bins()}/{NFFT} bins kept per block)")
-        self.log(f"Time averaging: {'ON, ' + str(self.avg_get_active_count()) + ' captures/block' if self.avg_enabled else 'OFF'}")
+        # Range/Sample rate/Gain/Averaging are shown on the stable status panel rather
+        # than logged here - see update_status_panel().
+        self.update_status_panel()
         self.stop_flag.clear()
         # init_sdr should be idempotent; it will skip reopen if already open, and always
         # re-applies self.SAMPLE_RATE/self.sdr_gain/self.hf_mode to the hardware.
