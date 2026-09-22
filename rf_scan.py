@@ -263,7 +263,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         ctrl_layout = QtWidgets.QHBoxLayout()
         left_layout.addLayout(ctrl_layout)
 
-        self.btn_start = QtWidgets.QPushButton("START FAST SWEEP")
+        self.btn_start = QtWidgets.QPushButton("START SINGLE SWEEP")
         self.btn_stop = QtWidgets.QPushButton("STOP")
         self.btn_save = QtWidgets.QPushButton("SAVE CSV")
         self.chk_cispr = QtWidgets.QCheckBox("Show CISPR limit")
@@ -335,9 +335,15 @@ class EmcScanner(QtWidgets.QMainWindow):
         # the operator's live CISPR Offset spinbox value - see cispr_get_effective_offset().
         # All zero for now; fill these in as calibration data becomes available per mode.
         self.presets = [
-            ("30M", "30M HF", 150e3, 30e6, 2.4e6, 120, True, 0.0),
-            ("30M2", "30M HF2  ", 2e6, 30e6, 2.4e6, 120, True, 0.0),
-            ("30M3", "30M NOT HF ", 2e6, 30e6, 2.4e6, 120, False, 0.0),
+            ("SF1", "4.5 2.048", 4.5e6, 4.5e6, 2.048e6, 60, False, 0.0),
+            ("SF1", "4.5 2.8", 4.5e6, 4.5e6, 2.8e6, 60, False, 0.0),
+            ("SF3", "2Mh B", 1e6, 1e6, 3.2e6, 60, True, 0.0),
+            ("SF4", "2M B", 1e6, 1e6, 3,2e6, 60, False, 0.0),
+            ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 60, True, 0.0),
+            ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 60, False, 0.0),
+            ("30M", "150k-30Mhz 1", 150e3, 30e6, 1.8e6, 120, False, 0.0),
+            ("30M2", "2-30Mhz 2  ", 150e3, 30e6, 2.4e6, 120, False, 0.0),
+            ("30M3", "2-30Mhz 3", 150e3, 30e6, 3.2e6, 120, False, 0.0),
             ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 30, False, 0.0),
             ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 37, False, 0.0),
             ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 120, False, 0.0),
@@ -927,16 +933,16 @@ class EmcScanner(QtWidgets.QMainWindow):
             peak_freq = freqs[peak_idx]
             peak_level = psd[peak_idx]
             psd_checksum = np.sum(np.round(psd, 3))
-            print(f"DIAG block {i}: peak {peak_freq/1e6:.6f} MHz @ {peak_level:.1f} dB, checksum {psd_checksum:.3f}")
-            print("DIAG block sample freqs[0:6] (MHz):", (freqs[:6]/1e6).tolist())
-            print("DIAG block sample psd[0:6]:", psd[:6].tolist())
+            #print(f"DIAG block {i}: peak {peak_freq/1e6:.6f} MHz @ {peak_level:.1f} dB, checksum {psd_checksum:.3f}")
+            #print("DIAG block sample freqs[0:6] (MHz):", (freqs[:6]/1e6).tolist())
+            #print("DIAG block sample psd[0:6]:", psd[:6].tolist())
 
             # Diagnostic: show block frequency span and planned storage indices
             fmin = freqs.min()
             fmax = freqs.max()
             start = i * NFFT
             stop = start + NFFT
-            print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz planned store [{start}:{stop}]")
+            #print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz planned store [{start}:{stop}]")
 
             # Safety checks before writing into stitched arrays
             if self.freq_axis is None or self.power_axis is None:
@@ -949,8 +955,8 @@ class EmcScanner(QtWidgets.QMainWindow):
 
             # Detect accidental overwrite (indicates logic bug)
             existing_mask = ~np.isnan(self.freq_axis[start:stop])
-            if existing_mask.any():
-                print(f"sweep_loop: WARNING - block {i} would overwrite existing data at indices {start}:{stop}")
+            #if existing_mask.any():
+            #    print(f"sweep_loop: WARNING - block {i} would overwrite existing data at indices {start}:{stop}")
 
             # Diagnostic: compute checksums and peaks for comparison
             peak_idx = np.nanargmax(psd)
