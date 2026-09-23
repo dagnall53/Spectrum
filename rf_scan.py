@@ -180,8 +180,16 @@ class EmcScanner(QtWidgets.QMainWindow):
         # for how many consecutive FFT captures (per frequency block) to average together.
         # Averaging is done in POWER (linear), never in dB - see avg_get_active_count()
         # and sweep_loop(). avg_count=1 or avg_enabled=False both mean "no averaging".
-        self.avg_enabled = False
-        self.avg_count = 4
+        self.avg_enabled = True
+        self.avg_count = 20
+
+        # ---- Artefact-correction state (DC offset removal / IQ balance correction) ----
+        # Both target known direct-conversion-receiver artefacts that track center
+        # frequency and sample rate rather than being real signals - see
+        # _remove_dc_offset() / _correct_iq_imbalance() for what each one does and why.
+        # Both default OFF so existing behaviour is unchanged until switched on.
+        self.dc_removal_enabled = True
+        self.iq_balance_enabled = False
 
         # Label of whichever preset/MODE is currently active, shown on the stable status
         # panel (see update_status_panel()). "-" until a MODE button has been pressed.
@@ -218,7 +226,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         os.add_dll_directory(self.driver_path)
 
         # ---- Window title ----
-        self.setWindowTitle("EMC FAST Sweep 150 kHz – 30 MHz")
+        self.setWindowTitle("EMC Sweep")
 
         # RTL-SDR handle
         self.sdr = None
@@ -433,7 +441,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         # cost of a slower sweep (avg_count reads per hop instead of one).
         self.chk_avg = QtWidgets.QCheckBox("Time Averaging")
         self.avg_count_spin = QtWidgets.QSpinBox()
-        self.avg_count_spin.setRange(1, 64)
+        self.avg_count_spin.setRange(1, 150)
         self.avg_count_spin.setValue(self.avg_count)
         self.avg_count_spin.setSuffix(" avgs")
         self.avg_count_spin.setToolTip(
@@ -477,6 +485,35 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_capture_ref.clicked.connect(self.reference_capture)
         self.chk_show_ref.toggled.connect(self.reference_toggle_visibility)
 
+        # ---- Signal-processing toggle row (artefact correction) ----
+        # DC Offset Removal and IQ Balance Correction each target a specific
+        # direct-conversion-receiver artefact that tracks center frequency / sample rate
+        # rather than being a real signal - see _remove_dc_offset() / _correct_iq_imbalance().
+        # Both default OFF; switch them on independently to see which (if either) accounts
+        # for a given spike.
+        ctrl_layout3 = QtWidgets.QHBoxLayout()
+        left_layout.addLayout(ctrl_layout3)
+
+        self.chk_dc_removal = QtWidgets.QCheckBox("DC Offset Removal")
+        self.chk_dc_removal.setChecked(self.dc_removal_enabled)
+        self.chk_dc_removal.setToolTip(
+            "Subtract each block's own mean IQ value before windowing/FFT. Targets the "
+            "repeated spike at each block's center frequency caused by LO leakage / ADC "
+            "DC bias - not a real signal if it moves when you change range or sample rate."
+        )
+        ctrl_layout3.addWidget(self.chk_dc_removal)
+        self.chk_dc_removal.toggled.connect(self.dc_removal_on_toggle)
+
+        self.chk_iq_balance = QtWidgets.QCheckBox("IQ Balance Correction")
+        self.chk_iq_balance.setChecked(self.iq_balance_enabled)
+        self.chk_iq_balance.setToolTip(
+            "Blind per-block correction of I/Q gain and phase mismatch. Targets a mirrored "
+            "spike reflected around each block's center frequency, caused by receiver I/Q "
+            "imbalance rather than a real signal."
+        )
+        ctrl_layout3.addWidget(self.chk_iq_balance)
+        self.chk_iq_balance.toggled.connect(self.iq_balance_on_toggle)
+
         # ---- Sweep state ----
         self.stop_flag = threading.Event()
         self.sweep_thread = None
@@ -510,14 +547,16 @@ class EmcScanner(QtWidgets.QMainWindow):
             ("SF4", "2M B", 1e6, 1e6, 3.2e6, 60, False, 0.0),
             ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 60, True, 0.0),
             ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 60, False, 0.0),
-            ("30M", "150k-30Mhz 1", 150e3, 30e6, 1.8e6, 120, False, 0.0),
-            ("30M2", "2-30Mhz 2  ", 150e3, 30e6, 2.4e6, 120, False, 0.0),
-            ("30M3", "2-30Mhz 3", 150e3, 30e6, 3.2e6, 120, False, 0.0),
-            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 30, False, 0.0),
-            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 37, False, 0.0),
-            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 120, False, 0.0),
-            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 37, False, 0.0),
-            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 37, False, 0.0),
+            ("30M", "150k-30Mhz 1", 150e3, 30e6, 1.8e6, 60, False, 0.0),
+            ("30M2", "2-30Mhz 2  ", 150e3, 30e6, 2.4e6, 60, False, 0.0),
+            ("30M3", "2-30Mhz 3", 150e3, 30e6, 3.2e6, 60, False, 0.0),
+            ("30-200M3", "30-200Mhz 3", 30e6, 200e6, 3.2e6, 60, False, 0.0),
+            ("200-900M3", "200-900Mhz 3", 200e6, 900e6, 3.2e6, 60, False, 0.0),
+            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 60, False, 0.0),
+            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 60, False, 0.0),
+            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 60, False, 0.0),
+            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 60, False, 0.0),
+            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 60, False, 0.0),
         ]
 
         # Create buttons in a loop so adding presets is trivial
@@ -988,7 +1027,64 @@ class EmcScanner(QtWidgets.QMainWindow):
                 f = f[:-1]
             f = f.reshape(-1, 2)
             samples = (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
+
+        # ---- Optional artefact correction (both OFF by default, GUI-toggleable) ----
+        # Applied here, on the RAW IQ samples, BEFORE windowing/FFT. The center-frequency
+        # "DC spike" and its mirrored image are properties of the raw ADC/tuner samples
+        # (LO leakage and I/Q gain-phase mismatch) - not of the window function - so
+        # correcting them here is both the standard approach and more accurate than
+        # trying to remove them from an already-windowed block: the window weights
+        # samples unevenly, which would bias a windowed-mean DC estimate, and does
+        # nothing at all for IQ imbalance, which is a per-sample I/Q relationship the
+        # window doesn't touch.
+        if getattr(self, "dc_removal_enabled", False):
+            samples = self._remove_dc_offset(samples)
+        if getattr(self, "iq_balance_enabled", False):
+            samples = self._correct_iq_imbalance(samples)
+
         return samples
+
+    def _remove_dc_offset(self, samples):
+        """
+        Subtract this block's own mean IQ value. Targets the "spike at the block's
+        center frequency" artefact caused by LO leakage / ADC DC bias in direct-
+        conversion receivers: since it sits at fc for every block, once many blocks are
+        stitched together it shows up as a repeated spike, spaced by the per-block hop
+        width - exactly the "moves with center frequency / sample rate" symptom.
+        """
+        return (samples - np.mean(samples)).astype(np.complex64)
+
+    def _correct_iq_imbalance(self, samples):
+        """
+        Blind, per-block moment-based I/Q gain and phase imbalance correction (estimates
+        the imbalance fresh from every block, rather than applying one fixed factory
+        calibration). Gain/phase mismatch between a receiver's I and Q channels produces a
+        mirrored, attenuated image of any strong nearby component - including the DC/LO
+        leakage spike - reflected around the block's center frequency: another artefact
+        that tracks center frequency and sample rate rather than being a real signal.
+        Re-estimating per block adapts automatically but is noisier than a one-off
+        calibration would be.
+        """
+        I = samples.real
+        Q = samples.imag
+        p_i = float(np.mean(I * I))
+        p_q = float(np.mean(Q * Q))
+        if p_i <= 0.0 or p_q <= 0.0:
+            return samples
+        gain = math.sqrt(p_q / p_i)
+        sin_phi = float(np.mean(I * Q)) / math.sqrt(p_i * p_q)
+        sin_phi = max(-0.999, min(0.999, sin_phi))
+        cos_phi = math.sqrt(1.0 - sin_phi * sin_phi)
+        Q_corrected = (Q / gain - sin_phi * I) / cos_phi
+        return (I + 1j * Q_corrected).astype(np.complex64)
+
+    def dc_removal_on_toggle(self, checked):
+        """DC Offset Removal checkbox -> model. Read by _read_normalized_iq()."""
+        self.dc_removal_enabled = bool(checked)
+
+    def iq_balance_on_toggle(self, checked):
+        """IQ Balance Correction checkbox -> model. Read by _read_normalized_iq()."""
+        self.iq_balance_enabled = bool(checked)
 
     # =====================================================================
     # Display toggles: frequency markers & reference trace
@@ -1408,6 +1504,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     def save_csv(self):
         if self.freq_axis is None or self.power_axis is None:
+            self.log("Save FFT: no live data to save yet")
             return
 
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1420,8 +1517,34 @@ class EmcScanner(QtWidgets.QMainWindow):
         f = self.freq_axis[idx]
         p = self.power_axis[idx]
 
-        data = np.column_stack((f, p))
-        np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
+        have_ref = (getattr(self, "reference_freq", None) is not None
+                    and getattr(self, "reference_power", None) is not None
+                    and len(self.reference_freq) > 0)
+
+        if not have_ref:
+            # No reference captured - unchanged behaviour from before.
+            data = np.column_stack((f, p))
+            np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
+            self.log(f"Saved live trace ({len(f)} points) to {path}")
+            return
+
+        # A captured reference trace may have been taken under different sweep settings
+        # (different MODE, sample rate, etc.) than the current live trace, so it can have
+        # a different length and a different frequency grid. Rather than assume the two
+        # line up row-for-row, write them as two independent (freq, level) column pairs;
+        # whichever trace is shorter just leaves its trailing cells blank.
+        rf = np.asarray(self.reference_freq, dtype=np.float64)
+        rp = np.asarray(self.reference_power, dtype=np.float64)
+        n = max(len(f), len(rf))
+        with open(path, "w", newline="") as fh:
+            fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
+            for i in range(n):
+                a = f"{f[i]:.6f}" if i < len(f) else ""
+                b = f"{p[i]:.3f}" if i < len(p) else ""
+                c = f"{rf[i]:.6f}" if i < len(rf) else ""
+                d = f"{rp[i]:.3f}" if i < len(rp) else ""
+                fh.write(f"{a},{b},{c},{d}\n")
+        self.log(f"Saved live ({len(f)} pts) + reference ({len(rf)} pts) trace to {path}")
 
     def closeEvent(self, event):
         self.stop_flag.set()
