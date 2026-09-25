@@ -28,7 +28,13 @@ STOP_FREQ  = 102e6        # 30 MHz
 #STEP_HZ    = 2000       # 300 kHz per center
 SAMPLE_RATE = 2.4e6      # Hz
 NFFT        = 4096
-GAIN        = 120     # or numeric (e.g. 30)
+GAIN_DB        = 120     # Requested gain, in dB - NOT a raw device table index. The
+                         # device only supports specific dB steps (query self.sdr.get_gains()
+                         # for the list, given in TENTHS of dB) and silently rounds/clamps
+                         # to the nearest one it has - e.g. on the RTL-SDR Blog V4, 49.6 dB
+                         # is the maximum, so this default of 120 dB actually just requests
+                         # (and receives) the device's max, 49.6 dB. See init_sdr(), which
+                         # reads back and logs the actual applied gain every time it runs.
 
 # ---- Stitching / edge-masking ----
 # Each FFT block's outer edges show visible artefacts (front-end filter roll-off and/or
@@ -65,10 +71,25 @@ class EmcScanner(QtWidgets.QMainWindow):
         mode_label = getattr(self, "current_mode_label", "-")
         avg_text = (f"ON ({self.avg_count})" if getattr(self, "avg_enabled", False)
                     else "OFF")
+        # Show the actual applied gain alongside the requested one - but ONLY when
+        # actual_gain_db is known to have been measured against the CURRENTLY selected
+        # gain_db. Right after a MODE switch, self.gain_db has changed but the hardware
+        # hasn't been touched yet (that only happens when a sweep next starts), so
+        # actual_gain_db/actual_gain_db_for_request still reflect the PREVIOUS mode -
+        # comparing them against the new gain_db would report a false, stale mismatch.
+        actual = getattr(self, "actual_gain_db", None)
+        actual_for = getattr(self, "actual_gain_db_for_request", None)
+        if actual is not None and actual_for == self.gain_db:
+            if abs(actual - self.gain_db) > 0.5:
+                gain_text = f"{self.gain_db:.1f} dB requested -> {actual:.1f} dB actual"
+            else:
+                gain_text = f"{self.gain_db:.1f} dB"
+        else:
+            gain_text = f"{self.gain_db:.1f} dB (not yet applied - press Start)"
         text = (
             f"Mode: {mode_label}\n"
             f"Start: {self.START_FREQ/1e6:.3f} MHz    Stop: {self.STOP_FREQ/1e6:.3f} MHz\n"
-            f"Sample Rate: {self.SAMPLE_RATE/1e6:.3f} MS/s    Gain: {self.sdr_gain}\n"
+            f"Sample Rate: {self.SAMPLE_RATE/1e6:.3f} MS/s    Gain: {gain_text}\n"
             f"Averaging: {avg_text}"
         )
         QtCore.QMetaObject.invokeMethod(
@@ -187,7 +208,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Both target known direct-conversion-receiver artefacts that track center
         # frequency and sample rate rather than being real signals - see
         # _remove_dc_offset() / _correct_iq_imbalance() for what each one does and why.
-        # Both default OFF so existing behaviour is unchanged until switched on.
+        # DC Offset Removal defaults ON - it was found to be the far larger of the two
+        # effects on this hardware. IQ Balance Correction still defaults off.
         self.dc_removal_enabled = True
         self.iq_balance_enabled = False
 
@@ -235,12 +257,24 @@ class EmcScanner(QtWidgets.QMainWindow):
         # These start as copies of the module-level defaults, but from here on they are
         # the live settings actually used to sweep. set_preset() updates these when a MODE
         # button is pressed; start_sweep()/start_continuous()/init_sdr()/sweep_loop() all
-        # read self.START_FREQ/self.STOP_FREQ/self.SAMPLE_RATE/self.sdr_gain, never the
+        # read self.START_FREQ/self.STOP_FREQ/self.SAMPLE_RATE/self.gain_db, never the
         # bare module-level constants, so a preset change actually takes effect.
         self.START_FREQ = START_FREQ
         self.STOP_FREQ = STOP_FREQ
         self.SAMPLE_RATE = SAMPLE_RATE
-        self.sdr_gain = GAIN
+        self.gain_db = GAIN_DB
+        # Actual gain reported back by the device after the last init_sdr() call - may
+        # differ from self.gain_db, since the driver silently rounds/clamps whatever we
+        # request to the nearest value the hardware supports. None until a sweep has
+        # actually opened the SDR at least once. See init_sdr() and update_status_panel().
+        self.actual_gain_db = None
+        # Which gain_db value actual_gain_db was actually measured against - i.e. what
+        # self.gain_db was AT THE TIME init_sdr() applied it. Switching modes changes
+        # self.gain_db immediately, but the hardware isn't reconfigured until the next
+        # sweep actually starts, so actual_gain_db can be stale (left over from a
+        # DIFFERENT mode) for a while after a MODE click. update_status_panel() only
+        # trusts actual_gain_db when this still matches the current self.gain_db.
+        self.actual_gain_db_for_request = None
 
         # Sweep centers
         self.centers = self.build_centers(self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE)
@@ -489,8 +523,9 @@ class EmcScanner(QtWidgets.QMainWindow):
         # DC Offset Removal and IQ Balance Correction each target a specific
         # direct-conversion-receiver artefact that tracks center frequency / sample rate
         # rather than being a real signal - see _remove_dc_offset() / _correct_iq_imbalance().
-        # Both default OFF; switch them on independently to see which (if either) accounts
-        # for a given spike.
+        # DC Offset Removal defaults ON (confirmed to be the larger effect on this
+        # hardware); IQ Balance Correction still defaults off - switch it on to see
+        # whether it accounts for any remaining spike once DC removal is active.
         ctrl_layout3 = QtWidgets.QHBoxLayout()
         left_layout.addLayout(ctrl_layout3)
 
@@ -540,23 +575,23 @@ class EmcScanner(QtWidgets.QMainWindow):
         # reference signal's true dBuV level against what this mode reads). It is added to
         # the operator's live CISPR Offset spinbox value - see cispr_get_effective_offset().
         # All zero for now; fill these in as calibration data becomes available per mode.
+        #Supported gains: [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
         self.presets = [
-            ("SF1", "4.5 2.048", 4.5e6, 4.5e6, 2.048e6, 60, False, 0.0),
-            ("SF1", "4.5 2.8", 4.5e6, 4.5e6, 2.8e6, 60, False, 0.0),
-            ("SF3", "2Mh B", 1e6, 1e6, 3.2e6, 60, True, 0.0),
-            ("SF4", "2M B", 1e6, 1e6, 3.2e6, 60, False, 0.0),
-            ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 60, True, 0.0),
-            ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 60, False, 0.0),
-            ("30M", "150k-30Mhz 1", 150e3, 30e6, 1.8e6, 60, False, 0.0),
-            ("30M2", "2-30Mhz 2  ", 150e3, 30e6, 2.4e6, 60, False, 0.0),
-            ("30M3", "2-30Mhz 3", 150e3, 30e6, 3.2e6, 60, False, 0.0),
-            ("30-200M3", "30-200Mhz 3", 30e6, 200e6, 3.2e6, 60, False, 0.0),
-            ("200-900M3", "200-900Mhz 3", 200e6, 900e6, 3.2e6, 60, False, 0.0),
-            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 60, False, 0.0),
-            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 60, False, 0.0),
-            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 60, False, 0.0),
-            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 60, False, 0.0),
-            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 60, False, 0.0),
+            ("SF3", "2M HF", 1e6, 1e6, 3.2e6, 40.2, True, 0.0),
+            ("SF4", "2M ", 1e6, 1e6, 3.2e6, 40.2, False, 0.0),
+            ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 40.2, True, 0.0),
+            ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 40.2, False, 0.0),
+            ("LF3", "2M-6 3.2", 2e6, 6e6, 3.2e6, 40.2, False, 0.0),
+            ("LF4", "6M-12 3.2", 6e6, 12e6, 3.2e6, 40.2, False, 0.0),
+            ("30M3", "0-30Mhz 3.2", 150e3, 30e6, 3.2e6, 40.2, False, 0.0),
+            ("30-200M3", "30-200Mhz 3", 30e6, 200e6, 3.2e6, 40.2, False, 0.0),
+            ("200-900M3", "200-900Mhz 3", 200e6, 900e6, 3.2e6, 40.2, False, 0.0),
+            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 40.2, False, 0.0),
+            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 40.2, False, 0.0),
+            ("VHF", "Broadcast VHF lw gain", 88e6, 108e6, 2.4e6, 20, False, 0.0),
+            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 40.2, False, 0.0),
+            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 40.2, False, 0.0),
+            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 40.2, False, 0.0),
         ]
 
         # Create buttons in a loop so adding presets is trivial
@@ -639,13 +674,31 @@ class EmcScanner(QtWidgets.QMainWindow):
         # DO NOT close here — this is your main SDR handle
         # self.sdr.close()
         # Always reapply parameters - use the LIVE preset values (self.SAMPLE_RATE /
-        # self.sdr_gain), which set_preset() updates when a MODE button is pressed.
-        # Using the module-level SAMPLE_RATE/GAIN constants here would silently ignore
+        # self.gain_db), which set_preset() updates when a MODE button is pressed.
+        # Using the module-level SAMPLE_RATE/GAIN_DB constants here would silently ignore
         # whichever mode the user last selected.
         self.sdr.sample_rate = self.SAMPLE_RATE
         self.sdr.set_agc_mode(False)
-        self.sdr.gain = self.sdr_gain
-        print("Gain set to:", self.sdr.get_gain())
+        self.sdr.gain = self.gain_db
+        # IMPORTANT: the driver snaps whatever dB value we ask for to the nearest value
+        # the hardware actually supports (the "Supported gains" list printed above, in
+        # TENTHS of dB - e.g. 402 there means 40.2 dB) - it does NOT treat the number we
+        # pass in as an index into that table, and it does not clip/error if we ask for
+        # more than the hardware can do; it just silently gives us its maximum instead.
+        # Reading back the actual applied gain (rather than trusting self.gain_db) is the
+        # only way to know what really happened - see update_status_panel().
+        self.actual_gain_db = float(self.sdr.get_gain())
+        # Record which request this reading actually corresponds to, so a later MODE
+        # switch (which changes self.gain_db immediately, before the hardware is touched
+        # again) can't make update_status_panel() compare a NEW request against this OLD
+        # actual value and report a false mismatch.
+        self.actual_gain_db_for_request = self.gain_db
+        print(f"Gain requested: {self.gain_db} dB -> actual: {self.actual_gain_db} dB")
+        if abs(self.actual_gain_db - self.gain_db) > 0.5:
+            print(f"WARNING: requested gain {self.gain_db} dB was not available; "
+                  f"the device is actually using {self.actual_gain_db} dB "
+                  f"(see 'Supported gains' above, in tenths of dB, for the full list)")
+        self.update_status_panel()
             
         # HF mode for RTL-SDR V4
         try:
@@ -663,7 +716,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         Apply a MODE button's settings: stop any in-progress sweep, then store the new
         start/stop/sample-rate/gain/hf_mode/dbuv_calibration as the LIVE settings that
         start_sweep(), start_continuous(), init_sdr(), sweep_loop() and the CISPR mapping
-        all read (self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE, self.sdr_gain,
+        all read (self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE, self.gain_db,
         self.hf_mode, self.dbuv_calibration). The SDR itself isn't reopened here -
         init_sdr() re-applies these values to the hardware the next time START SWEEP /
         START CONTINUOUS is pressed, so browsing between modes doesn't repeatedly
@@ -688,8 +741,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                 self.sweep_thread.join(timeout=1.0)
 
             # Unpack preset tuple: (internal_name, label, start_hz, stop_hz, sample_rate,
-            # gain, hf_mode_flag, dbuv_calibration)
-            _, _label, start_hz, stop_hz, sample_rate, gain, hf_flag, dbuv_cal = self.presets[preset_index]
+            # gain_db, hf_mode_flag, dbuv_calibration)
+            _, _label, start_hz, stop_hz, sample_rate, gain_db, hf_flag, dbuv_cal = self.presets[preset_index]
 
             # Store preset values as the LIVE settings for other code to use
             self.START_FREQ = float(start_hz)
@@ -698,7 +751,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
             # Preserve CISPR calibration; do not overwrite it with SDR preset gain.
             # Store SDR/preset gain separately so it cannot change CISPR mapping accidentally.
-            self.sdr_gain = float(gain)
+            self.gain_db = float(gain_db)
 
             # HF mode flag (affects SDR path and PSD constant only)
             self.hf_mode = bool(hf_flag)
@@ -720,7 +773,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                 pass
 
             self.log(f"MODE set: {_label}  {self.START_FREQ/1e6:.3f}-{self.STOP_FREQ/1e6:.3f} MHz, "
-                     f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.sdr_gain}, HF={self.hf_mode}, "
+                     f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}, "
                      f"dBuV_Calibration={self.dbuv_calibration:+.1f} dB")
 
             # Reflect the new mode's calibration in the CISPR display and redraw the line.
@@ -1149,7 +1202,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     def start_sweep(self):
         # Start a single fast stitched sweep (one-shot), using the LIVE preset settings
-        # (self.START_FREQ/self.STOP_FREQ/self.SAMPLE_RATE/self.sdr_gain) - i.e. whichever
+        # (self.START_FREQ/self.STOP_FREQ/self.SAMPLE_RATE/self.gain_db) - i.e. whichever
         # MODE button was last pressed, not the module-level defaults.
         if self.sweep_thread and self.sweep_thread.is_alive():
             return
@@ -1193,7 +1246,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Start sweep thread
         self.stop_flag.clear()
         # init_sdr should be idempotent; it will skip reopen if already open, and always
-        # re-applies self.SAMPLE_RATE/self.sdr_gain/self.hf_mode to the hardware.
+        # re-applies self.SAMPLE_RATE/self.gain_db/self.hf_mode to the hardware.
         self.init_sdr()
         self.sweep_thread = threading.Thread(target=self.sweep_loop, daemon=True)
         self.sweep_thread.start()
@@ -1210,7 +1263,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.update_status_panel()
         self.stop_flag.clear()
         # init_sdr should be idempotent; it will skip reopen if already open, and always
-        # re-applies self.SAMPLE_RATE/self.sdr_gain/self.hf_mode to the hardware.
+        # re-applies self.SAMPLE_RATE/self.gain_db/self.hf_mode to the hardware.
         self.init_sdr()
 
         # Build centers from current preset (same logic as start_sweep)
