@@ -1,0 +1,36 @@
+# settings.csv - sweep defaults and MODE buttons for rf_scan_portable,,,,,,,,
+#,,,,,,,,
+# Keep this file in the same folder as rf_scan_portable.py (or the .exe).,,,,,,,,
+# Lines starting with # and blank lines are ignored. Edit it, save it, restart the program.,,,,,,
+#,,,,,,,,
+# Columns:,,,,,,,,
+#   type        default = the band used before any MODE button is pressed (one row only),,,,,,,,
+#               preset  = one MODE button on the right-hand panel (top-to-bottom order),,,,,,,,
+#   name        short internal name (not shown; may be left blank),,,,,,,,
+#   label       text shown on the button (presets only),,,,,,,,
+#   start,stop  band edges. Plain numbers are Hz; or use a k / M / G suffix: 150k, 2M, 156.875M, 2.4G,,,,
+#   sample_rate sample rate, same notation (e.g. 3.2M or 2.4M). The RTL-SDR only accepts,,,,,,,
+#               225001-300000 and 900001-3200000 S/s (nothing between 0.3M and 0.9M),,,,,,,,
+#   gain_db     requested gain in dB (the RTL-SDR rounds to the nearest step it supports),,,,,,,,
+#   hf_mode     true / false  (generally leave false - HF mode has no gain),,,,,,,,
+#   dbuv_cal    fixed dBuV calibration for this mode, in dB,,,,,,,
+#,,,,,,,,
+# Tip: if you edit in Excel," save as ""CSV (Comma delimited)"".",,,,,,,
+#,,,,,,,,
+type,name,label,start,stop,sample_rate,gain_db,hf_mode,dbuv_cal
+setting,dc_offset_removal,on,,,,,,
+setting,iq_balance_correction,on,,,,,,
+setting,driver,default,,,,,,
+setting,driver_root,,,,,,,
+setting,driver_dialog,off,,,,,,
+default,,,95M,102M,2.4M,10,,
+preset,LF2,10k-1M 2.4,10k,1M,2.4M,0,FALSE,-47
+preset,LF1,100k-1.2M 3.2,100k,1.2M,3.2M,20.7,FALSE,-47
+preset,LF3,100k-6M 3.2,100k,6M,3.2M,40.2,FALSE,-47
+preset,LF4,6M-12 3.2,6M,12M,3.2M,40.2,FALSE,-47
+preset,30M3,12-30Mhz 3.2,12M,30M,3.2M,40.2,FALSE,-47
+preset,30-200M,30-200Mhz 3,30M,200M,3.2M,40.2,FALSE,-47
+preset,200-900,200-900Mhz 3,200M,900M,3.2M,40.2,FALSE,-47
+preset,900M-2.4,900Mhz - 2.4G 3,900M,24000M,3.2M,40.2,FALSE,-47
+preset,MVHF,Marine VHF,156M,162M,2.4M,40.2,FALSE,-47
+preset,VHF,Broadcast VHF,88M,108M,2.4M,40.2,FALSE,-47

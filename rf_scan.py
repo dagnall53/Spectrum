@@ -46,8 +46,20 @@ GAIN_DB        = 120     # Requested gain, in dB - NOT a raw device table index.
 # no gaps and no overlap. Adjust this constant if the FFT windowing/filtering changes.
 STITCH_EDGE_MASK_FRACTION = 0.15   # 15% discarded off each edge (30% of each block total)
 
+# Sample rates offered on the live Sample Rate control (see EmcScanner.__init__). Derived
+# from the distinct sample rates actually used across self.presets below - kept as its own
+# list (rather than scraped from the presets automatically) so the dropdown's order and
+# contents stay predictable even if presets are added/edited later.
+SAMPLE_RATE_CHOICES = [2.4e6, 2.56e6, 2.8e6, 3.2e6]
+
 class PlotSignals(QtCore.QObject):
     update = QtCore.pyqtSignal(object, object)
+    # Emitted by sweep_loop() (worker thread) whenever it rebuilds self.centers, so the
+    # GUI thread can redraw the frequency markers to match. draw_block_markers() touches
+    # Qt scene items directly and must only ever run on the GUI thread - this signal is
+    # what makes that safe when the rebuild itself happens on the worker thread (see the
+    # live Sample Rate control in sweep_loop()).
+    markers_changed = QtCore.pyqtSignal()
 
 class EmcScanner(QtWidgets.QMainWindow):
 
@@ -262,6 +274,11 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.START_FREQ = START_FREQ
         self.STOP_FREQ = STOP_FREQ
         self.SAMPLE_RATE = SAMPLE_RATE
+        # Which sample rate is actually configured on the hardware right now (set by
+        # init_sdr() and by sweep_loop()'s live-rate check) - may lag self.SAMPLE_RATE
+        # briefly after the Sample Rate combo box is changed while a sweep is running.
+        # None until the SDR has actually been opened at least once.
+        self._applied_sample_rate = None
         self.gain_db = GAIN_DB
         # Actual gain reported back by the device after the last init_sdr() call - may
         # differ from self.gain_db, since the driver silently rounds/clamps whatever we
@@ -415,6 +432,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         self.plot_signals = PlotSignals()
         self.plot_signals.update.connect(self.set_plot_data)
+        self.plot_signals.markers_changed.connect(self.draw_block_markers)
 
         # Add this in __init__ after creating self.plot
         self._block_markers = []   # list of (line_left, line_right) or shaded items
@@ -441,6 +459,26 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_stop.clicked.connect(self.stop_sweep)
         self.btn_save.clicked.connect(self.save_csv)
         self.chk_cispr.toggled.connect(self.cispr_toggle_visibility)
+
+        # ---- Live Sample Rate control ----
+        # Independent of the MODE preset buttons: changing this does NOT stop a running
+        # sweep. It updates self.SAMPLE_RATE immediately; sweep_loop() (worker thread)
+        # picks the new value up and applies it to the hardware itself at the start of
+        # its next full sweep pass - see sweep_loop() for why it's done there rather than
+        # here. Intended for quickly cycling sample rates to check whether a suspect
+        # spike/signal moves (artefact) or stays put (real) - see SAMPLE_RATE_CHOICES.
+        self.sample_rate_label = QtWidgets.QLabel("Sample Rate")
+        self.sample_rate_combo = QtWidgets.QComboBox()
+        for rate_hz in SAMPLE_RATE_CHOICES:
+            self.sample_rate_combo.addItem(f"{rate_hz/1e6:.3f} MS/s", rate_hz)
+        self.sample_rate_combo.setToolTip(
+            "Change the SDR sample rate live, without stopping a running sweep - useful "
+            "for checking whether a spike shifts with sample rate (artefact) or stays put "
+            "(real signal). Takes effect at the start of the next full sweep pass."
+        )
+        ctrl_layout.addWidget(self.sample_rate_label)
+        ctrl_layout.addWidget(self.sample_rate_combo)
+        self.sample_rate_combo.currentIndexChanged.connect(self.sample_rate_on_changed)
 
         # ---- CISPR Offset Control (user calibration) ----
         # This spinbox holds a single value that persists across MODE changes - it is the
@@ -569,31 +607,31 @@ class EmcScanner(QtWidgets.QMainWindow):
         main_layout.addLayout(preset_panel)
 
         # Define presets as a list so we can index them and extend easily
-        # Each entry: (internal_name, label, start_hz, stop_hz, sample_rate, gain, hf_mode_flag,
+        # Each entry: (internal_name, label, start_hz, stop_hz, sample_rate, gain_db, hf_mode_flag,
         #              dbuv_calibration)
         # dbuv_calibration is a fixed, mode-specific dB value (e.g. from comparing a known
         # reference signal's true dBuV level against what this mode reads). It is added to
         # the operator's live CISPR Offset spinbox value - see cispr_get_effective_offset().
         # All zero for now; fill these in as calibration data becomes available per mode.
-        #Supported gains: [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
+        # Supported gains: [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254,
+        # 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496] (tenths of dB -
+        # e.g. 402 -> 40.2 dB). gain_db values below are requested dB; init_sdr() reads back
+        # and logs/warns if the device actually applied something different - see gain_db.
+        # generally avoid HF mode as it has no gain.
         self.presets = [
-            ("SF3", "2M HF", 1e6, 1e6, 3.2e6, 40.2, True, 0.0),
-            ("SF4", "2M ", 1e6, 1e6, 3.2e6, 40.2, False, 0.0),
-            ("LF1", "2M HF", 150e3, 2e6, 2.4e6, 40.2, True, 0.0),
-            ("LF2", "2M 3.2", 150e3, 2e6, 3.2e6, 40.2, False, 0.0),
-            ("LF3", "2M-6 3.2", 2e6, 6e6, 3.2e6, 40.2, False, 0.0),
-            ("LF4", "6M-12 3.2", 6e6, 12e6, 3.2e6, 40.2, False, 0.0),
-            ("LF5", "6M-12 2.8", 6e6, 12e6, 2.8e6, 40.2, False, 0.0),
-            ("LF6", "6M-12 2.56", 6e6, 12e6, 2.56e6, 40.2, False, 0.0),
-            ("30M3", "0-30Mhz 3.2", 150e3, 30e6, 3.2e6, 40.2, False, 0.0),
-            ("30-200M3", "30-200Mhz 3", 30e6, 200e6, 3.2e6, 40.2, False, 0.0),
-            ("200-900M3", "200-900Mhz 3", 200e6, 900e6, 3.2e6, 40.2, False, 0.0),
-            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 40.2, False, 0.0),
-            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 40.2, False, 0.0),
-            ("VHF", "Broadcast VHF lw gain", 88e6, 108e6, 2.4e6, 20, False, 0.0),
-            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 40.2, False, 0.0),
-            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 40.2, False, 0.0),
-            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 40.2, False, 0.0),
+            ("LF2", "150k-2M 3.2", 150e3, 2e6, 3.2e6, 40.2, False, -47),
+            ("LF3", "2M-6 3.2", 2e6, 6e6, 3.2e6, 40.2, False, -47),
+            ("LF4", "6M-12 3.2", 6e6, 12e6, 3.2e6, 40.2, False, -47),
+            ("30M3", "12-30Mhz 3.2", 12e6, 30e6, 3.2e6, 40.2, False, -47),
+            ("30-200M", "30-200Mhz 3", 30e6, 200e6, 3.2e6, 40.2, False, -47),
+            (" 200-900", "200-900Mhz 3", 200e6, 900e6, 3.2e6, 40.2, False, -47),
+            ("900M-2.4", "900Mhz - 2.4G 3", 900e6, 24000e6, 3.2e6, 40.2, False, -47),
+            ("MVHF", "Marine VHF", 156e6, 162e6, 2.4e6, 40.2, False, -47),
+            ("VHF", "Broadcast VHF", 88e6, 108e6, 2.4e6, 40.2, False, -47),
+            ("VHF", "Broadcast VHF lw gain", 88e6, 108e6, 2.4e6, 20, False, -47),
+            ("VHF HG", "High Gain  Bcst VHF", 88e6, 108e6, 2.4e6, 40.2, False, -47),
+            ("FM_WB", "100.3M Wideband", 100.3e6, 100.3e6, 2.4e6, 40.2, False, -47),
+            ("MVHF_WB", "Marine VHF Wideband", 156.875e6, 156.875e6, 2.4e6, 40.2, False, -47),
         ]
 
         # Create buttons in a loop so adding presets is trivial
@@ -637,6 +675,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(f"Using driver path: {self.driver_path}")
         self.log("Setup complete")
         self.update_status_panel()   # show initial (module-default) settings until a MODE is picked
+        self.sync_sample_rate_combo()
 
 
 
@@ -680,6 +719,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Using the module-level SAMPLE_RATE/GAIN_DB constants here would silently ignore
         # whichever mode the user last selected.
         self.sdr.sample_rate = self.SAMPLE_RATE
+        self._applied_sample_rate = self.SAMPLE_RATE   # matches sweep_loop()'s live-rate check
         self.sdr.set_agc_mode(False)
         self.sdr.gain = self.gain_db
         # IMPORTANT: the driver snaps whatever dB value we ask for to the nearest value
@@ -750,6 +790,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.START_FREQ = float(start_hz)
             self.STOP_FREQ = float(stop_hz)
             self.SAMPLE_RATE = float(sample_rate)
+            self.sync_sample_rate_combo()
 
             # Preserve CISPR calibration; do not overwrite it with SDR preset gain.
             # Store SDR/preset gain separately so it cannot change CISPR mapping accidentally.
@@ -992,16 +1033,40 @@ class EmcScanner(QtWidgets.QMainWindow):
             # defensive: don't crash GUI
             pass
 
-    def cispr_build_reference_curve(self):
-        # CISPR 16-1-1 style placeholder curve (dBµV)
-        f = np.array([9e3, 150e3, 500e3, 1e6, 30e6, 100e6, 200e6, 300e6, 600e6, 1e9
-        ], dtype=np.float64)
+    # def cispr_build_reference_curve(self):
+        # # CISPR 16-1-1 style placeholder curve (dBµV)
+        # f = np.array([9e3, 150e3, 500e3, 1e6, 30e6, 100e6, 200e6, 300e6, 600e6, 1e9
+        # ], dtype=np.float64)
 
-        L= np.array([70, 66, 56, 56, 50, 40, 37, 33, 30, 28
+        # L= np.array([70, 66, 56, 56, 50, 40, 37, 33, 30, 28
+        # ], dtype=np.float64)
+         # ## very roughly with Tiny point antenna psd_dBuV = psd + 158.0
+
+        # return f, L
+        
+    def cispr_build_reference_curve(self):
+    # EN 55032 / CISPR 32 Class B radiated limits (simplified)
+    # 10 m below 1 GHz, 3 m above 1 GHz – all in dBµV/m
+
+        f = np.array([
+            30e6,   # 30 MHz
+            230e6,  # 230 MHz
+            1000e6, # 1 GHz
+            3e9,    # 3 GHz
+            6e9     # 6 GHz
         ], dtype=np.float64)
-         ## very roughly with Tiny point antenna psd_dBuV = psd + 158.0
+        delta_3m_to_10m = -10.46  # 20*log10(3/10)
+    # Use quasi-peak limits below 1 GHz, average limits above 1 GHz
+        L = np.array([
+            30.0,  # 30–230 MHz  (QP, 10 m)
+            30.0,  # 30–230 MHz  (flat segment)
+            37.0,  # 230–1000 MHz (QP, 10 m)
+            50.0 + delta_3m_to_10m,            # 1–3 GHz scaled to 10 m
+            54.0 + delta_3m_to_10m             # 3–6 GHz scaled to 10 m
+        ], dtype=np.float64)
 
         return f, L
+
 
     def cispr_toggle_visibility(self, checked):
         """
@@ -1069,7 +1134,27 @@ class EmcScanner(QtWidgets.QMainWindow):
         Factored out so sweep_loop() can call it once per averaging capture without
         duplicating this logic K times.
         """
-        samples = self.sdr.read_samples(n)
+        # The RTL-SDR USB read occasionally comes back short (device hiccup, USB
+        # scheduling stall, etc.) and raises OSError("Short read..."). Retry a couple
+        # of times with a brief pause before giving up - most short reads clear on
+        # the very next attempt without needing to reopen the device at all.
+        last_err = None
+        samples = None
+        for attempt in range(3):
+            try:
+                samples = self.sdr.read_samples(n)
+                last_err = None
+                break
+            except OSError as e:
+                last_err = e
+                print(f"_read_normalized_iq: read_samples failed (attempt {attempt + 1}/3): {e}")
+                time.sleep(0.05)
+        if last_err is not None:
+            # Still failing after retries - let the caller (sweep_loop) decide how to
+            # recover (it will skip this block and/or reopen the device) instead of
+            # letting the exception propagate up and kill the sweep thread.
+            raise last_err
+
         samples = samples[:n]
         if np.iscomplexobj(samples):
             samples = samples.astype(np.complex64) / 128.0
@@ -1164,6 +1249,49 @@ class EmcScanner(QtWidgets.QMainWindow):
                 item.setVisible(self.markers_visible)
             except Exception:
                 pass
+
+    def sync_sample_rate_combo(self):
+        """
+        Reflect self.SAMPLE_RATE in the Sample Rate combo box without re-triggering
+        sample_rate_on_changed() - call this whenever something OTHER than the combo box
+        itself changes self.SAMPLE_RATE (currently: set_preset()). If self.SAMPLE_RATE
+        isn't one of SAMPLE_RATE_CHOICES (e.g. a preset uses a rate not in that list),
+        the combo is left on whatever it currently shows rather than guessing.
+        """
+        idx = self.sample_rate_combo.findData(self.SAMPLE_RATE)
+        if idx < 0:
+            return
+        self.sample_rate_combo.blockSignals(True)
+        self.sample_rate_combo.setCurrentIndex(idx)
+        self.sample_rate_combo.blockSignals(False)
+
+    def sample_rate_on_changed(self, index):
+        """
+        Sample Rate combo box -> model. Deliberately does NOT stop a running sweep or
+        touch the hardware directly from here - see sweep_loop() for why (the RTL-SDR
+        driver isn't safe to call concurrently from two threads). This just updates
+        self.SAMPLE_RATE and, if nothing is currently running, rebuilds the centers and
+        markers immediately for instant feedback; if a sweep IS running, sweep_loop()
+        (worker thread) picks up the new rate and applies it to the hardware itself at
+        the start of its next full pass, then asks the GUI thread to redraw markers via
+        the markers_changed signal.
+        """
+        new_rate = self.sample_rate_combo.itemData(index)
+        if new_rate is None:
+            return
+        new_rate = float(new_rate)
+        if new_rate == self.SAMPLE_RATE:
+            return
+        self.SAMPLE_RATE = new_rate
+        self.log(f"Sample rate -> {new_rate/1e6:.3f} MS/s (takes effect on next sweep pass)")
+        self.update_status_panel()
+        if not (self.sweep_thread and self.sweep_thread.is_alive()):
+            # Nothing running - safe to rebuild centers/markers directly on the GUI thread.
+            if self.START_FREQ == self.STOP_FREQ:
+                self.centers = np.array([self.START_FREQ], dtype=np.float64)
+            else:
+                self.centers = self.build_centers(self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE)
+            self.draw_block_markers()
 
     def reference_capture(self):
         """
@@ -1309,10 +1437,46 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sweep_thread.start()
 
     def sweep_loop(self):
-        # Defensive checks at start
+        # Rebuild sweep centers from the CURRENT live settings every time this runs - not
+        # just once when the sweep first started. This is what lets a live Sample Rate
+        # change (from the combo box) take effect on the very next pass without needing
+        # to stop continuous mode: continuous_loop() just calls sweep_loop() repeatedly,
+        # and each call re-derives self.centers from self.START_FREQ/STOP_FREQ/SAMPLE_RATE
+        # as they stand right now. A change mid-pass only takes effect on the NEXT pass -
+        # this pass keeps running with the centers it already had, so a single sweep never
+        # ends up half old-rate, half new-rate.
+        if self.START_FREQ == self.STOP_FREQ:
+            new_centers = np.array([self.START_FREQ], dtype=np.float64)
+        else:
+            new_centers = self.build_centers(self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE)
+        centers_changed = (self.centers is None or len(self.centers) != len(new_centers)
+                            or not np.allclose(self.centers, new_centers))
+        self.centers = new_centers
+
         if self.centers is None or len(self.centers) == 0:
             print("sweep_loop: no centers defined, exiting")
             return
+
+        if centers_changed:
+            # draw_block_markers() touches Qt scene items directly and must only ever run
+            # on the GUI thread - ask for it via a queued signal rather than calling it here.
+            try:
+                self.plot_signals.markers_changed.emit()
+            except Exception:
+                pass
+
+        # Apply the current sample rate to the hardware if it's changed since we last
+        # configured it. Done here (worker thread) and ONLY here during a running sweep -
+        # never from the GUI thread directly, since the RTL-SDR driver isn't safe to call
+        # concurrently from two threads. This is what actually makes the Sample Rate combo
+        # box take effect without stopping continuous mode.
+        if self.sdr is not None and getattr(self, "_applied_sample_rate", None) != self.SAMPLE_RATE:
+            try:
+                print(f"sweep_loop: applying live sample-rate change -> {self.SAMPLE_RATE/1e6:.3f} MS/s")
+                self.sdr.sample_rate = self.SAMPLE_RATE
+                self._applied_sample_rate = self.SAMPLE_RATE
+            except Exception as e:
+                print("sweep_loop: error applying live sample-rate change:", e)
 
         # Number of bins actually stored per block AFTER edge masking (see
         # stitch_get_kept_bins()) - this, not NFFT, is the real per-block stride into
@@ -1387,15 +1551,37 @@ class EmcScanner(QtWidgets.QMainWindow):
             # 10*log10(|spec|^2) == 20*log10(|spec|).
             power_acc = None
             captures_done = 0
+            read_failed = False
             for _k in range(n_avg):
                 if self.stop_flag.is_set():
                     break
-                samples = self._read_normalized_iq(NFFT)
+                try:
+                    samples = self._read_normalized_iq(NFFT)
+                except OSError as e:
+                    # Hard USB failure that survived the retries in
+                    # _read_normalized_iq(). Don't let this kill the sweep thread:
+                    # drop this block, try to reopen the device, and carry on with
+                    # the next block/hop instead of crashing the whole scan.
+                    print(f"sweep_loop: read error on block {i}, capture {_k}: {e}")
+                    read_failed = True
+                    break
                 spec = np.fft.fftshift(np.fft.fft(samples * window))
                 spec = spec / NFFT
                 power = np.abs(spec) ** 2
                 power_acc = power if power_acc is None else power_acc + power
                 captures_done += 1
+
+            if read_failed:
+                try:
+                    print("sweep_loop: attempting to reopen SDR device after read failure...")
+                    self.init_sdr()
+                    print("sweep_loop: SDR device reopened successfully")
+                except Exception as e:
+                    print(f"sweep_loop: failed to reopen SDR device: {e}")
+                    # Give the hardware/driver a moment before the next attempt so we
+                    # don't spin tight in a reopen-fail loop.
+                    time.sleep(0.5)
+                continue
 
             if captures_done == 0:
                 # Stopped before a single capture completed - nothing to store this block.
@@ -1498,7 +1684,17 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     def continuous_loop(self):
         while not self.stop_flag.is_set():
-            self.sweep_loop()   # run one sweep
+            try:
+                self.sweep_loop()   # run one sweep
+            except Exception as e:
+                # Last-resort safety net: an unhandled exception anywhere in
+                # sweep_loop() used to kill this whole thread (silently, from the
+                # GUI's point of view, apart from a console traceback). Log it and
+                # keep the continuous scan alive instead of letting it die.
+                import traceback
+                print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
+                traceback.print_exc()
+                time.sleep(0.5)
 
     def update_plot(self):
 
