@@ -1164,6 +1164,142 @@ class StitchSignals(QtCore.QObject):
     done = QtCore.pyqtSignal(object)
 
 
+class _DigitLabel(QtWidgets.QLabel):
+    """One digit of the DigitalFreqSelector: click to select it, mouse wheel to step it."""
+    def __init__(self, exponent, owner):
+        super().__init__("0")
+        self._k = exponent
+        self._owner = owner
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setFixedSize(24, 34)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        self._owner.select(self._k)
+        self._owner.setFocus()
+
+    def wheelEvent(self, e):
+        self._owner.select(self._k)
+        self._owner.step(self._k, 1 if e.angleDelta().y() > 0 else -1)
+        e.accept()
+
+
+class DigitalFreqSelector(QtWidgets.QWidget):
+    """
+    Centre-frequency selector made of individual digits, like the dial of a bench instrument:
+        0100.300 000 MHz        (4 MHz digits . 3 kHz digits   3 Hz digits)
+    Every digit has an up and a down arrow, steps with the mouse wheel when the pointer is over it, and can be
+    selected by clicking it; the selected digit (outlined) also answers to the Up / Down keys, Left / Right
+    move the selection, and typing 0-9 overwrites it and moves on. A step adds or subtracts that digit's
+    place value from the whole frequency (so it carries and borrows like any counter) and is limited to
+    [min_hz, max_hz]. valueChanged(int hz) is emitted on every change made by the operator.
+    """
+    valueChanged = QtCore.pyqtSignal(int)
+    N_DIGITS = 10                                   # up to 9999.999999 MHz in 1 Hz steps
+
+    def __init__(self, value_hz=100000000, min_hz=100000, max_hz=1766000000, parent=None):
+        super().__init__(parent)
+        self._min, self._max = int(min_hz), int(max_hz)
+        self._value = max(self._min, min(self._max, int(round(value_hz))))
+        self._sel = 6                               # selected digit = its power of ten (6 = the 1 MHz digit)
+        self._labels = {}
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(1)
+        for k in range(self.N_DIGITS - 1, -1, -1):
+            if k == 5:
+                row.addWidget(self._sep("."))
+            elif k == 2:
+                row.addSpacing(10)                  # gap between the kHz and Hz groups
+            col = QtWidgets.QVBoxLayout()
+            col.setSpacing(0)
+            up, dn = self._arrow(QtCore.Qt.UpArrow, k, +1), self._arrow(QtCore.Qt.DownArrow, k, -1)
+            lbl = _DigitLabel(k, self)
+            self._labels[k] = lbl
+            col.addWidget(up)
+            col.addWidget(lbl)
+            col.addWidget(dn)
+            row.addLayout(col)
+        unit = QtWidgets.QLabel("MHz")
+        unit.setStyleSheet("QLabel { color: #FFD54A; font: bold 16px 'Consolas'; padding-left: 6px; }")
+        row.addWidget(unit)
+        self._refresh()
+
+    def _sep(self, text):
+        lab = QtWidgets.QLabel(text)
+        lab.setFixedWidth(10)
+        lab.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter)
+        lab.setStyleSheet("QLabel { color: #FFD54A; font: bold 22px 'Consolas'; }")
+        return lab
+
+    def _arrow(self, arrow, k, direction):
+        b = QtWidgets.QToolButton()
+        b.setArrowType(arrow)
+        b.setFixedSize(24, 14)
+        b.setAutoRepeat(True)
+        b.setAutoRepeatDelay(450)
+        b.setAutoRepeatInterval(110)
+        b.setFocusPolicy(QtCore.Qt.NoFocus)
+        b.clicked.connect(lambda _=False, k=k, d=direction: (self.select(k), self.step(k, d)))
+        return b
+
+    def value(self):
+        return self._value
+
+    def setValue(self, hz, emit_signal=False):
+        hz = max(self._min, min(self._max, int(round(hz))))
+        if hz != self._value:
+            self._value = hz
+            self._refresh()
+            if emit_signal:
+                self.valueChanged.emit(self._value)
+
+    def select(self, k):
+        self._sel = max(0, min(self.N_DIGITS - 1, int(k)))
+        self._refresh()
+
+    def step(self, k, direction):
+        """Add / subtract the place value of digit k (carry and borrow come for free)."""
+        new = self._value + direction * (10 ** int(k))
+        new = max(self._min, min(self._max, new))
+        if new != self._value:
+            self._value = new
+            self._refresh()
+            self.valueChanged.emit(self._value)
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        if key == QtCore.Qt.Key_Up:
+            self.step(self._sel, +1)
+        elif key == QtCore.Qt.Key_Down:
+            self.step(self._sel, -1)
+        elif key == QtCore.Qt.Key_Left:
+            self.select(self._sel + 1)
+        elif key == QtCore.Qt.Key_Right:
+            self.select(self._sel - 1)
+        elif QtCore.Qt.Key_0 <= key <= QtCore.Qt.Key_9:
+            k = self._sel
+            cur = (self._value // 10 ** k) % 10
+            new = max(self._min, min(self._max, self._value + (key - QtCore.Qt.Key_0 - cur) * 10 ** k))
+            if new != self._value:
+                self._value = new
+                self.valueChanged.emit(self._value)
+            self._refresh()
+            self.select(self._sel - 1)
+        else:
+            super().keyPressEvent(e)
+
+    def _refresh(self):
+        for k, lab in self._labels.items():
+            lab.setText(str((self._value // 10 ** k) % 10))
+            dim = (self._value < 10 ** k) and k > 6          # leading zeros above the MHz units digit are dimmed
+            border = "#FFD54A" if k == self._sel else "#3a3a3a"
+            colour = "#6a5a22" if dim else "#FFD54A"
+            lab.setStyleSheet(f"QLabel {{ background: #101010; color: {colour}; font: bold 22px 'Consolas'; "
+                              f"border: 2px solid {border}; }}")
+
+
 class PlotSignals(QtCore.QObject):
     update = QtCore.pyqtSignal(object, object)
     # Emitted by sweep_loop() (worker thread) whenever it rebuilds self.centers, so the
@@ -1927,6 +2063,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.scope_tame_status_label()     # scope readout must never widen the program window
         self.survey_connect_signals()      # survey runs on the worker thread and reports back by signal
         self.stitch_build_ui(left_layout)  # STITCH CHECK button: is a feature real or made by the block layout?
+        self.single_build_ui(left_layout)  # SINGLE FREQUENCY mode: button above the ranges + digit selector under the gain row
 
 
 
@@ -2380,8 +2517,18 @@ class EmcScanner(QtWidgets.QMainWindow):
     # cispr_* block above there is no GUI-thread restriction on these.
     # =====================================================================
 
+    # ---- previous stitch_get_edge_bins() (always masked the edges), kept in case of problems ----
+#     def stitch_get_edge_bins(self):
+#         """Number of FFT bins discarded from EACH edge of a block before stitching."""
+#         frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
+#         frac = max(0.0, min(0.49, frac))  # guard against masking away the whole block
+#         return int(round(NFFT * frac))
+
     def stitch_get_edge_bins(self):
-        """Number of FFT bins discarded from EACH edge of a block before stitching."""
+        """Number of FFT bins discarded from EACH edge of a block before stitching. None in single-frequency mode:
+        there is only one block and nothing to stitch, so the whole captured bandwidth is shown."""
+        if getattr(self, "single_mode", False):
+            return 0
         frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
         frac = max(0.0, min(0.49, frac))  # guard against masking away the whole block
         return int(round(NFFT * frac))
@@ -3476,6 +3623,144 @@ class EmcScanner(QtWidgets.QMainWindow):
                 self.log(f"  ... and {n - 12} more range(s)")
         if s["was_running"] and not result.get("aborted"):
             self.continuous_when_idle()
+
+    # ------------------------------------------------------------------------------------
+    # SINGLE FREQUENCY mode: tune the SDR to one centre frequency and show ONE spectrum of everything it
+    # receives there (the whole captured bandwidth - there is nothing to stitch, so no edge masking).
+    # ------------------------------------------------------------------------------------
+
+    def single_build_ui(self, left_layout):
+        self.single_mode = False
+        self.single_centre_hz = 100000000
+        self._pending_centre = None
+        self._single_lock = threading.Lock()
+        self._last_preset_index = None
+        # the mode button goes ABOVE the range (preset) buttons, same size and shape as them
+        first = self.mode_buttons[0]
+        self.btn_single = QtWidgets.QPushButton("Single Frequency")
+        self.btn_single.setCheckable(True)
+        self.btn_single.setSizePolicy(first.sizePolicy())
+        self.btn_single.setMinimumSize(first.minimumSize())
+        self.btn_single.setToolTip("Test mode: tune to one centre frequency and show a single spectrum of the whole captured "
+                                    "bandwidth. The centre frequency is set digit by digit below the gain controls. Press a "
+                                    "range button to go back to the range sweeps.")
+        self.btn_single.toggled.connect(self.single_on_toggled)
+        main_layout = self.centralWidget().layout()
+        placed = False
+        for i in range(main_layout.count()):
+            lay = main_layout.itemAt(i).layout()
+            if lay is not None and lay.indexOf(first) >= 0:
+                lay.insertWidget(lay.indexOf(first), self.btn_single)
+                placed = True
+                break
+        if not placed:
+            main_layout.addWidget(self.btn_single)
+        self.mode_buttons.append(self.btn_single)       # joins the controls that are locked during a survey / the scope
+        # the digit selector sits in its own row BELOW the gain row, visible only in this mode
+        self.single_panel = QtWidgets.QWidget()
+        prow = QtWidgets.QHBoxLayout(self.single_panel)
+        prow.setContentsMargins(0, 2, 0, 2)
+        lab = QtWidgets.QLabel("Centre frequency")
+        self.freq_selector = DigitalFreqSelector(self.single_centre_hz)
+        self.freq_selector.setToolTip("Click a digit (or use its arrows / the mouse wheel) to change it; with a digit selected "
+                                       "the Up / Down keys step it, Left / Right move along, and typing 0-9 overwrites it.")
+        self.freq_selector.valueChanged.connect(self.single_on_freq)
+        hint = QtWidgets.QLabel("(click a digit, then arrows, wheel, Up/Down or type 0-9)")
+        hint.setStyleSheet("QLabel { color: #9aa0a8; }")
+        prow.addWidget(lab)
+        prow.addWidget(self.freq_selector)
+        prow.addWidget(hint)
+        prow.addStretch()
+        pos = left_layout.count()
+        for i in range(left_layout.count()):
+            lay = left_layout.itemAt(i).layout()
+            if lay is not None and lay.indexOf(self.gain_slider) >= 0:
+                pos = i + 1                              # directly under the row that holds the gain slider
+                break
+        left_layout.insertWidget(pos, self.single_panel)
+        self.single_panel.setVisible(False)
+
+    def single_on_toggled(self, checked):
+        if checked:
+            self.single_enter()
+        else:
+            self.single_leave()
+
+    def single_enter(self):
+        """Switch to the single-frequency test mode and start capturing at once."""
+        if self._survey is not None or getattr(self, "scope_active", False) or self._stitch is not None:
+            self.log("Single frequency mode is not available while a survey, the scope or a stitch check is running")
+            self.btn_single.blockSignals(True)
+            self.btn_single.setChecked(False)
+            self.btn_single.blockSignals(False)
+            return
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            self.stop_flag.set()
+            self.sweep_thread.join(timeout=1.0)
+        centre = int(round(0.5 * (self.START_FREQ + self.STOP_FREQ))) if not self.single_mode else self.single_centre_hz
+        centre = max(self.freq_selector._min, min(self.freq_selector._max, centre))
+        self.single_mode = True
+        self.single_centre_hz = centre
+        self.freq_selector.setValue(centre)
+        with self._single_lock:
+            self._pending_centre = None
+        self.START_FREQ = self.STOP_FREQ = float(centre)
+        self.hf_mode = False
+        self.centers = np.array([float(centre)], dtype=np.float64)
+        self.current_mode_label = f"Single frequency {centre / 1e6:.6f} MHz"
+        self.single_panel.setVisible(True)
+        self.log(f"=== SINGLE FREQUENCY MODE: centre {centre / 1e6:.6f} MHz ===")
+        self.update_status_panel()
+        self.continuous_when_idle()
+
+    def single_leave(self):
+        """The mode button was switched off: go back to the last range that was selected (if any)."""
+        self.single_exit()
+        if self._last_preset_index is not None:
+            self.set_preset_and_run(self._last_preset_index)
+
+    def single_exit(self):
+        """Leave single-frequency mode (a range button was pressed, or the mode button was switched off)."""
+        if not self.single_mode:
+            return
+        self.single_mode = False
+        self.single_panel.setVisible(False)
+        self.btn_single.blockSignals(True)
+        self.btn_single.setChecked(False)
+        self.btn_single.blockSignals(False)
+        with self._single_lock:
+            self._pending_centre = None
+
+    def single_on_freq(self, hz):
+        """A digit changed. While a sweep thread owns the SDR it applies the new centre itself at the start of its
+        next scan (single_apply_pending) - both START and STOP are changed there together; otherwise apply now."""
+        if not self.single_mode:
+            return                                       # the selector is only in use (and visible) in single-frequency mode
+        hz = int(hz)
+        self.single_centre_hz = hz
+        self.current_mode_label = f"Single frequency {hz / 1e6:.6f} MHz"
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            with self._single_lock:
+                self._pending_centre = hz
+            self._restart_pass = True                    # abandon the scan in progress; the next one starts at the new centre
+        else:
+            self.START_FREQ = self.STOP_FREQ = float(hz)
+            self.centers = np.array([float(hz)], dtype=np.float64)
+            try:
+                self.draw_block_markers()
+            except Exception:
+                pass
+            self.update_status_panel()
+
+    def single_apply_pending(self):
+        """Worker thread, before each scan: apply a centre-frequency change made on the front panel."""
+        if not getattr(self, "single_mode", False):
+            return
+        with self._single_lock:
+            hz, self._pending_centre = self._pending_centre, None
+        if hz is not None:
+            self.START_FREQ = self.STOP_FREQ = float(hz)
+            self.update_status_panel()
 
     def survey_connect_signals(self):
         self.survey_signals = SurveySignals()
@@ -7302,12 +7587,32 @@ class EmcScanner(QtWidgets.QMainWindow):
             if not self._restart_pass:
                 break
 
+    # ---- previous continuous_loop() (no single-frequency hook), kept in case of problems ----
+#     def continuous_loop(self):
+#         try:
+#             self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
+#         except Exception as e:
+#             print(f"continuous_loop: settle_radio failed: {e!r}")
+#         while not self.stop_flag.is_set():
+#             try:
+#                 self.sweep_loop()   # run one sweep
+#             except Exception as e:
+#                 # Last-resort safety net: an unhandled exception anywhere in
+#                 # sweep_loop() used to kill this whole thread (silently, from the
+#                 # GUI's point of view, apart from a console traceback). Log it and
+#                 # keep the continuous scan alive instead of letting it die.
+#                 import traceback
+#                 print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
+#                 traceback.print_exc()
+#                 time.sleep(0.5)
+
     def continuous_loop(self):
         try:
             self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
         except Exception as e:
             print(f"continuous_loop: settle_radio failed: {e!r}")
         while not self.stop_flag.is_set():
+            self.single_apply_pending()     # single-frequency mode: a new centre chosen on the front panel starts here
             try:
                 self.sweep_loop()   # run one sweep
             except Exception as e:
@@ -7412,8 +7717,16 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         self.start_continuous()
 
+    # ---- previous set_preset_and_run(), kept in case of problems ----
+#     def set_preset_and_run(self, preset_index):
+#         """MODE button: apply the preset, then immediately (re)start CONTINUOUS mode."""
+#         self.set_preset(preset_index)
+#         self.continuous_when_idle()
+
     def set_preset_and_run(self, preset_index):
-        """MODE button: apply the preset, then immediately (re)start CONTINUOUS mode."""
+        """MODE button: leave single-frequency mode, apply the preset, then immediately (re)start CONTINUOUS mode."""
+        self.single_exit()
+        self._last_preset_index = preset_index
         self.set_preset(preset_index)
         self.continuous_when_idle()
 
