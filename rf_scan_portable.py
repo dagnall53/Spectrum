@@ -44,6 +44,13 @@ def _add_dll_dir(path):
 # With a 5W RF transmitter at 5m  with 30db attenuator fitted between TX and antenna, 
 # a signal strength of aproximately 87dBuv is expected.
 # when my atenuator arrives I hope to be able to properly link the CISPR and FFT scales. 
+#
+# ---- THE ONE dBuV CALIBRATION CONSTANT ----
+# Displayed level (dBuV at the INPUT of the external attenuator) =
+#       SDR dB  -  RF gain (dB)  +  attenuator (dB)  +  CAL_SDR_DB_TO_DBUV
+# To recalibrate: feed a known level, note the displayed peak, then
+#       CAL_SDR_DB_TO_DBUV = CAL_SDR_DB_TO_DBUV + (true dBuV - displayed dBuV)
+CAL_SDR_DB_TO_DBUV = 107
 
 #--------------------------------------------------------------
 
@@ -1484,9 +1491,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         # pressed. Different modes/bands/antennas can need a different fixed calibration
         # (e.g. derived from a known reference signal), independent of the operator's
         # live CISPR OFFSET.
-        self.dbuv_calibration = 0.0
+        self.dbuv_calibration = -78
         # Effective offset actually applied to the right (CISPR) axis: OFFSET + CALIBRATION.
         self.cispr_effective_offset = 0.0
+        self.input_atten_db = 0.0   # external attenuator in front of the SDR (front-panel spinbox)
         # in __init__, after super().__init__() and before threads start
         self._psd_to_dbuv_const = 33.5   # default conversion constant (tuner path default)
 
@@ -1672,7 +1680,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         # ---- Plot ----
         self.plot = pg.PlotWidget()
         self.plot.setLabel('bottom', 'Frequency', units='Hz')
-        self.plot.setLabel('left', 'Level', units='dB')
+        # self.plot.setLabel('left', 'Level', units='dB')
+        self.plot.setLabel('left', 'Level at input (dBµV)')
 
         # main FFT curve (left axis)
         self.curve = self.plot.plot(pen='y')
@@ -1742,8 +1751,10 @@ class EmcScanner(QtWidgets.QMainWindow):
 
 
         # ---- Fixed Y-axis (no autoscale) ----
-        self._left_ymin = -120.0
-        self._left_ymax = 20.0
+        # self._left_ymin = -120.0
+        # self._left_ymax = 20.0
+        self._left_ymin = -20.0
+        self._left_ymax = 120.0
         self.plot.setYRange(self._left_ymin, self._left_ymax)
         self.plot.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
         self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
@@ -1872,19 +1883,44 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_offset_spin.setDecimals(1)
         self.cispr_offset_spin.setValue(self.cispr_offset_db)   # initial value from __init__
         self.cispr_offset_spin.setSuffix(" dB")
-        self.cispr_offset_spin.setToolTip("Visual offset to align CISPR (accounts for antenna/attenuation). "
-                                           "Persists across MODE changes.")
+        # self.cispr_offset_spin.setToolTip("Visual offset to align CISPR (accounts for antenna/attenuation). "
+        #                                    "Persists across MODE changes.")
+        self.cispr_offset_spin.setToolTip("Offset of the CISPR (right) axis relative to the left dBuV axis "
+                                           "(e.g. antenna factor). Persists across MODE changes.")
 
         # Read-only display of the current mode's dBuV_Calibration, kept in sync by
         # cispr_refresh_offset_ui() whenever set_preset() changes mode.
-        self.cispr_calibration_label = QtWidgets.QLabel(f"Cal: {self.dbuv_calibration:+.1f} dB")
-        self.cispr_calibration_label.setToolTip("Mode-dependent dBuV calibration, added to CISPR Offset "
-                                                 "(set per MODE in self.presets).")
+        # ---- previous CISPR calibration label / control placement, kept in case of problems ----
+        # self.cispr_calibration_label = QtWidgets.QLabel(f"Cal: {self.dbuv_calibration:+.1f} dB")
+        # self.cispr_calibration_label.setToolTip("Mode-dependent dBuV calibration, added to CISPR Offset "
+        #                                          "(set per MODE in self.presets).")
+
+        # # place the controls in the same control row
+        # ctrl_layout.addWidget(self.cispr_offset_label)
+        # ctrl_layout.addWidget(self.cispr_offset_spin)
+        # ctrl_layout.addWidget(self.cispr_calibration_label)
+
+        self.cispr_calibration_label = QtWidgets.QLabel(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
+        self.cispr_calibration_label.setToolTip("CAL_SDR_DB_TO_DBUV - set in the code (top of the file).")
+
+        # ---- Attenuator (external, between antenna and SDR) ----
+        self.atten_label = QtWidgets.QLabel("Attenuator")
+        self.atten_spin = QtWidgets.QDoubleSpinBox()
+        self.atten_spin.setRange(0.0, 100.0)
+        self.atten_spin.setSingleStep(1.0)
+        self.atten_spin.setDecimals(1)
+        self.atten_spin.setValue(self.input_atten_db)
+        self.atten_spin.setSuffix(" dB")
+        self.atten_spin.setToolTip("Attenuator fitted in front of the SDR. The left axis shows dBuV at the "
+                                   "attenuator's input (antenna side).")
+        self.atten_spin.valueChanged.connect(self.atten_on_changed)
 
         # place the controls in the same control row
         ctrl_layout.addWidget(self.cispr_offset_label)
         ctrl_layout.addWidget(self.cispr_offset_spin)
         ctrl_layout.addWidget(self.cispr_calibration_label)
+        ctrl_layout.addWidget(self.atten_label)
+        ctrl_layout.addWidget(self.atten_spin)
 
         # ---- Time-Averaging Control ----
         # Same pattern as the CISPR Offset control: a checkbox to switch the feature on/off,
@@ -2229,9 +2265,11 @@ class EmcScanner(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+            # self.log(f"MODE set: {_label}  {self.START_FREQ/1e6:.3f}-{self.STOP_FREQ/1e6:.3f} MHz, "
+            #          f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}, "
+            #          f"dBuV_Calibration={self.dbuv_calibration:+.1f} dB")
             self.log(f"MODE set: {_label}  {self.START_FREQ/1e6:.3f}-{self.STOP_FREQ/1e6:.3f} MHz, "
-                     f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}, "
-                     f"dBuV_Calibration={self.dbuv_calibration:+.1f} dB")
+                     f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}")
 
             # Reflect the new mode's calibration in the CISPR display and redraw the line.
             self.cispr_refresh_offset_ui()
@@ -2299,12 +2337,35 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_update_curve()
         self.cispr_update_axis_ticks()
 
+ 
+    def cal_total_offset_db(self):
+        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator."""
+        applied = getattr(self, "_applied_gain_db", None)
+        gain = float(applied if applied is not None else self.gain_db)
+        if self.hf_mode:
+            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by CAL_SDR_DB_TO_DBUV)
+        return CAL_SDR_DB_TO_DBUV - gain + float(self.input_atten_db)
+
+    def atten_on_changed(self, val):
+        """Attenuator spinbox -> model; redraw the stored trace at the new calibration."""
+        self.input_atten_db = float(val)
+        self.update_plot()
+
+    # ---- previous cispr_get_effective_offset(), kept in case of problems ----
+    # def cispr_get_effective_offset(self):
+    #     """
+    #     The actual offset applied to the right (CISPR) axis: the operator's persistent
+    #     CISPR Offset spinbox value, plus this mode's fixed dBuV_Calibration. ALSO account for gain 
+    #     """
+    #     return (
+    #         float(getattr(self, "cispr_offset_db", 0.0))
+    #         + float(getattr(self, "dbuv_calibration", 0.0))
+    #         + float(getattr(self, "gain_db", 0.0))
+    #     )
+
     def cispr_get_effective_offset(self):
-        """
-        The actual offset applied to the right (CISPR) axis: the operator's persistent
-        CISPR Offset spinbox value, plus this mode's fixed dBuV_Calibration.
-        """
-        return float(getattr(self, "cispr_offset_db", 0.0)) + float(getattr(self, "dbuv_calibration", 0.0))
+        """Offset of the right (CISPR) axis relative to the left axis. The left axis is already dBuV."""
+        return float(getattr(self, "cispr_offset_db", 0.0))
 
     def cispr_on_offset_changed(self, val):
         """
@@ -2326,7 +2387,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         the resulting curve/ticks are refreshed.
         """
         try:
-            self.cispr_calibration_label.setText(f"Cal: {self.dbuv_calibration:+.1f} dB")
+            # self.cispr_calibration_label.setText(f"Cal: {self.dbuv_calibration:+.1f} dB")
+            self.cispr_calibration_label.setText(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
         except Exception:
             pass
         self.cispr_effective_offset = self.cispr_get_effective_offset()
@@ -7749,7 +7811,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         if not np.any(valid):
             return
         f = f[valid]
-        p = p[valid]
+        # p = p[valid]
+        p = p[valid] + self.cal_total_offset_db()   # SDR dB -> dBuV at attenuator input
 
         # --- IMPORTANT: do NOT overwrite stitched arrays used by the sweep ---
         # Keep a plotting copy instead so the sweep's stitched storage remains intact.
@@ -7800,7 +7863,8 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         idx = np.argsort(self.freq_axis)
         f = self.freq_axis[idx]
-        p = self.power_axis[idx]
+        # p = self.power_axis[idx]
+        p = self.power_axis[idx] + self.cal_total_offset_db()   # dBuV at attenuator input
 
         have_ref = (getattr(self, "reference_freq", None) is not None
                     and getattr(self, "reference_power", None) is not None
@@ -7809,7 +7873,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         if not have_ref:
             # No reference captured - unchanged behaviour from before.
             data = np.column_stack((f, p))
-            np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
+            # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
+            np.savetxt(path, data, delimiter=",", header="freq_hz,level_dbuv", comments="")
             self.log(f"Saved live trace ({len(f)} points) to {path}")
             return
 
@@ -7822,7 +7887,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         rp = np.asarray(self.reference_power, dtype=np.float64)
         n = max(len(f), len(rf))
         with open(path, "w", newline="") as fh:
-            fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
+            # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
+            fh.write("freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
             for i in range(n):
                 a = f"{f[i]:.6f}" if i < len(f) else ""
                 b = f"{p[i]:.3f}" if i < len(p) else ""
