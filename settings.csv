@@ -34,3 +34,9 @@ preset,200-900,200-900Mhz 3,200M,900M,3.2M,0,FALSE,-47
 preset,900M-2.4,900Mhz - 2.4G 3,900M,24000M,3.2M,0,FALSE,-47
 preset,MVHF,Marine VHF,156M,162M,2.4M,0,FALSE,-47
 preset,VHF,Broadcast VHF,88M,108M,2.4M,0,FALSE,-47
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-09 10:31)
+setting,cal_1024000,98.22,,,,,,
+setting,cal_1800000,98.28,,,,,,
+setting,cal_2048000,95.96,,,,,,
+setting,cal_2400000,96.26,,,,,,
+setting,cal_2560000,104.94,,,,,,

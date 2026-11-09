@@ -117,7 +117,7 @@ import csv, re
 SETTINGS_FILENAME = "settings.csv"
 
 # Built-in fallback (the original hard-coded presets). Each entry:
-# (internal_name, label, start_hz, stop_hz, sample_rate, gain_db, hf_mode_flag, dbuv_calibration)
+# (internal_name, label, start_hz, stop_hz, sample_rate, gain_db, hf_mode_flag)
 _FALLBACK_PRESETS = [
     ("LF2", "150k-2M 3.2", 150e3, 2e6, 3.2e6, 40.2, False, -47),
     ("LF3", "2M-6 3.2", 2e6, 6e6, 3.2e6, 40.2, False, -47),
@@ -228,8 +228,80 @@ def _parse_bool(text):
 # Program settings read from settings.csv rows of type "setting" (key in the name column, value in the
 # label column - or a "value" column if you add one). Filled in by load_settings().
 SETTINGS_EXTRA = {}
-_KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog")
+# (previous: _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog"))
+_KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog",
+                   "saturation_line", "saturation_margin_db")   # (plus cal_<sample rate Hz> rows, see CAL_BY_RATE)
 
+
+# ---- previous load_settings() (warned about cal_ rows), kept in case of problems ----
+#def load_settings():
+#    """Read settings.csv. Returns (defaults_dict, presets_list, path_used).
+#    defaults_dict may hold start_freq, stop_freq, sample_rate, gain_db (any that were
+#    given). presets_list uses the same tuple layout as _FALLBACK_PRESETS. Rows of type
+#    "setting" (program options such as dc_offset_removal, iq_balance_correction, driver,
+#    driver_root, driver_dialog) go into the module-level SETTINGS_EXTRA dict. On any
+#    problem with the file as a whole, falls back to the built-in presets; a bad single
+#    row is reported and skipped."""
+#    SETTINGS_EXTRA.clear()
+#    path = next((p for p in _settings_search_paths() if os.path.isfile(p)), None)
+#    if path is None:
+#        print(f"settings: {SETTINGS_FILENAME} not found - using built-in presets")
+#        return {}, list(_FALLBACK_PRESETS), None
+
+#    defaults, presets = {}, []
+#    try:
+#        with open(path, newline="", encoding="utf-8-sig") as fh:
+#            lines = [ln for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+#        reader = csv.DictReader(lines, skipinitialspace=True)
+#        reader.fieldnames = [(n or "").strip().lower() for n in (reader.fieldnames or [])]
+#        for rownum, row in enumerate(reader, start=2):
+#            kind = (row.get("type") or "").strip().lower()
+#            try:
+#                if kind == "setting":
+#                    key = (row.get("name") or "").strip().lower()
+#                    val = (row.get("value") or row.get("label") or "").strip()
+#                    if not key:
+#                        raise ValueError("a setting needs a name (the setting key)")
+#                    if key not in _KNOWN_SETTINGS:
+#                        print(f"settings: row {rownum}: unknown setting {key!r} (known: {', '.join(_KNOWN_SETTINGS)})")
+#                    SETTINGS_EXTRA[key] = val
+#                    continue
+#                start = _parse_hz(row["start"])
+#                stop = _parse_hz(row["stop"])
+#                rate = _parse_hz(row["sample_rate"])
+#                gain = float(str(row["gain_db"]).strip())
+#                if start <= 0 or stop < start or rate <= 0:
+#                    raise ValueError("need 0 < start <= stop and sample_rate > 0")
+#                if not any(lo <= rate <= hi for lo, hi in RTL_VALID_RATE_RANGES):
+#                    print(f"settings: row {rownum}: sample_rate {rate:.0f} S/s is outside the "
+#                          f"RTL-SDR's valid ranges (225001-300000, 900001-3200000) - the "
+#                          f"driver will probably refuse it")
+#                if kind == "default":
+#                    defaults = {"start_freq": start, "stop_freq": stop,
+#                                "sample_rate": rate, "gain_db": gain}
+#                elif kind == "preset":
+#                    label = (row.get("label") or "").strip()
+#                    if not label:
+#                        raise ValueError("preset needs a label (the button text)")
+#                    name = (row.get("name") or "").strip() or label
+#                    hf = _parse_bool(row.get("hf_mode") or "")
+#                    cal = float(str(row.get("dbuv_cal") or "0").strip() or 0)
+#                    presets.append((name, label, start, stop, rate, gain, hf, cal))
+#                else:
+#                    raise ValueError(f"unknown type {kind!r} (use 'default', 'preset' or 'setting')")
+#            except Exception as e:
+#                print(f"settings: {os.path.basename(path)} row {rownum} skipped: {e}")
+#    except Exception as e:
+#        print(f"settings: could not read {path}: {e} - using built-in presets")
+#        return {}, list(_FALLBACK_PRESETS), None
+
+#    if not presets:
+#        print(f"settings: no valid presets in {path} - using built-in presets")
+#        presets = list(_FALLBACK_PRESETS)
+#    print(f"settings: loaded {len(presets)} presets from {path}")
+#    if SETTINGS_EXTRA:
+#        print("settings: program settings: " + ", ".join(f"{k}={v}" for k, v in SETTINGS_EXTRA.items()))
+#    return defaults, presets, path
 
 def load_settings():
     """Read settings.csv. Returns (defaults_dict, presets_list, path_used).
@@ -259,7 +331,7 @@ def load_settings():
                     val = (row.get("value") or row.get("label") or "").strip()
                     if not key:
                         raise ValueError("a setting needs a name (the setting key)")
-                    if key not in _KNOWN_SETTINGS:
+                    if key not in _KNOWN_SETTINGS and not key.startswith("cal_"):   # cal_<rate> rows are the per-rate dB -> dBuV factors
                         print(f"settings: row {rownum}: unknown setting {key!r} (known: {', '.join(_KNOWN_SETTINGS)})")
                     SETTINGS_EXTRA[key] = val
                     continue
@@ -350,6 +422,92 @@ DRIVER_CHOICE = (SETTINGS_EXTRA.get("driver") or "default").strip()
 if SETTINGS_EXTRA.get("driver_root"):
     DRIVER_ROOT = _resolve_dir(SETTINGS_EXTRA["driver_root"])
 ENABLE_DRIVER_SELECTION = _setting_bool("driver_dialog", ENABLE_DRIVER_SELECTION)
+
+# ---- Per-sample-rate dB -> dBuV calibration (written by the CAL button, read here) ----
+# settings.csv rows   setting,cal_<sample rate in Hz>,<factor>    e.g.   setting,cal_2400000,108.37
+# A sample rate with no row of its own uses the default CAL_SDR_DB_TO_DBUV (top of the file).
+CAL_BY_RATE = {}
+for _k, _v in SETTINGS_EXTRA.items():
+    if _k.startswith("cal_"):
+        try:
+            CAL_BY_RATE[float(_k[4:])] = float(_v)
+        except ValueError:
+            print(f"settings: warning - calibration setting {_k} = {_v!r} is not valid and is ignored")
+if CAL_BY_RATE:
+    print("settings: per-sample-rate dB->dBuV factors: " + ", ".join(f"{r/1e6:g} MS/s = {v:.2f}" for r, v in sorted(CAL_BY_RATE.items())))
+
+# ADC saturation line on the display (settings.csv:  setting,saturation_line,on|off   setting,saturation_margin_db,10)
+SATURATION_LINE = _setting_bool("saturation_line", True)
+try:
+    SATURATION_MARGIN_DB = float(SETTINGS_EXTRA.get("saturation_margin_db") or 10.0)
+except ValueError:
+    print(f"settings: warning - saturation_margin_db = {SETTINGS_EXTRA.get('saturation_margin_db')!r} is not a number - using 10")
+    SATURATION_MARGIN_DB = 10.0
+
+
+def cal_for_rate(rate):
+    """The dB -> dBuV factor for this sample rate (Hz): its own value from settings.csv / the CAL button, else the default."""
+    for r, v in CAL_BY_RATE.items():
+        if abs(r - float(rate)) < 1.0:
+            return v
+    return CAL_SDR_DB_TO_DBUV
+
+
+def cal_has_rate(rate):
+    return any(abs(r - float(rate)) < 1.0 for r in CAL_BY_RATE)
+
+
+def cal_reference_db():
+    """Factor used for the saturation line: that of the most sensitive calibrated rate (the smallest), else the default."""
+    return min(CAL_BY_RATE.values()) if CAL_BY_RATE else CAL_SDR_DB_TO_DBUV
+
+
+def settings_write_cal(cal_by_rate):
+    """Write the per-rate factors into settings.csv as 'setting,cal_<Hz>,<value>' rows. Every other line (presets, other
+    settings, comments) is kept exactly; old cal_ rows are replaced; the old file is first copied to settings.csv.bak.
+    The column the value goes in follows the file's own header ('value' if there is one, else 'label'). Returns the path."""
+    import shutil
+    if SETTINGS_PATH:
+        path = SETTINGS_PATH
+    else:
+        here = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, SETTINGS_FILENAME)
+    text = ""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+            text = fh.read()
+        shutil.copy2(path, path + ".bak")
+    nl = "\r\n" if ("\r\n" in text or "\n" not in text) else "\n"
+    fields = None
+    keep = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            row = next(csv.reader([ln], skipinitialspace=True), [])
+            if fields is None:                                   # the header line
+                fields = [x.strip().lower() for x in row]
+            elif len(row) >= 2 and row[0].strip().lower() == "setting" and row[1].strip().lower().startswith("cal_"):
+                continue                                         # an old per-rate calibration row: replaced below
+        keep.append(ln)
+    if fields is None:
+        fields = ["type", "name", "label", "start", "stop", "sample_rate", "gain_db", "hf_mode", "dbuv_cal"]
+        keep.insert(0, ",".join(fields))
+    i_type = fields.index("type") if "type" in fields else 0
+    i_name = fields.index("name") if "name" in fields else 1
+    i_val = fields.index("value") if "value" in fields else (fields.index("label") if "label" in fields else 2)
+
+    def make_row(name, val):
+        row = [""] * max(len(fields), i_val + 1, i_name + 1, i_type + 1)
+        row[i_type], row[i_name], row[i_val] = "setting", name, val
+        return ",".join(row)
+
+    keep.append("# dB -> dBuV factor per sample rate (written by the CAL button " + time.strftime("%Y-%m-%d %H:%M") + ")")
+    for rate, val in sorted(cal_by_rate.items()):
+        keep.append(make_row(f"cal_{int(round(rate))}", f"{val:.2f}"))
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(nl.join(keep) + nl)
+    return path
+
 # Any preset sample rate that is not already offered gets added to the live Sample Rate
 # dropdown, so the combo can always display the active preset's rate.
 SAMPLE_RATE_CHOICES = sorted(set(SAMPLE_RATE_CHOICES) | {p[4] for p in PRESETS} | {SAMPLE_RATE})
@@ -1114,6 +1272,34 @@ class SurveySignals(QtCore.QObject):
     # survey worker thread -> GUI thread: a new rate/gain test has started, show its settings on the controls
     progress = QtCore.pyqtSignal()
 
+# ---- CAL SURVEY defaults (see EmcScanner.cal_open_dialog) ----
+# A calibration survey feeds a KNOWN sine into the SDR and measures how the displayed level of that tone
+# changes with sample rate and RF gain, so CAL_SDR_DB_TO_DBUV can be checked against the whole range.
+CAL_TONE_HZ_DEFAULT = 1.5e6        # frequency of the test tone
+CAL_TONE_VPP_DEFAULT = 0.11        # its amplitude (V pk-pk) at the generator output / attenuator input
+CAL_WINDOW_HZ_DEFAULT = 25e3       # the tone is searched for within +/- this of its nominal frequency
+CAL_OFFSET_KHZ_DEFAULT = "200"     # tone position above the block centre (kHz); a comma list maps the passband
+CAL_SCANS_DEFAULT = 2              # scans per setting (the median is reported)
+CAL_LOBE_BINS = 3                  # bins either side of the peak summed to get the scalloping-free tone level
+CAL_MAX_OFFSET_FRAC = 0.40         # offsets beyond this fraction of the sample rate from the centre are skipped
+CAL_AGREE_DB = 1.0                 # sample rates "agree" at a gain if their levels are within this
+CAL_DEPART_DB = 1.0                # a rate "departs" at the first gain where it is this far from its low-gain level
+CAL_SPREAD_WARN_DB = 0.5           # repeat scans of one setting differing by more than this are flagged
+CAL_QUICK_TONE_HZ = 1.5e6          # the CAL button's test tone
+CAL_QUICK_SCANS = 2                # scans per tone position in the CAL button's measurement
+CAL_POS_FRACTIONS = (-0.30, -0.15, 0.15, 0.30)   # tone positions in the block, as a fraction of the sample rate from the centre
+CAL_POS_SPREAD_WARN_DB = 3.0       # CAL: tell the user if the level varies more than this with tone position
+CAL_MIN_HEADROOM_DB = 10.0         # CAL: reject a rate whose tone is closer than this to ADC full scale
+CAL_MIN_SNR_DB = 25.0              # CAL: reject a rate whose tone is less than this above the noise
+CAL_WINDOW_ENBW_DB = 10.0 * math.log10(0.375 / 0.25)   # Hann: sum of power over the tone's lobe / on-bin peak power
+
+
+class CalSurveySignals(QtCore.QObject):
+    # calibration survey worker thread -> GUI thread
+    done = QtCore.pyqtSignal(object)      # True if stopped early
+    progress = QtCore.pyqtSignal()        # a new rate/gain setting has started: move the Sample Rate box / gain slider
+
+
 # ---- Baseband SCOPE defaults (see the EmcScanner.scope_* methods) ----
 SCOPE_MAX_SAMPLES = 2097152     # most samples captured per scope frame (2**21)
 SCOPE_MIN_SAMPLES = 512         # fewest samples ever displayed per frame
@@ -1328,6 +1514,45 @@ class EmcScanner(QtWidgets.QMainWindow):
             QtCore.Q_ARG(str, msg)
         )
 
+    # ---- previous update_status_panel() (single Cal label), kept in case of problems ----
+#    def update_status_panel(self):
+#        """
+#        Rebuild the stable status panel text from the current live settings. Called
+#        whenever a setting actually changes (set_preset, averaging toggled/changed) -
+#        NOT once per sweep block - and safe to call from either thread since QLabel's
+#        setText is invoked via a queued call, matching the thread-safety pattern log() uses.
+#        """
+#        mode_label = getattr(self, "current_mode_label", "-")
+#        avg_text = (f"ON ({self.avg_count})" if getattr(self, "avg_enabled", False)
+#                    else "OFF")
+#        # Show the actual applied gain alongside the requested one - but ONLY when
+#        # actual_gain_db is known to have been measured against the CURRENTLY selected
+#        # gain_db. Right after a MODE switch, self.gain_db has changed but the hardware
+#        # hasn't been touched yet (that only happens when a sweep next starts), so
+#        # actual_gain_db/actual_gain_db_for_request still reflect the PREVIOUS mode -
+#        # comparing them against the new gain_db would report a false, stale mismatch.
+#        actual = getattr(self, "actual_gain_db", None)
+#        actual_for = getattr(self, "actual_gain_db_for_request", None)
+#        if actual is not None and actual_for == self.gain_db:
+#            if abs(actual - self.gain_db) > 0.5:
+#                gain_text = f"{self.gain_db:.1f} dB requested -> {actual:.1f} dB actual"
+#            else:
+#                gain_text = f"{self.gain_db:.1f} dB"
+#        else:
+#            gain_text = f"{self.gain_db:.1f} dB (not yet applied - press Start)"
+#        text = (
+#            f"Mode: {mode_label}\n"
+#            f"Start: {self.START_FREQ/1e6:.3f} MHz    Stop: {self.STOP_FREQ/1e6:.3f} MHz\n"
+#            f"Sample Rate: {self.SAMPLE_RATE/1e6:.3f} MS/s    Gain: {gain_text}\n"
+#            f"Averaging: {avg_text}"
+#        )
+#        QtCore.QMetaObject.invokeMethod(
+#            self.status_panel,
+#            "setText",
+#            QtCore.Qt.QueuedConnection,
+#            QtCore.Q_ARG(str, text)
+#        )
+
     def update_status_panel(self):
         """
         Rebuild the stable status panel text from the current live settings. Called
@@ -1365,6 +1590,11 @@ class EmcScanner(QtWidgets.QMainWindow):
             QtCore.Qt.QueuedConnection,
             QtCore.Q_ARG(str, text)
         )
+        # the front-panel "Cal:" label follows the sample rate in use (queued call: safe from either thread)
+        lbl = getattr(self, "cispr_calibration_label", None)
+        if lbl is not None:
+            QtCore.QMetaObject.invokeMethod(lbl, "setText", QtCore.Qt.QueuedConnection,
+                                            QtCore.Q_ARG(str, self.cal_label_text()))
 
     # Use this to build centers across the sweep band
     # start_hz, stop_hz, sample_rate are floats
@@ -1486,12 +1716,12 @@ class EmcScanner(QtWidgets.QMainWindow):
         # presses, since it represents the operator's own calibration adjustment, not
         # something a preset should reset.
         self.cispr_offset_db = 0.0
-        # dBuV_Calibration: a per-mode constant carried on each preset (see self.presets)
-        # and copied into this attribute by set_preset() whenever a MODE button is
-        # pressed. Different modes/bands/antennas can need a different fixed calibration
-        # (e.g. derived from a known reference signal), independent of the operator's
-        # live CISPR OFFSET.
-        self.dbuv_calibration = -78
+        # CISPR limit type shown by the red line / right axis: "radiated" (dBuV/m @ 10 m) or
+        # "conducted" (dBuV, mains port). Selected with the combo box next to 'Show CISPR limit'.
+        self.cispr_mode = "radiated"
+        # The correction (antenna factor / LISN loss) is remembered separately for each type.
+        self._cispr_corr_by_mode = {"radiated": 0.0, "conducted": 0.0}
+   
         # Effective offset actually applied to the right (CISPR) axis: OFFSET + CALIBRATION.
         self.cispr_effective_offset = 0.0
         self.input_atten_db = 0.0   # external attenuator in front of the SDR (front-panel spinbox)
@@ -1700,7 +1930,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         # This creates an independent right ViewBox so the right axis can show CISPR units
         # while the main (left) axis remains the FFT dB scale.
         self.plot.showAxis('right')
-        self.plot.getAxis('right').setLabel('CISPR (dBµV)')
+        # self.plot.getAxis('right').setLabel('CISPR (dBµV)')
+        self.plot.getAxis('right').setLabel(self.cispr_axis_label())
         self.plot.getAxis('right').setPen(pg.mkPen(color='red', width=2))
 
         # create dedicated right ViewBox and add it to the scene
@@ -1790,6 +2021,11 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_stop = QtWidgets.QPushButton("STOP")
         self.btn_save = QtWidgets.QPushButton("SAVE CSV")
         self.chk_cispr = QtWidgets.QCheckBox("Show CISPR limit")
+        self.cispr_mode_combo = QtWidgets.QComboBox()
+        self.cispr_mode_combo.addItem("Radiated (dBµV/m @10 m)", "radiated")
+        self.cispr_mode_combo.addItem("Conducted (dBµV)", "conducted")
+        self.cispr_mode_combo.setCurrentIndex(self.cispr_mode_combo.findData(self.cispr_mode))
+        self.cispr_mode_combo.setToolTip("Which CISPR limit the red line and right-hand axis show.")
 
         self.btn_cont = QtWidgets.QPushButton("START CONTINUOUS")
         ctrl_layout.addWidget(self.btn_cont)
@@ -1799,11 +2035,13 @@ class EmcScanner(QtWidgets.QMainWindow):
         ctrl_layout.addWidget(self.btn_stop)
         ctrl_layout.addWidget(self.btn_save)
         ctrl_layout.addWidget(self.chk_cispr)
+        ctrl_layout.addWidget(self.cispr_mode_combo)
 
         self.btn_start.clicked.connect(self.start_sweep)
         self.btn_stop.clicked.connect(self.stop_sweep)
         self.btn_save.clicked.connect(self.save_csv)
         self.chk_cispr.toggled.connect(self.cispr_toggle_visibility)
+        self.cispr_mode_combo.currentIndexChanged.connect(self.cispr_on_mode_changed)
 
         # ---- Live Sample Rate control ----
         # Independent of the MODE preset buttons: changing this does NOT stop a running
@@ -1885,15 +2123,12 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_offset_spin.setSuffix(" dB")
         # self.cispr_offset_spin.setToolTip("Visual offset to align CISPR (accounts for antenna/attenuation). "
         #                                    "Persists across MODE changes.")
-        self.cispr_offset_spin.setToolTip("Offset of the CISPR (right) axis relative to the left dBuV axis "
-                                           "(e.g. antenna factor). Persists across MODE changes.")
+        # self.cispr_offset_spin.setToolTip("Offset of the CISPR (right) axis relative to the left dBuV axis "
+        #                                    "(e.g. antenna factor). Persists across MODE changes.")
+        # (label and tooltip are now set per limit type by cispr_refresh_corr_ui())
 
         # Read-only display of the current mode's dBuV_Calibration, kept in sync by
         # cispr_refresh_offset_ui() whenever set_preset() changes mode.
-        # ---- previous CISPR calibration label / control placement, kept in case of problems ----
-        # self.cispr_calibration_label = QtWidgets.QLabel(f"Cal: {self.dbuv_calibration:+.1f} dB")
-        # self.cispr_calibration_label.setToolTip("Mode-dependent dBuV calibration, added to CISPR Offset "
-        #                                          "(set per MODE in self.presets).")
 
         # # place the controls in the same control row
         # ctrl_layout.addWidget(self.cispr_offset_label)
@@ -2017,6 +2252,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_offset_spin.valueChanged.connect(self.cispr_on_offset_changed)
         # Force an initial update so the curve/label reflect the current mode+spinbox value
         # immediately (safe because freq_axis/power_axis exist)
+        self.cispr_refresh_corr_ui()
         self.cispr_refresh_offset_ui()
         # Ensure initial visibility follows the checkbox (do not force show unconditionally)
         self.cispr_toggle_visibility(bool(getattr(self, "chk_cispr", None) and self.chk_cispr.isChecked()))
@@ -2026,11 +2262,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # Define presets as a list so we can index them and extend easily
         # Each entry: (internal_name, label, start_hz, stop_hz, sample_rate, gain_db, hf_mode_flag,
-        #              dbuv_calibration)
-        # dbuv_calibration is a fixed, mode-specific dB value (e.g. from comparing a known
-        # reference signal's true dBuV level against what this mode reads). It is added to
-        # the operator's live CISPR Offset spinbox value - see cispr_get_effective_offset().
-        # All zero for now; fill these in as calibration data becomes available per mode.
+
         # Supported gains: [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254,
         # 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496] (tenths of dB -
         # e.g. 402 -> 40.2 dB). gain_db values below are requested dB; init_sdr() reads back
@@ -2205,10 +2437,10 @@ class EmcScanner(QtWidgets.QMainWindow):
     def set_preset(self, preset_index):
         """
         Apply a MODE button's settings: stop any in-progress sweep, then store the new
-        start/stop/sample-rate/gain/hf_mode/dbuv_calibration as the LIVE settings that
+        start/stop/sample-rate/gain/hf_mode as the LIVE settings that
         start_sweep(), start_continuous(), init_sdr(), sweep_loop() and the CISPR mapping
         all read (self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE, self.gain_db,
-        self.hf_mode, self.dbuv_calibration). The SDR itself isn't reopened here -
+        self.hf_mode). The SDR itself isn't reopened here -
         init_sdr() re-applies these values to the hardware the next time START SWEEP /
         START CONTINUOUS is pressed, so browsing between modes doesn't repeatedly
         open/close the device. This method does not start a new sweep; it only stops the
@@ -2232,7 +2464,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                 self.sweep_thread.join(timeout=1.0)
 
             # Unpack preset tuple: (internal_name, label, start_hz, stop_hz, sample_rate,
-            # gain_db, hf_mode_flag, dbuv_calibration)
+            # gain_db, hf_mode_flag)
             _, _label, start_hz, stop_hz, sample_rate, gain_db, hf_flag, dbuv_cal = self.presets[preset_index]
 
             # Store preset values as the LIVE settings for other code to use
@@ -2249,10 +2481,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             # HF mode flag (affects SDR path and PSD constant only)
             self.hf_mode = bool(hf_flag)
 
-            # Mode-dependent dBuV calibration - added to the operator's CISPR Offset
-            # spinbox value (which is NOT touched here; see cispr_refresh_offset_ui()).
-            self.dbuv_calibration = float(dbuv_cal)
-
             # Recompute the sweep centers and block markers for the new range/sample rate
             # so the plot's markers and the next sweep agree on the new preset immediately,
             # without waiting for START SWEEP / START CONTINUOUS to rebuild them.
@@ -2265,9 +2493,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # self.log(f"MODE set: {_label}  {self.START_FREQ/1e6:.3f}-{self.STOP_FREQ/1e6:.3f} MHz, "
-            #          f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}, "
-            #          f"dBuV_Calibration={self.dbuv_calibration:+.1f} dB")
             self.log(f"MODE set: {_label}  {self.START_FREQ/1e6:.3f}-{self.STOP_FREQ/1e6:.3f} MHz, "
                      f"{self.SAMPLE_RATE/1e6:.3f} MS/s, gain {self.gain_db}, HF={self.hf_mode}")
 
@@ -2338,13 +2563,24 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_update_axis_ticks()
 
  
+    # ---- previous cal_total_offset_db() (one factor for all rates), kept in case of problems ----
+#    def cal_total_offset_db(self):
+#        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator."""
+#        applied = getattr(self, "_applied_gain_db", None)
+#        gain = float(applied if applied is not None else self.gain_db)
+#        if self.hf_mode:
+#            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by CAL_SDR_DB_TO_DBUV)
+#        return CAL_SDR_DB_TO_DBUV - gain + float(self.input_atten_db)
+
     def cal_total_offset_db(self):
-        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator."""
+        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator. The dB -> dBuV factor is
+        the one for the sample rate in use (per-rate values from settings.csv / the CAL button, else the default)."""
         applied = getattr(self, "_applied_gain_db", None)
         gain = float(applied if applied is not None else self.gain_db)
         if self.hf_mode:
-            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by CAL_SDR_DB_TO_DBUV)
-        return CAL_SDR_DB_TO_DBUV - gain + float(self.input_atten_db)
+            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by the dB -> dBuV factors)
+        rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
+        return cal_for_rate(rate) - gain + float(self.input_atten_db)
 
     def atten_on_changed(self, val):
         """Attenuator spinbox -> model; redraw the stored trace at the new calibration."""
@@ -2353,31 +2589,83 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     # ---- previous cispr_get_effective_offset(), kept in case of problems ----
     # def cispr_get_effective_offset(self):
-    #     """
-    #     The actual offset applied to the right (CISPR) axis: the operator's persistent
-    #     CISPR Offset spinbox value, plus this mode's fixed dBuV_Calibration. ALSO account for gain 
-    #     """
-    #     return (
-    #         float(getattr(self, "cispr_offset_db", 0.0))
-    #         + float(getattr(self, "dbuv_calibration", 0.0))
-    #         + float(getattr(self, "gain_db", 0.0))
-    #     )
+    #     """Offset of the right (CISPR) axis relative to the left axis. The left axis is already dBuV."""
+    #     return float(getattr(self, "cispr_offset_db", 0.0))
 
     def cispr_get_effective_offset(self):
-        """Offset of the right (CISPR) axis relative to the left axis. The left axis is already dBuV."""
-        return float(getattr(self, "cispr_offset_db", 0.0))
+        """
+        Offset of the right (CISPR) axis relative to the left axis. The spinbox value is a
+        CORRECTION added to the displayed level to get the quantity the limit is written in
+        (antenna factor for Radiated, LISN / coupling-network loss for Conducted), so the
+        right axis reads (left axis + correction): effective offset = -correction.
+        """
+        return -float(getattr(self, "cispr_offset_db", 0.0))
+
+    def cispr_axis_label(self):
+        if getattr(self, "cispr_mode", "radiated") == "conducted":
+            return "CISPR conducted (dBµV)"
+        return "CISPR radiated (dBµV/m @10 m)"
+
+    def cispr_refresh_corr_ui(self):
+        """Set the correction spinbox's label/tooltip for the current limit type."""
+        try:
+            if self.cispr_mode == "conducted":
+                self.cispr_offset_label.setText("LISN corr.")
+                self.cispr_offset_spin.setToolTip(
+                    "Correction ADDED to the displayed level to get the level at the LISN measuring port "
+                    "(e.g. the loss of a coupling network). The right axis reads left axis + this value.")
+            else:
+                self.cispr_offset_label.setText("Antenna factor")
+                self.cispr_offset_spin.setToolTip(
+                    "Antenna factor (plus cable loss), dB(1/m), ADDED to the displayed level to give field "
+                    "strength in dBuV/m. The right axis reads left axis + this value.")
+        except Exception:
+            pass
+
+    def cispr_on_mode_changed(self, index):
+        """Radiated / Conducted combo -> model (GUI thread): swap the limit table, label and correction."""
+        mode = self.cispr_mode_combo.itemData(index)
+        if mode not in ("radiated", "conducted") or mode == self.cispr_mode:
+            return
+        self._cispr_corr_by_mode[self.cispr_mode] = float(self.cispr_offset_db)   # remember the old type's value
+        self.cispr_mode = mode
+        self.cispr_offset_db = float(self._cispr_corr_by_mode[mode])
+        self.cispr_offset_spin.blockSignals(True)
+        self.cispr_offset_spin.setValue(self.cispr_offset_db)
+        self.cispr_offset_spin.blockSignals(False)
+        self.cispr_freqs, self.cispr_limits = self.cispr_build_reference_curve()
+        self.plot.getAxis('right').setLabel(self.cispr_axis_label())
+        self.cispr_refresh_corr_ui()
+        self.cispr_refresh_offset_ui()
 
     def cispr_on_offset_changed(self, val):
         """
         Spinbox -> model. This value is deliberately global (not keyed by mode) so it
-        persists across MODE button presses; only dbuv_calibration changes with mode.
+        persists across MODE button presses;
         Redraws the curve AND the axis ticks - the ticks must be refreshed here too,
         since they depend on _vb_right's Y range, which cispr_update_curve() just changed.
         """
         self.cispr_offset_db = float(val)
+        self._cispr_corr_by_mode[self.cispr_mode] = self.cispr_offset_db
         self.cispr_effective_offset = self.cispr_get_effective_offset()
         self.cispr_update_curve()
         self.cispr_update_axis_ticks()
+
+    # ---- previous cispr_refresh_offset_ui() (one factor for all rates), kept in case of problems ----
+#    def cispr_refresh_offset_ui(self):
+#        """
+#        Call this whenever the active mode changes (set_preset()). The CISPR Offset
+#        spinbox is NOT touched here - it is the operator's persistent value and must
+#        survive mode changes unchanged. Only the mode-dependent calibration display and
+#        the resulting curve/ticks are refreshed.
+#        """
+#        try:
+#            self.cispr_calibration_label.setText(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
+#        except Exception:
+#            pass
+#        self.cispr_effective_offset = self.cispr_get_effective_offset()
+#        self.cispr_update_curve()
+#        self.cispr_update_axis_ticks()
 
     def cispr_refresh_offset_ui(self):
         """
@@ -2387,8 +2675,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         the resulting curve/ticks are refreshed.
         """
         try:
-            # self.cispr_calibration_label.setText(f"Cal: {self.dbuv_calibration:+.1f} dB")
-            self.cispr_calibration_label.setText(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
+            self.cispr_calibration_label.setText(self.cal_label_text())
         except Exception:
             pass
         self.cispr_effective_offset = self.cispr_get_effective_offset()
@@ -2426,7 +2713,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         try:
             freqs = np.asarray(self.cispr_freqs, dtype=np.float64)
             limits = np.asarray(self.cispr_limits, dtype=np.float64)
-            L_interp = np.interp(fa, freqs, limits)
+            # L_interp = np.interp(fa, freqs, limits)
+            L_interp = np.interp(fa, freqs, limits, left=np.nan, right=np.nan)   # no line outside the table's range
         except Exception:
             return
 
@@ -2437,7 +2725,14 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Plot the CISPR curve in CISPR units (no offset applied to the data itself -
         # the offset is expressed entirely as a shift of the right ViewBox's range below).
         try:
-            self.cispr_curve.setData(fa, L_interp)
+            # self.cispr_curve.setData(fa, L_interp)
+            if np.all(np.isnan(L_interp)):
+                self.cispr_curve.setData([], [])          # scan range is outside the limit table
+            else:
+                try:
+                    self.cispr_curve.setData(fa, L_interp, connect='finite')
+                except Exception:
+                    self.cispr_curve.setData(fa, L_interp)
         except Exception as e:
             print("cispr_update_curve: setData error:", e)
 
@@ -2520,10 +2815,48 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # return f, L
         
-    def cispr_build_reference_curve(self):
-    # EN 55032 / CISPR 32 Class B radiated limits (simplified)
-    # 10 m below 1 GHz, 3 m above 1 GHz – all in dBµV/m
+    # ---- previous cispr_build_reference_curve() (radiated only), kept in case of problems ----
+    # def cispr_build_reference_curve(self):
+    # # EN 55032 / CISPR 32 Class B radiated limits (simplified)
+    # # 10 m below 1 GHz, 3 m above 1 GHz – all in dBµV/m
 
+    #     f = np.array([
+    #         30e6,   # 30 MHz
+    #         230e6,  # 230 MHz
+    #         1000e6, # 1 GHz
+    #         3e9,    # 3 GHz
+    #         6e9     # 6 GHz
+    #     ], dtype=np.float64)
+    #     delta_3m_to_10m = -10.46  # 20*log10(3/10)
+    # # Use quasi-peak limits below 1 GHz, average limits above 1 GHz
+    #     L = np.array([
+    #         30.0,  # 30–230 MHz  (QP, 10 m)
+    #         30.0,  # 30–230 MHz  (flat segment)
+    #         37.0,  # 230–1000 MHz (QP, 10 m)
+    #         50.0 + delta_3m_to_10m,            # 1–3 GHz scaled to 10 m
+    #         54.0 + delta_3m_to_10m             # 3–6 GHz scaled to 10 m
+    #     ], dtype=np.float64)
+
+    #     return f, L
+
+    def cispr_build_reference_curve(self, mode=None):
+        """
+        Return (freqs_hz, limits) for the selected CISPR limit type (self.cispr_mode if mode is None).
+          "radiated"  : EN 55032 / CISPR 32 Class B, dBuV/m at 10 m, 30 MHz - 6 GHz (simplified)
+          "conducted" : EN 55032 / CISPR 32 Class B, AC mains port, quasi-peak, dBuV, 150 kHz - 30 MHz
+        """
+        if mode is None:
+            mode = getattr(self, "cispr_mode", "radiated")
+
+        if mode == "conducted":
+            # 66 -> 56 dBuV falls linearly with log(f) from 150 kHz to 500 kHz, then 56 to 5 MHz, 60 to 30 MHz.
+            f_lo = np.geomspace(150e3, 500e3, 20)
+            L_lo = 66.0 - 10.0 * np.log10(f_lo / 150e3) / np.log10(500e3 / 150e3)
+            f = np.concatenate([f_lo, [5e6, 5.0001e6, 30e6]])
+            L = np.concatenate([L_lo, [56.0, 60.0, 60.0]])
+            return f.astype(np.float64), L.astype(np.float64)
+
+        # radiated (10 m below 1 GHz, 3 m above 1 GHz scaled to 10 m) - all in dBuV/m
         f = np.array([
             30e6,   # 30 MHz
             230e6,  # 230 MHz
@@ -2532,15 +2865,14 @@ class EmcScanner(QtWidgets.QMainWindow):
             6e9     # 6 GHz
         ], dtype=np.float64)
         delta_3m_to_10m = -10.46  # 20*log10(3/10)
-    # Use quasi-peak limits below 1 GHz, average limits above 1 GHz
+        # Use quasi-peak limits below 1 GHz, average limits above 1 GHz
         L = np.array([
-            30.0,  # 30–230 MHz  (QP, 10 m)
-            30.0,  # 30–230 MHz  (flat segment)
-            37.0,  # 230–1000 MHz (QP, 10 m)
-            50.0 + delta_3m_to_10m,            # 1–3 GHz scaled to 10 m
-            54.0 + delta_3m_to_10m             # 3–6 GHz scaled to 10 m
+            30.0,  # 30-230 MHz  (QP, 10 m)
+            30.0,  # 30-230 MHz  (flat segment)
+            37.0,  # 230-1000 MHz (QP, 10 m)
+            50.0 + delta_3m_to_10m,            # 1-3 GHz scaled to 10 m
+            54.0 + delta_3m_to_10m             # 3-6 GHz scaled to 10 m
         ], dtype=np.float64)
-
         return f, L
 
 
@@ -3824,6 +4156,985 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.START_FREQ = self.STOP_FREQ = float(hz)
             self.update_status_panel()
 
+    # ------------------------------------------------------------------------------------
+    # CAL SURVEY: how does the displayed level of a KNOWN tone vary with sample rate and RF gain?
+    # ------------------------------------------------------------------------------------
+    # Feed a sine of known level (default 1.5 MHz, 0.11 Vpp, via an attenuator) and press CAL SURVEY.
+    # For every sample rate x RF gain (x tone position in the block) the program measures the tone and converts it
+    # with the SAME formula the main display uses:
+    #       dBuV = SDR dB - RF gain + attenuator + CAL_SDR_DB_TO_DBUV
+    # then compares it with the level the tone really has (from Vpp). If one CAL_SDR_DB_TO_DBUV were right
+    # everywhere, every rate/gain would read the same. The report shows where that holds, where it does not,
+    # and which CAL_SDR_DB_TO_DBUV would be right for the region that does agree.
+    #
+    # Two things in the measurement are deliberately controlled:
+    #   * Position in the block. By default each rate is tuned so the tone sits at the SAME offset above the block
+    #     centre (200 kHz) - otherwise the tone would land at a different place in the tuner's IF passband at every
+    #     rate, and a passband ripple / roll-off would be mistaken for a sample-rate dependence. Enter several
+    #     offsets (e.g. -300,-150,150,300) to map the passband at every rate. Or tick the MODE-band option to
+    #     measure it exactly as the main display does (stitched blocks, whatever offset it falls at).
+    #   * Scalloping. A tone that falls between two FFT bins reads up to 1.4 dB low in the peak bin, by an amount
+    #     that changes with sample rate (the bin width does). The tone level is therefore taken from the power summed
+    #     over the tone's whole lobe, expressed as the on-bin peak the display would show. The raw peak-bin level
+    #     is recorded as well.
+
+    def cal_build_ui(self):
+        """Create the CAL and CAL SURVEY buttons next to GAIN/RATE SURVEY and the signals (called from survey_connect_signals)."""
+        self._cal = None
+        self.cal_signals = CalSurveySignals()
+        self.cal_signals.done.connect(self.cal_finish)
+        self.cal_signals.progress.connect(self.survey_sync_controls)
+        self.btn_cal_quick = QtWidgets.QPushButton("CAL...")
+        self.btn_cal_quick.setToolTip(
+            "Calibrate the dB -> dBuV factor of EVERY sample rate: feed a 1.5 MHz sine of known amplitude; each rate is measured at "
+            "0 dB RF gain and the best factor is worked out. You are asked before anything is applied or written to settings.csv.")
+        self.btn_cal_quick.clicked.connect(self.cal_quick_open_dialog)
+        self.btn_cal = QtWidgets.QPushButton("CAL SURVEY...")
+        self.btn_cal.setToolTip(
+            "Diagnostic: feed a known sine (default 1.5 MHz) and measure how its displayed dBuV changes with sample rate and RF gain. "
+            "Writes an HTML report and CSV files. Press STOP to end early (partial results are saved).")
+        self.btn_cal.clicked.connect(self.cal_open_dialog)
+        sub = self.find_layout_with(self.btn_survey)
+        if sub is not None:
+            at = sub.indexOf(self.btn_survey) + 1
+            sub.insertWidget(at, self.btn_cal_quick)
+            sub.insertWidget(at + 1, self.btn_cal)
+        else:
+            self.centralWidget().layout().addWidget(self.btn_cal_quick)
+            self.centralWidget().layout().addWidget(self.btn_cal)
+        self.mode_buttons.append(self.btn_cal_quick)   # join the controls that are locked while a survey / the scope runs
+        self.mode_buttons.append(self.btn_cal)
+
+    def find_layout_with(self, widget):
+        """The (nested) layout that directly holds this widget, searched two levels down from the central layout."""
+        main_layout = self.centralWidget().layout()
+        for i in range(main_layout.count()):
+            lay = main_layout.itemAt(i).layout()
+            if lay is None:
+                continue
+            if lay.indexOf(widget) >= 0:
+                return lay
+            for j in range(lay.count()):
+                sub = lay.itemAt(j).layout()
+                if sub is not None and sub.indexOf(widget) >= 0:
+                    return sub
+        return None
+
+    def cal_busy(self):
+        return (self._survey is not None or self._cal is not None or self._stitch is not None
+                or getattr(self, "scope_active", False))
+
+    @staticmethod
+    def cal_expected_dbuv(vpp):
+        """dBuV of a sine of this peak-to-peak voltage: 20*log10(Vrms / 1 uV)."""
+        return 20.0 * math.log10(max(float(vpp), 1e-12) / (2.0 * math.sqrt(2.0)) / 1e-6)
+
+    @staticmethod
+    def cal_parse_offsets(text):
+        """'200' or '-300, -150; 150, 300' -> list of kHz floats. Raises ValueError on rubbish."""
+        vals = []
+        for t in str(text).replace(";", ",").split(","):
+            t = t.strip()
+            if t:
+                vals.append(float(t))
+        if not vals:
+            raise ValueError("no offsets given")
+        return vals
+
+    def cal_open_dialog(self):
+        if self._survey is not None or self._cal is not None or self._stitch is not None or getattr(self, "scope_active", False):
+            self.log("CAL survey: not available while another survey, the stitch check or the scope is running")
+            return
+        if self.hf_mode:
+            QtWidgets.QMessageBox.information(self, "Cal survey", "Not available in an HF (direct-sampling) mode - pick a tuner MODE first.")
+            return
+        use_band_ok = (self.START_FREQ != self.STOP_FREQ) and not getattr(self, "single_mode", False)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Calibration survey - known tone")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel(
+            "Feed a sine of known level. Every sample rate x RF gain is measured (scanned several times, median kept)\n"
+            "and the tone's displayed dBuV is compared with its true level. Averaging setting is used as-is."))
+        form = QtWidgets.QFormLayout()
+        sp_tone = QtWidgets.QDoubleSpinBox()
+        sp_tone.setLocale(SCOPE_LOCALE)
+        sp_tone.setRange(0.01, 30.0)
+        sp_tone.setDecimals(4)
+        sp_tone.setSuffix(" MHz")
+        sp_tone.setValue(CAL_TONE_HZ_DEFAULT / 1e6)
+        sp_vpp = QtWidgets.QDoubleSpinBox()
+        sp_vpp.setLocale(SCOPE_LOCALE)
+        sp_vpp.setRange(0.0001, 20.0)
+        sp_vpp.setDecimals(4)
+        sp_vpp.setSuffix(" V pk-pk")
+        sp_vpp.setValue(CAL_TONE_VPP_DEFAULT)
+        sp_att = QtWidgets.QDoubleSpinBox()
+        sp_att.setLocale(SCOPE_LOCALE)
+        sp_att.setRange(0.0, 100.0)
+        sp_att.setDecimals(1)
+        sp_att.setSuffix(" dB")
+        sp_att.setValue(float(self.input_atten_db))
+        sp_att.setToolTip("Attenuator between the generator and the SDR. Defaults to the front-panel Attenuator setting.")
+        lbl_exp = QtWidgets.QLabel("")
+        sp_win = QtWidgets.QDoubleSpinBox()
+        sp_win.setLocale(SCOPE_LOCALE)
+        sp_win.setRange(1.0, 500.0)
+        sp_win.setDecimals(1)
+        sp_win.setSuffix(" kHz")
+        sp_win.setValue(CAL_WINDOW_HZ_DEFAULT / 1e3)
+        sp_win.setToolTip("The tone is looked for within +/- this of its nominal frequency.")
+        chk_band = QtWidgets.QCheckBox("Measure on the current MODE band (stitched blocks, as the main display)")
+        chk_band.setEnabled(use_band_ok)
+        chk_band.setToolTip("Unticked (default): one block per measurement with the tone at a fixed offset from the block "
+                            "centre, so the tone is always in the same part of the tuner passband at every sample rate.")
+        ed_off = QtWidgets.QLineEdit(CAL_OFFSET_KHZ_DEFAULT)
+        ed_off.setToolTip("Tone position above the block centre, kHz (negative = below). Several values separated by commas "
+                          "measure the passband shape at every sample rate. Offsets outside +/-40% of a rate are skipped.")
+        chk_band.toggled.connect(lambda on: ed_off.setEnabled(not on))
+        gain_texts = [f"{g:.1f} dB" for g in RTL_GAIN_STEPS_DB]
+        cb_lo, cb_hi = QtWidgets.QComboBox(), QtWidgets.QComboBox()
+        cb_lo.addItems(gain_texts)
+        cb_hi.addItems(gain_texts)
+        cb_lo.setCurrentIndex(0)
+        cb_hi.setCurrentIndex(len(gain_texts) - 1)
+        sp_stride = QtWidgets.QSpinBox()
+        sp_stride.setRange(1, 10)
+        sp_stride.setValue(1)
+        sp_scans = QtWidgets.QSpinBox()
+        sp_scans.setRange(1, 5)
+        sp_scans.setValue(CAL_SCANS_DEFAULT)
+        form.addRow("Tone frequency", sp_tone)
+        form.addRow("Tone amplitude (generator / attenuator input)", sp_vpp)
+        form.addRow("Attenuator fitted", sp_att)
+        form.addRow("True level at attenuator input", lbl_exp)
+        form.addRow("Search window", sp_win)
+        form.addRow("", chk_band)
+        form.addRow("Tone offset from block centre (kHz)", ed_off)
+        form.addRow("Gain from", cb_lo)
+        form.addRow("Gain to", cb_hi)
+        form.addRow("Use every Nth gain step", sp_stride)
+        form.addRow("Scans per setting", sp_scans)
+        lay.addLayout(form)
+        lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
+        lst = QtWidgets.QListWidget()
+        for r in SAMPLE_RATE_CHOICES:
+            it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s")
+            it.setData(QtCore.Qt.UserRole, float(r))
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if any(abs(r - q) < 1.0 for q in SAMPLE_RATE_RECOMMENDED) else QtCore.Qt.Unchecked)
+            lst.addItem(it)
+        lst.setMinimumHeight(150)
+        lay.addWidget(lst)
+        info = QtWidgets.QLabel("")
+        lay.addWidget(info)
+
+        def offsets_or_none():
+            try:
+                return self.cal_parse_offsets(ed_off.text())
+            except ValueError:
+                return None
+
+        def chosen():
+            lo, hi = sorted((cb_lo.currentIndex(), cb_hi.currentIndex()))
+            gains = [float(g) for g in RTL_GAIN_STEPS_DB[lo:hi + 1:sp_stride.value()]]
+            rates = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count()) if lst.item(i).checkState() == QtCore.Qt.Checked]
+            return rates, gains
+
+        def valid_offsets(rate, offs):
+            return [o for o in offs if abs(o * 1e3) <= CAL_MAX_OFFSET_FRAC * rate and sp_tone.value() * 1e6 - o * 1e3 > 50e3]
+
+        def n_points():
+            rates, gains = chosen()
+            if chk_band.isChecked():
+                return rates, gains, [(r, None) for r in rates]
+            offs = offsets_or_none() or []
+            return rates, gains, [(r, o) for r in rates for o in valid_offsets(r, offs)]
+
+        def total_seconds():
+            rates, gains, ro = n_points()
+            n_avg = self.avg_get_active_count()
+            tot = 0.0
+            for r, _o in ro:
+                nblk = len(self.build_centers(self.START_FREQ, self.STOP_FREQ, r)) if chk_band.isChecked() else 1
+                per = nblk * (0.12 + 0.15 + n_avg * (NFFT / r + 0.004))
+                tot += per * (len(gains) * sp_scans.value() + 1)
+            return tot
+
+        def refresh_info(*_):
+            exp = self.cal_expected_dbuv(sp_vpp.value())
+            lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value():.4f} Vpp = {sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
+            rates, gains, ro = n_points()
+            bad = (not chk_band.isChecked()) and offsets_or_none() is None
+            info.setText("Offsets must be numbers (kHz), comma separated." if bad else
+                         f"{len(rates)} rates x {len(gains)} gains, {len(ro)} rate/offset combination(s), {sp_scans.value()} scan(s) each "
+                         f"- roughly {self.survey_fmt_seconds(total_seconds())}")
+
+        for wdg in (sp_tone, sp_vpp, sp_att, sp_win):
+            wdg.valueChanged.connect(refresh_info)
+        for wdg in (cb_lo, cb_hi):
+            wdg.currentIndexChanged.connect(refresh_info)
+        sp_stride.valueChanged.connect(refresh_info)
+        sp_scans.valueChanged.connect(refresh_info)
+        ed_off.textChanged.connect(refresh_info)
+        chk_band.toggled.connect(refresh_info)
+        lst.itemChanged.connect(refresh_info)
+        refresh_info()
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        rates, gains = chosen()
+        if not rates or not gains:
+            self.log("CAL survey: nothing selected")
+            return
+        use_band = chk_band.isChecked()
+        offs = [None]
+        if not use_band:
+            offs = offsets_or_none()
+            if not offs:
+                QtWidgets.QMessageBox.information(self, "Cal survey", "The tone offsets must be numbers (kHz), comma separated.")
+                return
+        combos = []
+        for r in rates:
+            for o in ([None] if use_band else valid_offsets(r, offs)):
+                for g in gains:
+                    combos.append((r, o, g))
+        if not combos:
+            self.log("CAL survey: no rate / offset combination is possible (offsets too large for the chosen rates?)")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save calibration survey (base name; writes .html and _*.csv)", "rf_cal_survey.html", "HTML report (*.html)")
+        if not path:
+            return
+        params = {"tone_hz": sp_tone.value() * 1e6, "vpp": sp_vpp.value(), "atten": sp_att.value(),
+                  "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": sp_win.value() * 1e3,
+                  "use_band": use_band, "combos": combos, "scans": sp_scans.value(), "path": path}
+        self.cal_start(params)
+
+    def cal_start(self, prm):
+        if self._survey is not None or self._cal is not None:
+            return
+        quick = bool(prm.get("quick"))             # the CAL button: no files, just the per-rate result
+        fh = None
+        if not quick:
+            base = os.path.splitext(prm["path"])[0]
+            prm["base"] = base
+            prm["html_path"] = base + ".html"
+            try:
+                fh = open(base + "_long.csv", "w", newline="")
+            except Exception as e:
+                self.log(f"CAL survey: cannot create result files: {e}")
+                return
+        was_running = bool(self.sweep_thread and self.sweep_thread.is_alive())
+        if was_running:
+            self.stop_flag.set()
+            self.sweep_thread.join(timeout=3.0)
+            if self.sweep_thread.is_alive():
+                self.log("CAL survey: ERROR - the running sweep did not stop; try again")
+                if fh is not None:
+                    fh.close()
+                return
+        self.stop_flag.clear()
+        try:
+            self.init_sdr()
+        except Exception as e:
+            self.log(f"CAL survey: error opening the SDR: {e}")
+            if fh is not None:
+                fh.close()
+            return
+        w = csv.writer(fh) if fh is not None else None
+        if w is not None:
+            w.writerow(["sample_rate_hz", "tone_offset_khz", "block_offset_khz", "gain_db", "scan", "tone_freq_hz", "tone_dbuv",
+                    "peak_bin_dbuv", "error_db", "implied_cal", "floor_dbuv", "snr_db", "strongest_freq_hz", "strongest_dbuv",
+                    "stronger_signal_elsewhere", "n_avg"])
+        prm.update({"fh": fh, "w": w, "results": [], "records": [], "idx": -1, "skipped": 0, "t_start": time.time(),
+                    "was_running": was_running,
+                    "orig": (self.START_FREQ, self.STOP_FREQ, self.SAMPLE_RATE, self.gain_db, bool(getattr(self, "single_mode", False))),
+                    "n_avg": self.avg_get_active_count(), "cal0": CAL_SDR_DB_TO_DBUV})
+        self._cal = prm
+        self._survey = {"cal": True}                 # makes the stitch check / single-frequency mode / scope / old survey stand aside
+        self.log(f"=== {'CAL' if quick else 'CAL SURVEY'} STARTED: {len(prm['combos'])} settings x {prm['scans']} scan(s), tone {prm['tone_hz']/1e6:.4f} MHz, "
+                 f"true level {prm['expected']:.1f} dBuV" + ("" if quick else f" -> {prm['html_path']}") + " ===")
+        self.survey_set_lock(True)
+        self.sweep_thread = threading.Thread(target=self.cal_loop, daemon=True)
+        self.sweep_thread.start()
+
+    def cal_point_setup(self, rate, off_khz):
+        """Worker thread: aim the sweep for this point. Single-block mode: one block centred so the tone is off_khz above
+        the centre (START = STOP = centre; single_mode makes the whole captured bandwidth count). MODE-band mode: unchanged."""
+        c = self._cal
+        if c["use_band"]:
+            return
+        centre = c["tone_hz"] - off_khz * 1e3
+        self.START_FREQ = self.STOP_FREQ = float(centre)
+        self.centers = np.array([float(centre)], dtype=np.float64)
+
+    def cal_loop(self):
+        """Survey worker thread: for every rate / offset / gain take several complete scans with the normal sweep_loop(),
+        measure the tone in each, keep the median, log and store the results."""
+        c = self._cal
+        aborted = False
+        try:
+            if not c["use_band"]:
+                self.single_mode = True              # no edge masking, no stitching: the whole captured block is shown
+            rate0, off0, gain0 = c["combos"][0]
+            self.SAMPLE_RATE = rate0
+            self.gain_db = gain0
+            self.cal_point_setup(rate0, off0)
+            self.cal_signals.progress.emit()
+            c0 = self.centers if c["use_band"] is False else self.build_centers(self.START_FREQ, self.STOP_FREQ, rate0)
+            self.sdr.sample_rate = rate0
+            self._applied_sample_rate = rate0
+            self.settle_radio(float(c0[0]))
+            last_key = None
+            n_all = len(c["combos"])
+            for idx, (rate, off, gain) in enumerate(c["combos"]):
+                if self.stop_flag.is_set():
+                    aborted = True
+                    break
+                c["idx"] = idx
+                self.SAMPLE_RATE = rate
+                self.gain_db = gain
+                self.cal_point_setup(rate, off)
+                self.cal_signals.progress.emit()
+                key = (rate, off)
+                warm = 1 if key != last_key else 0      # the first scan after a rate / tuning change is a warm-up: thrown away
+                last_key = key
+                got = []
+                tries = 0
+                while len(got) < c["scans"] and tries < c["scans"] + warm + 3:
+                    if self.stop_flag.is_set():
+                        aborted = True
+                        break
+                    tries += 1
+                    seq0 = self._pass_seq
+                    self._restart_pass = False
+                    self.sweep_loop()
+                    lp = self._last_pass
+                    if lp is None or lp["seq"] <= seq0 or lp["rate"] != rate or lp["gain"] != gain:
+                        continue                        # not a clean scan: try again
+                    if warm > 0:
+                        warm -= 1
+                        continue
+                    got.append(self.cal_measure(lp, rate, off, gain, len(got) + 1))
+                if aborted:
+                    break
+                if not got:
+                    c["skipped"] += 1
+                    self.log(f"CAL survey: no clean scan at {rate/1e6:.3f} MS/s / {off} kHz / {gain:.1f} dB - skipped")
+                    continue
+                res = self.cal_aggregate(got, rate, off, gain)
+                c["results"].append(res)
+                self.log(f"Cal {idx + 1}/{n_all}: {rate/1e6:.3f} MS/s, " + (f"tone at {off:+g} kHz, " if off is not None else "MODE band, ") +
+                         f"{gain:.1f} dB -> {res['tone']:.1f} dBuV (error {res['err']:+.1f} dB)" +
+                         ("  [stronger signal elsewhere]" if res["other"] else ""))
+        except Exception as e:
+            import traceback
+            print(f"cal_loop: error {e!r}")
+            traceback.print_exc()
+            aborted = True
+        finally:
+            try:
+                c["fh"].flush()
+            except Exception:
+                pass
+            sf, st, sr, sg, sm = c["orig"]               # put the operator's settings back
+            self.single_mode = sm
+            self.START_FREQ, self.STOP_FREQ = sf, st
+            self.SAMPLE_RATE, self.gain_db = sr, sg
+            self.centers = (np.array([sf], dtype=np.float64) if sf == st else self.build_centers(sf, st, sr))
+            self.cal_signals.done.emit(bool(aborted))
+
+    @staticmethod
+    def cal_tone_levels(f, p, rate, tone_hz, win_hz, ignore_hz=50e3):
+        """Measure the test tone in one stitched spectrum (f in Hz, p in SDR dB, i.e. before the gain / attenuator / CAL
+        conversion). Returns a dict: found, f_pk, pk_db (peak bin), tone_db (power summed over the tone's lobe, expressed as
+        the on-bin peak - free of scalloping loss), floor_db (median), g_f / g_db (strongest bin anywhere) and
+        other_louder (something clearly stronger than the tone, elsewhere in the spectrum)."""
+        nan = float("nan")
+        out = {"found": False, "f_pk": nan, "pk_db": nan, "tone_db": nan, "floor_db": nan, "g_f": nan, "g_db": nan,
+               "other_louder": False}
+        f = np.asarray(f, dtype=np.float64)
+        p = np.asarray(p, dtype=np.float64)
+        ok = np.isfinite(f) & np.isfinite(p) & (p > -190.0)
+        f, p = f[ok], p[ok]
+        if f.size < 20:
+            return out
+        order = np.argsort(f)
+        f, p = f[order], p[order]
+        floor = float(np.median(p))
+        out["floor_db"] = floor
+        # strongest bin anywhere - but not in the RF-DC region (|f| < ignore_hz): the V4 upconverter's LO feed-through and
+        # the DC spike sit there and are not signals, so they must not be mistaken for a stronger signal than the tone
+        away = np.flatnonzero(np.abs(f) > ignore_hz)
+        ig = int(away[np.argmax(p[away])]) if away.size else int(np.argmax(p))
+        out["g_f"], out["g_db"] = float(f[ig]), float(p[ig])
+        sel = np.flatnonzero(np.abs(f - tone_hz) <= win_hz)
+        if sel.size == 0:
+            return out
+        ipk = int(sel[np.argmax(p[sel])])
+        df = float(rate) / NFFT
+        lobe = np.abs(f - f[ipk]) <= (CAL_LOBE_BINS + 0.5) * df
+        nb = int(np.count_nonzero(lobe))
+        lin = float(np.sum(10.0 ** (p[lobe] / 10.0)))
+        net = max(lin - nb * 10.0 ** (floor / 10.0), lin * 1e-3)      # take the noise inside the lobe out
+        out["found"] = True
+        out["f_pk"], out["pk_db"] = float(f[ipk]), float(p[ipk])
+        out["tone_db"] = 10.0 * math.log10(net) - CAL_WINDOW_ENBW_DB
+        out["other_louder"] = bool(out["g_db"] > out["pk_db"] + 1.0 and abs(out["g_f"] - out["f_pk"]) > 5.0 * df)
+        return out
+
+    def cal_measure(self, lp, rate, off, gain, scan_no):
+        """Worker thread: measure the tone in one finished scan, convert to dBuV, store the record and one CSV row."""
+        c = self._cal
+        m = self.cal_tone_levels(lp["f"], lp["p"], rate, c["tone_hz"], c["win_hz"])
+        cal_r = cal_for_rate(rate)                                         # this sample rate's dB -> dBuV factor
+        conv = -float(gain) + float(c["atten"]) + cal_r                   # SDR dB -> dBuV at the attenuator input
+        nan = float("nan")
+        blk = nan
+        if c["use_band"]:
+            cen = self.build_centers(self.START_FREQ, self.STOP_FREQ, rate)
+            blk = (c["tone_hz"] - float(cen[int(np.argmin(np.abs(cen - c["tone_hz"])))])) / 1e3
+        elif off is not None:
+            blk = float(off)
+        tone = m["tone_db"] + conv
+        rec = {"rate": rate, "off": off, "blk": blk, "gain": gain, "scan": scan_no, "found": m["found"], "f_pk": m["f_pk"],
+               "tone": tone, "pk": m["pk_db"] + conv, "err": tone - c["expected"], "implied": cal_r - (tone - c["expected"]), "cal": cal_r, "tone_p": m["tone_db"],
+               "floor": m["floor_db"] + conv, "snr": m["tone_db"] - m["floor_db"], "g_f": m["g_f"], "g_db": m["g_db"] + conv,
+               "other": m["other_louder"], "n_avg": lp["n_avg"]}
+        c["records"].append(rec)
+        try:
+            if c.get("w") is None:
+                return rec
+            c["w"].writerow([f"{rate:.0f}", "" if off is None else f"{off:g}", "" if blk != blk else f"{blk:.1f}", f"{gain:.1f}", scan_no,
+                             f"{rec['f_pk']:.1f}", f"{rec['tone']:.2f}", f"{rec['pk']:.2f}", f"{rec['err']:.2f}", f"{rec['implied']:.2f}",
+                             f"{rec['floor']:.2f}", f"{rec['snr']:.1f}", f"{rec['g_f']:.1f}", f"{rec['g_db']:.2f}",
+                             int(rec["other"]), rec["n_avg"]])
+            c["fh"].flush()
+        except Exception as e:
+            print("cal_measure: could not write CSV row:", e)
+        return rec
+
+    @staticmethod
+    def cal_aggregate(recs, rate, off, gain):
+        """Median of the scans of one setting (a tone that is not found gives NaN)."""
+        def med(key):
+            v = [r[key] for r in recs if r["found"] and r[key] == r[key]]
+            return float(np.median(v)) if v else float("nan")
+        tones = [r["tone"] for r in recs if r["found"] and r["tone"] == r["tone"]]
+        return {"rate": rate, "off": off, "gain": gain, "n": len(recs), "tone": med("tone"), "pk": med("pk"), "err": med("err"),
+                "implied": med("implied"), "cal": med("cal"), "tone_p": med("tone_p"), "floor": med("floor"), "snr": med("snr"), "blk": med("blk"),
+                "spread": (max(tones) - min(tones)) if len(tones) > 1 else 0.0,
+                "other": any(r["other"] for r in recs), "found": bool(tones)}
+
+    # ---- analysis ----
+    def cal_analyse(self, c):
+        """Reduce the results to findings. Returns a list of (level, text) and, per tone offset, a dict of tables."""
+        res = [r for r in c["results"] if r["found"]]
+        exp = c["expected"]
+        finds = []
+        per_off = {}
+        offs = sorted({r["off"] for r in res}, key=lambda o: (o is not None, o if o is not None else 0.0))
+        for off in offs:
+            rs = [r for r in res if r["off"] == off]
+            rates = sorted({r["rate"] for r in rs})
+            gains = sorted({r["gain"] for r in rs})
+            M = {(r["rate"], r["gain"]): r for r in rs}
+            name = "MODE band (stitched)" if off is None else f"tone {off:+g} kHz from block centre"
+            # per rate: its own low-gain level and the gain at which it first moves away from it
+            per_rate = []
+            for r in rates:
+                gs = [g for g in gains if (r, g) in M]
+                if not gs:
+                    continue
+                ref = float(np.median([M[(r, g)]["tone"] for g in gs[:3]]))
+                depart = next((g for g in gs if abs(M[(r, g)]["tone"] - ref) > CAL_DEPART_DB), None)
+                errs = [M[(r, g)]["err"] for g in gs]
+                per_rate.append({"rate": r, "ref": ref, "ref_err": ref - exp, "depart": depart, "emin": min(errs), "emax": max(errs),
+                                 "implied_low": float(np.median([M[(r, g)]["cal"] for g in gs])) - (ref - exp)})
+            refs = {p_["rate"]: p_["ref"] for p_ in per_rate}
+            # gain range over which ONE constant works: every rate agrees AND each rate still holds its low-gain level
+            # (contiguous from the lowest gain)
+            gflat = None
+            flat_cells = []
+            for g in gains:
+                cells = [M[(r, g)] for r in rates if (r, g) in M]
+                vals = [x["tone"] for x in cells]
+                if (len(cells) == len(rates) and (max(vals) - min(vals)) <= CAL_AGREE_DB
+                        and all(abs(M[(r, g)]["tone"] - refs[r]) <= CAL_DEPART_DB for r in rates if r in refs)):
+                    gflat = g
+                    flat_cells += cells
+                else:
+                    break
+            spread_by_gain = {g: (max(M[(r, g)]["tone"] for r in rates if (r, g) in M) - min(M[(r, g)]["tone"] for r in rates if (r, g) in M))
+                              for g in gains if any((r, g) in M for r in rates)}
+            per_off[off] = {"name": name, "rates": rates, "gains": gains, "M": M, "gflat": gflat, "per_rate": per_rate,
+                            "spread_by_gain": spread_by_gain}
+            if flat_cells:
+                imp = [x["implied"] for x in flat_cells]
+                finds.append(("ok", f"{name}: all {len(rates)} sample rate(s) agree within {CAL_AGREE_DB:g} dB AND hold their low-gain level, for RF gain {gains[0]:g} to {gflat:g} dB. "
+                                    f"Over that region the dB-to-dBuV factor {np.median(imp):.1f} would read the tone correctly "
+                                    f"(range {min(imp):.1f} to {max(imp):.1f})."))
+            elif per_rate:
+                lows = [p_["implied_low"] for p_ in per_rate]
+                finds.append(("bad", f"{name}: no gain range where one constant works - at the lowest gain tested the rates already disagree by more than {CAL_AGREE_DB:g} dB (or the level moves at once). "
+                                     f"The CAL value that would be right for each rate at low gain runs from {min(lows):.1f} to {max(lows):.1f} "
+                                     f"(a spread of {max(lows) - min(lows):.1f} dB) - one constant cannot be right for all of them at this tone position."))
+            for p_ in per_rate:
+                if p_["depart"] is not None:
+                    finds.append(("warn", f"{name}, {p_['rate']/1e6:.3f} MS/s: the level holds within {CAL_DEPART_DB:g} dB of its low-gain value until the gain reaches "
+                                          f"{p_['depart']:g} dB, then departs "
+                                          f"(range of error over all gains {p_['emin']:+.1f} to {p_['emax']:+.1f} dB)."))
+        # does the tone position matter? compare offsets at the same rate and a low gain
+        if len([o for o in offs if o is not None]) > 1:
+            worst = 0.0
+            for r in sorted({x["rate"] for x in res}):
+                lv = []
+                for o in offs:
+                    if o is None:
+                        continue
+                    cell = per_off[o]["M"]
+                    g0 = per_off[o]["gains"][0] if per_off[o]["gains"] else None
+                    if g0 is not None and (r, g0) in cell:
+                        lv.append(cell[(r, g0)]["tone"])
+                if len(lv) > 1:
+                    worst = max(worst, max(lv) - min(lv))
+            finds.append(("warn" if worst > CAL_AGREE_DB else "ok",
+                          f"Tone position in the block: at the lowest gain the level changes by up to {worst:.1f} dB between the offsets tested "
+                          f"({'the tuner passband is not flat enough to ignore' if worst > CAL_AGREE_DB else 'passband flat to within the agreement limit'})."))
+        n_other = sum(1 for r in c["results"] if r["other"])
+        if n_other:
+            finds.append(("warn", f"{n_other} setting(s) had a signal stronger than the tone elsewhere in the spectrum (spurs / birdies): the tone is "
+                                  f"not the dominant signal there - see the * marks in the tables."))
+        n_unst = sum(1 for r in c["results"] if r["spread"] > CAL_SPREAD_WARN_DB)
+        if n_unst:
+            finds.append(("warn", f"{n_unst} setting(s): repeat scans differed by more than {CAL_SPREAD_WARN_DB:g} dB (marked ~ in the tables)."))
+        n_miss = sum(1 for r in c["results"] if not r["found"])
+        if n_miss:
+            finds.append(("bad", f"{n_miss} setting(s): no tone found within the search window."))
+        if not finds:
+            finds.append(("warn", "No results."))
+        return finds, per_off
+
+    @staticmethod
+    def cal_svg_chart(title, gains, series, expected, w=940, h=320):
+        """Inline SVG line chart: level against RF gain, one line per sample rate, dashed line = true level."""
+        vals = [v for _n, _c, vs in series for v in vs if v is not None and v == v] + [expected]
+        lo, hi = min(vals) - 2.0, max(vals) + 2.0
+        if hi - lo < 6:
+            hi, lo = hi + 3, lo - 3
+        L, R, T, B = 58, 150, 26, 36
+        gmin, gmax = min(gains), max(gains)
+        span = (gmax - gmin) or 1.0
+        X = lambda g: L + (g - gmin) / span * (w - L - R)
+        Y = lambda v: T + (1.0 - (v - lo) / (hi - lo)) * (h - T - B)
+        o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+             f'style="background:#14161a;border:1px solid #2a2d33;max-width:100%">',
+             f'<text x="{L}" y="16" fill="#d8dbe0" font-size="13" font-family="sans-serif">{title}</text>']
+        step = 5.0 if (hi - lo) <= 60 else 10.0
+        v = math.ceil(lo / step) * step
+        while v <= hi:
+            o.append(f'<line x1="{L}" y1="{Y(v):.1f}" x2="{w - R}" y2="{Y(v):.1f}" stroke="#2a2d33"/>'
+                     f'<text x="{L - 6}" y="{Y(v) + 4:.1f}" fill="#aaa" font-size="11" text-anchor="end" font-family="sans-serif">{v:g}</text>')
+            v += step
+        g = math.ceil(gmin / 5.0) * 5.0
+        while g <= gmax:
+            o.append(f'<line x1="{X(g):.1f}" y1="{T}" x2="{X(g):.1f}" y2="{h - B}" stroke="#23262c"/>'
+                     f'<text x="{X(g):.1f}" y="{h - B + 14}" fill="#aaa" font-size="11" text-anchor="middle" font-family="sans-serif">{g:g}</text>')
+            g += 5.0
+        o.append(f'<text x="{(L + w - R) / 2:.0f}" y="{h - 6}" fill="#aaa" font-size="11" text-anchor="middle" font-family="sans-serif">RF gain (dB)</text>')
+        o.append(f'<line x1="{L}" y1="{Y(expected):.1f}" x2="{w - R}" y2="{Y(expected):.1f}" stroke="#e0e0e0" stroke-dasharray="6 5"/>')
+        o.append(f'<text x="{w - R + 8}" y="{Y(expected) + 4:.1f}" fill="#e0e0e0" font-size="11" font-family="sans-serif">true {expected:.1f} dBuV</text>')
+        for k, (name, col, vs) in enumerate(series):
+            pts = [(X(gg), Y(vv)) for gg, vv in zip(gains, vs) if vv is not None and vv == vv]
+            if len(pts) > 1:
+                o.append(f'<polyline fill="none" stroke="{col}" stroke-width="1.6" points="' + " ".join(f"{a:.1f},{b:.1f}" for a, b in pts) + '"/>')
+            for a, b in pts:
+                o.append(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="2.4" fill="{col}"/>')
+            o.append(f'<text x="{w - R + 8}" y="{T + 16 + 15 * (k + 1)}" fill="{col}" font-size="12" font-family="sans-serif">{name}</text>')
+        o.append('</svg>')
+        return "".join(o)
+
+    def cal_build_html(self, c, finds, per_off, partial):
+        cols = ['#ffd54a', '#4fc3f7', '#ff7a7a', '#9ccc65', '#ba68c8', '#ffb74d', '#4db6ac', '#f06292', '#b0bec5', '#dce775']
+        css = ("body{background:#16181c;color:#d8dbe0;font:14px/1.45 Segoe UI,Arial,sans-serif;margin:0 auto;max-width:1180px;padding:16px 20px 60px}"
+               "h1{font-size:22px;margin:4px 0 2px}h2{font-size:17px;margin:26px 0 6px;border-bottom:1px solid #333;padding-bottom:3px}"
+               ".sub,.note{color:#9aa0a8}.note{font-size:13px;margin:2px 0 8px}"
+               ".find{margin:0;padding:0;list-style:none}.find li{padding:7px 10px;margin:4px 0;border-left:4px solid #4a90d9;background:#1d2026}"
+               ".find li.warn{border-left-color:#e0a030}.find li.bad{border-left-color:#e05050}.find li.ok{border-left-color:#5aa469}"
+               "table{border-collapse:collapse;font-size:13px;margin:6px 0}th,td{padding:3px 8px;border:1px solid #2a2d33;text-align:right}"
+               "th{background:#1d2026}td.g{background:#1d2026;font-weight:600}.scroll{overflow:auto;max-width:100%}")
+        h = ['<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>RF calibration survey</title><style>' + css + '</style></head><body>',
+             '<h1>RF scan - calibration survey (known tone)</h1>']
+        h.append(f'<div class="sub">tone {c["tone_hz"]/1e6:.4f} MHz, {c["vpp"]:g} Vpp = <b>{c["expected"]:.1f} dBuV</b> at the attenuator input, '
+                 f'attenuator {c["atten"]:g} dB, dB-to-dBuV: default {c["cal0"]:g}, {len(CAL_BY_RATE)} per-rate value(s) in use, averaging {c["n_avg"]}, '
+                 f'{len(c["results"])} setting(s) x {c["scans"]} scan(s)' + (' | <b>PARTIAL RESULT - stopped early</b>' if partial else '') +
+                 f' | {time.strftime("%Y-%m-%d %H:%M")}</div>')
+        h.append('<h2>Findings</h2><ul class="find">' + "".join(f'<li class="{lv}">{tx}</li>' for lv, tx in finds) + '</ul>')
+        h.append('<p class="note">The level shown is the tone converted with the main display\'s formula (SDR dB - RF gain + attenuator + CAL_SDR_DB_TO_DBUV), '
+                 'taken from the power summed over the tone\'s lobe so FFT scalloping loss does not enter. If the CAL constant were right at every setting '
+                 'each table cell would equal the true level. To re-calibrate: CAL_SDR_DB_TO_DBUV = current value + (true - displayed) for a setting you trust. '
+                 'If the generator was set for a 50 ohm load but measured unterminated, the real level into 50 ohm is 6 dB lower than the Vpp read - check that first.</p>')
+        for off, d in per_off.items():
+            h.append(f'<h2>{d["name"]}</h2>')
+            series = []
+            for k, r in enumerate(d["rates"]):
+                series.append((f'{r/1e6:.3f} MS/s', cols[k % len(cols)], [d["M"][(r, g)]["tone"] if (r, g) in d["M"] else None for g in d["gains"]]))
+            h.append(self.cal_svg_chart("Displayed tone level (dBuV) against RF gain", d["gains"], series, c["expected"]))
+            h.append('<h3 style="font-size:15px">Per sample rate</h3><table><tr><th>Sample rate</th><th>Level at lowest gains</th><th>Error there</th>'
+                     '<th>CAL right for it (at low gain)</th><th>Follows gain up to</th><th>Error range, all gains</th></tr>')
+            for p_ in d["per_rate"]:
+                dep = "all gains tested" if p_["depart"] is None else f'below {p_["depart"]:g} dB'
+                h.append(f'<tr><td>{p_["rate"]/1e6:.3f} MS/s</td><td>{p_["ref"]:.1f}</td><td>{p_["ref_err"]:+.1f}</td><td>{p_["implied_low"]:.1f}</td>'
+                         f'<td>{dep}</td><td>{p_["emin"]:+.1f} to {p_["emax"]:+.1f}</td></tr>')
+            h.append('</table>')
+            h.append('<h3 style="font-size:15px">Level (dBuV) - rows RF gain, columns sample rate</h3><div class="scroll"><table><tr><th>RF gain</th>' +
+                     "".join(f'<th>{r/1e6:.3f}</th>' for r in d["rates"]) + '<th>spread</th></tr>')
+            for g in d["gains"]:
+                row = f'<tr><td class="g">{g:g} dB</td>'
+                for r in d["rates"]:
+                    x = d["M"].get((r, g))
+                    if x is None:
+                        row += '<td></td>'
+                        continue
+                    e = abs(x["err"])
+                    bg = '#2f6d3f' if e <= 1.0 else ('#b8741c' if e <= 3.0 else '#a03a3a')
+                    row += (f'<td style="background:{bg};color:#fff" title="error {x["err"]:+.1f} dB, SNR {x["snr"]:.0f} dB, peak-bin {x["pk"]:.1f}">'
+                            f'{x["tone"]:.1f}{"*" if x["other"] else ""}{"~" if x["spread"] > CAL_SPREAD_WARN_DB else ""}</td>')
+                sp = d["spread_by_gain"].get(g)
+                row += f'<td>{"" if sp is None else f"{sp:.1f}"}</td></tr>'
+                h.append(row)
+            h.append('</table></div><p class="note">Green: within 1 dB of the true level; amber: within 3 dB; red: further. '
+                     '* a stronger signal exists elsewhere in the spectrum; ~ repeat scans differed. Hover a cell for error, SNR and peak-bin level.</p>')
+        h.append('</body></html>')
+        return "".join(h)
+
+    def cal_write_outputs(self, c, partial):
+        """Write the matrix CSV and the HTML report (the long CSV was written scan by scan). Returns the report path."""
+        finds, per_off = self.cal_analyse(c)
+        base = c["base"]
+        with open(base + "_matrix.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            for off, d in per_off.items():
+                w.writerow([d["name"], f"true {c['expected']:.2f} dBuV"])
+                w.writerow(["rf_gain_db"] + [f"{r:.0f}" for r in d["rates"]])
+                for g in d["gains"]:
+                    w.writerow([f"{g:g}"] + ["" if (r, g) not in d["M"] else f"{d['M'][(r, g)]['tone']:.2f}" for r in d["rates"]])
+                w.writerow([])
+        html_text = self.cal_build_html(c, finds, per_off, partial)
+        with open(c["html_path"], "w", encoding="utf-8") as fh:
+            fh.write(html_text)
+        for lv, tx in finds:
+            self.log(("CAL: " if lv == "ok" else "CAL (check): ") + tx)
+        return c["html_path"]
+
+    def cal_finish(self, aborted):
+        """GUI thread, after the cal worker has finished: write the report (CAL SURVEY) or show the per-rate result (CAL),
+        give the controls back, resume CONTINUOUS."""
+        c = self._cal
+        if c is None:
+            return
+        quick = bool(c.get("quick"))
+        path = None
+        try:
+            c["fh"].close()
+        except Exception:
+            pass
+        if not quick:
+            try:
+                path = self.cal_write_outputs(c, bool(aborted))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.log(f"CAL survey: could not write the report: {e}")
+        self.sync_sample_rate_combo()
+        self.sync_gain_slider()
+        self.update_status_panel()
+        self.survey_set_lock(False)
+        self._cal = None
+        self._survey = None
+        try:
+            self.draw_block_markers()
+        except Exception:
+            pass
+        self.log(f"=== {'CAL' if quick else 'CAL SURVEY'} {'STOPPED EARLY' if aborted else 'FINISHED'}: {len(c['results'])} settings, {len(c['records'])} scans"
+                 f"{', ' + str(c['skipped']) + ' skipped' if c['skipped'] else ''}{' -> ' + path if path else ''} ===")
+        if quick:
+            if aborted:
+                self.log("CAL stopped early - nothing was changed")
+            else:
+                try:
+                    self.cal_quick_report(c)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    self.log(f"CAL: could not show the result: {e}")
+        elif path and SURVEY_OPEN_REPORT:
+            try:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.abspath(path)))
+            except Exception as e:
+                self.log(f"CAL survey: could not open the report automatically: {e}")
+        if c["was_running"] and not aborted:
+            self.continuous_when_idle()
+
+    # ------------------------------------------------------------------------------------
+    # CAL button: one dB -> dBuV factor PER SAMPLE RATE, from a 1.5 MHz sine of known amplitude at 0 dB RF gain
+    # ------------------------------------------------------------------------------------
+    # Each rate is tuned so the tone sits at several fixed positions in the block (+/-15 % and +/-30 % of the sample
+    # rate from the block centre, inside the part the display keeps) and measured at 0 dB RF gain, where the nominal
+    # gain table cannot matter. The factor for the rate is the median over those positions:
+    #       factor = true dBuV at the attenuator input - attenuator - tone level (SDR dB)
+    # so that  displayed = SDR dB - RF gain + attenuator + factor  reads the tone correctly. The spread over position is
+    # reported (tuner passband ripple); a rate is only accepted if the tone is well clear of ADC full scale and of the
+    # noise. Nothing is applied until the user says so, and settings.csv is only written if the user chooses that.
+
+    def cal_quick_open_dialog(self):
+        if self.cal_busy():
+            self.log("CAL: not available while a survey, the stitch check or the scope is running")
+            return
+        if self.hf_mode:
+            QtWidgets.QMessageBox.information(self, "CAL", "Not available in an HF (direct-sampling) mode - pick a tuner MODE first.")
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("CAL - dB to dBuV factor for every sample rate")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel(
+            f"Connect a {CAL_QUICK_TONE_HZ/1e6:g} MHz SINE WAVE of known amplitude to the SDR input (through the attenuator).\n"
+            "Choose a level that is small enough not to overload the SDR: at 0 dB RF gain the input to the SDR should be\n"
+            "roughly 60-80 dBuV (1-10 mV rms). Enter the amplitude you are feeding in, and the attenuator that is fitted."))
+        form = QtWidgets.QFormLayout()
+        sp_vpp = QtWidgets.QDoubleSpinBox()
+        sp_vpp.setLocale(SCOPE_LOCALE)
+        sp_vpp.setRange(0.0001, 20.0)
+        sp_vpp.setDecimals(4)
+        sp_vpp.setSuffix(" V pk-pk")
+        sp_vpp.setValue(CAL_TONE_VPP_DEFAULT)
+        sp_att = QtWidgets.QDoubleSpinBox()
+        sp_att.setLocale(SCOPE_LOCALE)
+        sp_att.setRange(0.0, 100.0)
+        sp_att.setDecimals(1)
+        sp_att.setSuffix(" dB")
+        sp_att.setValue(float(self.input_atten_db))
+        sp_att.setToolTip("Attenuator between the generator and the SDR. Defaults to the front-panel Attenuator setting. "
+                          "Set the front-panel Attenuator to the value you normally use, not to this one, after the CAL.")
+        lbl_exp = QtWidgets.QLabel("")
+        form.addRow(f"Amplitude of the {CAL_QUICK_TONE_HZ/1e6:g} MHz sine (at the attenuator input)", sp_vpp)
+        form.addRow("Attenuator fitted", sp_att)
+        form.addRow("True level at the attenuator input", lbl_exp)
+        lay.addLayout(form)
+        lay.addWidget(QtWidgets.QLabel("Sample rates to calibrate:"))
+        lst = QtWidgets.QListWidget()
+        for r in SAMPLE_RATE_CHOICES:
+            it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s" + ("   (calibrated: %.2f)" % cal_for_rate(r) if cal_has_rate(r) else ""))
+            it.setData(QtCore.Qt.UserRole, float(r))
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked)
+            lst.addItem(it)
+        lst.setMinimumHeight(150)
+        lay.addWidget(lst)
+        info = QtWidgets.QLabel("")
+        lay.addWidget(info)
+
+        def chosen():
+            return [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count()) if lst.item(i).checkState() == QtCore.Qt.Checked]
+
+        def refresh(*_):
+            exp = self.cal_expected_dbuv(sp_vpp.value())
+            lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
+            at_sdr = exp - sp_att.value()
+            warn = ""
+            if at_sdr > 82.0:
+                warn = f"   WARNING: {at_sdr:.0f} dBuV at the SDR is probably too large - risk of overload"
+            elif at_sdr < 50.0:
+                warn = f"   WARNING: {at_sdr:.0f} dBuV at the SDR is probably too small - noisy result"
+            n_avg = self.avg_get_active_count()
+            tot = sum((0.12 + 0.15 + n_avg * (NFFT / r + 0.004)) * len(CAL_POS_FRACTIONS) * (CAL_QUICK_SCANS + 1) for r in chosen())
+            info.setText(f"About {at_sdr:.0f} dBuV reaches the SDR.{warn}\n{len(chosen())} rate(s) x {len(CAL_POS_FRACTIONS)} tone positions, "
+                         f"roughly {self.survey_fmt_seconds(tot)}. Averaging setting is used as-is.")
+
+        sp_vpp.valueChanged.connect(refresh)
+        sp_att.valueChanged.connect(refresh)
+        lst.itemChanged.connect(refresh)
+        refresh()
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        rates = chosen()
+        if not rates:
+            self.log("CAL: no sample rate selected")
+            return
+        combos = [(r, round(fr * r / 1e3, 3), 0.0) for r in rates for fr in CAL_POS_FRACTIONS]
+        self.cal_start({"quick": True, "tone_hz": CAL_QUICK_TONE_HZ, "vpp": sp_vpp.value(), "atten": sp_att.value(),
+                        "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": CAL_WINDOW_HZ_DEFAULT,
+                        "use_band": False, "combos": combos, "scans": CAL_QUICK_SCANS, "path": ""})
+
+    def cal_quick_evaluate(self, c):
+        """Reduce the CAL results to one row per sample rate: the factor, its spread over tone position, the headroom below
+        ADC full scale, the SNR and an accept / reject verdict."""
+        fs_p = self.sat_full_scale_p()
+        rows = []
+        for r in sorted({x["rate"] for x in c["results"]}):
+            rs = [x for x in c["results"] if x["rate"] == r and x["found"] and x["tone_p"] == x["tone_p"]]
+            row = {"rate": r, "old": cal_for_rate(r), "had": cal_has_rate(r), "new": None, "spread": None, "head": None,
+                   "snr": None, "ok": False, "note": "no tone found"}
+            if rs:
+                vals = [c["expected"] - c["atten"] - x["tone_p"] for x in rs]          # factor implied at each tone position
+                row["new"] = float(np.median(vals))
+                row["spread"] = float(max(vals) - min(vals))
+                row["head"] = float(fs_p - max(x["tone_p"] for x in rs))
+                row["snr"] = float(min(x["snr"] for x in rs))
+                if row["head"] < CAL_MIN_HEADROOM_DB:
+                    row["note"] = f"REJECTED: tone only {row['head']:.0f} dB below ADC full scale - reduce the input level"
+                elif row["snr"] < CAL_MIN_SNR_DB:
+                    row["note"] = f"REJECTED: tone only {row['snr']:.0f} dB above the noise - increase the input level"
+                else:
+                    row["ok"] = True
+                    row["note"] = "ok" if row["spread"] <= CAL_POS_SPREAD_WARN_DB else \
+                        f"ok - level varies {row['spread']:.1f} dB with tone position in the block"
+            rows.append(row)
+        return rows
+
+    def cal_quick_report(self, c):
+        """GUI thread: show the result and ask what to do - save to settings.csv, use for this session only, or discard."""
+        rows = self.cal_quick_evaluate(c)
+        head = f"{'Rate (MS/s)':>11} {'Old':>8} {'New':>8} {'Change':>7} {'Pos. spread':>11} {'Headroom':>9} {'SNR':>5}  Result"
+        lines = [head]
+        for x in rows:
+            if x["new"] is None:
+                lines.append(f"{x['rate']/1e6:>11.3f} {x['old']:>8.2f} {'-':>8} {'-':>7} {'-':>11} {'-':>9} {'-':>5}  {x['note']}")
+            else:
+                lines.append(f"{x['rate']/1e6:>11.3f} {x['old']:>8.2f} {x['new']:>8.2f} {x['new'] - x['old']:>+7.2f} {x['spread']:>10.1f}  "
+                             f"{x['head']:>8.0f} {x['snr']:>5.0f}  {x['note']}")
+        table = "\n".join(lines)
+        for ln in lines:
+            self.log("CAL " + ln)
+        good = [x for x in rows if x["ok"]]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("CAL result")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel(
+            f"Sine {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, 0 dB RF gain.\n"
+            f"'Old' is the factor in use now (the default {CAL_SDR_DB_TO_DBUV:g} where a rate has none of its own). "
+            f"Headroom = dB below ADC full scale; SNR = dB above the noise."))
+        txt = QtWidgets.QPlainTextEdit(table)
+        txt.setReadOnly(True)
+        txt.setFont(QtGui.QFont("Consolas", 9))
+        txt.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        txt.setMinimumSize(760, 40 + 22 * len(lines))
+        lay.addWidget(txt)
+        choice = {"v": None}
+        bb = QtWidgets.QHBoxLayout()
+        if good:
+            lay.addWidget(QtWidgets.QLabel(f"{len(good)} of {len(rows)} rate(s) are good. What do you want to do with them?"))
+            b_save = QtWidgets.QPushButton("Use and SAVE to settings.csv")
+            b_use = QtWidgets.QPushButton("Use for this session only")
+            for b, v in ((b_save, "save"), (b_use, "use")):
+                b.clicked.connect(lambda _=False, v=v: (choice.__setitem__("v", v), dlg.accept()))
+                bb.addWidget(b)
+        else:
+            lay.addWidget(QtWidgets.QLabel("No rate gave a usable result - nothing can be applied. Check the signal level and connections."))
+        b_no = QtWidgets.QPushButton("Discard (change nothing)")
+        b_no.clicked.connect(dlg.reject)
+        bb.addWidget(b_no)
+        lay.addLayout(bb)
+        dlg.exec_()
+        v = choice["v"]
+        if v is None:
+            self.log("CAL: result discarded - nothing was changed")
+            return
+        for x in good:
+            CAL_BY_RATE[float(x["rate"])] = round(x["new"], 2)
+        self.log(f"CAL: {len(good)} per-rate factor(s) applied for this session")
+        if v == "save":
+            try:
+                path = settings_write_cal(CAL_BY_RATE)
+                self.log(f"CAL: saved to {path} (the previous file is kept as {path}.bak)")
+            except Exception as e:
+                self.log(f"CAL: ERROR - could not write settings.csv: {e}")
+                QtWidgets.QMessageBox.warning(self, "CAL", f"The factors are in use for this session but settings.csv could not be written:\n{e}")
+        self.cispr_refresh_offset_ui()
+        self.update_status_panel()
+        self.update_plot()
+
+    # ------------------------------------------------------------------------------------
+    # ADC saturation lines on the display
+    # ------------------------------------------------------------------------------------
+    # Red line: the displayed level at which a single tone reaches ADC full scale at the current RF gain and attenuator.
+    # Orange dashed line: SATURATION_MARGIN_DB below it - above that the front end starts to compress, so a peak that is
+    # up to or beyond it is not a trustworthy level. The line is the same for every sample rate and is set by the most
+    # sensitive calibrated rate (the smallest factor), so for a less sensitive rate real clipping can start a little
+    # higher than shown: the line errs on the safe side. It is a guide for single spikes; a very strong signal outside the
+    # displayed band, or the sum of many signals, can overload the SDR without any one spike reaching the line.
+
+    def sat_build_ui(self):
+        self.sat_fs_line = pg.InfiniteLine(pos=0.0, angle=0, movable=False, pen=pg.mkPen((255, 70, 70), width=2))
+        self.sat_margin_line = pg.InfiniteLine(pos=0.0, angle=0, movable=False,
+                                               pen=pg.mkPen((255, 170, 40), width=1, style=QtCore.Qt.DashLine))
+        for ln in (self.sat_fs_line, self.sat_margin_line):
+            ln.setZValue(5)
+            self.plot.addItem(ln, ignoreBounds=True)
+        self.chk_sat = QtWidgets.QCheckBox("Show ADC saturation line")
+        self.chk_sat.setChecked(bool(SATURATION_LINE))
+        self.chk_sat.setToolTip(
+            "Red: displayed level at which a single tone reaches ADC full scale (clipping) at the current RF gain and attenuator.\n"
+            f"Orange dashed: {SATURATION_MARGIN_DB:g} dB lower - above it the front end starts to compress, so levels there are unreliable.\n"
+            "Default on/off: settings.csv  setting,saturation_line,on|off   (margin: setting,saturation_margin_db,10)")
+        sub = self.find_layout_with(self.chk_markers)
+        if sub is not None:
+            sub.addWidget(self.chk_sat)
+        else:
+            self.centralWidget().layout().addWidget(self.chk_sat)
+        self.chk_sat.toggled.connect(lambda _on: self.sat_update_lines())
+        self.sat_update_lines()
+
+    def sat_full_scale_p(self):
+        """Stored spectrum level (SDR dB) of a sine at ADC full scale: |FFT/N|^2 of a Hann-windowed tone of amplitude 1/128
+        (this program divides the driver's already-normalised samples by 128 again - the survey plateau confirmed it: 92.3
+        predicted, 93.2 measured at clipping once the conversion is added back) plus the PSD constant."""
+        return 10.0 * math.log10(0.25 / (128.0 ** 2)) + float(self._psd_to_dbuv_const)
+
+    def sat_full_scale_display(self):
+        """Displayed dBuV at which a single tone reaches ADC full scale, at the current RF gain and attenuator."""
+        applied = getattr(self, "_applied_gain_db", None)
+        gain = float(applied if applied is not None else self.gain_db)
+        if self.hf_mode:
+            gain = 0.0
+        return self.sat_full_scale_p() + cal_reference_db() - gain + float(self.input_atten_db)
+
+    def sat_update_lines(self):
+        """GUI thread: place (or hide) the saturation lines. Called on every plot update and when the box is ticked."""
+        try:
+            on = bool(self.chk_sat.isChecked())
+            self.sat_fs_line.setVisible(on)
+            self.sat_margin_line.setVisible(on)
+            if on:
+                fs = self.sat_full_scale_display()
+                self.sat_fs_line.setValue(fs)
+                self.sat_margin_line.setValue(fs - float(SATURATION_MARGIN_DB))
+        except Exception:
+            pass
+
+    def cal_label_text(self):
+        """Text of the front-panel 'Cal:' label for the sample rate in use."""
+        rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
+        return f"Cal: {cal_for_rate(rate):+.1f} dB" + ("" if cal_has_rate(rate) else " (default)")
+
+    # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
+#    def survey_connect_signals(self):
+#        self.survey_signals = SurveySignals()
+#        self.survey_signals.done.connect(self.survey_finish)
+#        self.survey_signals.progress.connect(self.survey_sync_controls)
+#        self.btn_survey.setToolTip(
+#            "Automatically step through sample rates and RF gains on the current band (any width - wide "
+#            "bands are swept in several blocks) and write ONE HTML report: findings on sample-rate effects and "
+#            "gain-stage artefacts, charts and exportable data. The Sample Rate box and RF Gain slider follow the "
+#            "test being run. Press STOP to end early (a partial report is saved).")
+
     def survey_connect_signals(self):
         self.survey_signals = SurveySignals()
         self.survey_signals.done.connect(self.survey_finish)
@@ -3833,6 +5144,8 @@ class EmcScanner(QtWidgets.QMainWindow):
             "bands are swept in several blocks) and write ONE HTML report: findings on sample-rate effects and "
             "gain-stage artefacts, charts and exportable data. The Sample Rate box and RF Gain slider follow the "
             "test being run. Press STOP to end early (a partial report is saved).")
+        self.cal_build_ui()                # CAL and CAL SURVEY buttons + signals: known-tone calibration
+        self.sat_build_ui()                # optional ADC saturation lines on the display
 
     def survey_sync_controls(self):
         """GUI thread: show the settings of the survey test now running on the Sample Rate box, the RF Gain
@@ -7832,6 +9145,25 @@ class EmcScanner(QtWidgets.QMainWindow):
             print("update_plot: emit error:", e)
 
 
+    # ---- previous set_plot_data() (no saturation lines), kept in case of problems ----
+#    @QtCore.pyqtSlot(object, object)
+#    def set_plot_data(self, f, p):
+#        """
+#        Runs on the GUI thread (queued slot from plot_signals.update). Draws the
+#        latest stitched FFT data, then draws the CISPR line immediately after -
+#        this is the ONLY place the CISPR line is redrawn as part of a normal
+#        sweep, so it is always in step with the FFT curve it sits alongside.
+#        (Previously this method also built its own interpolated CISPR curve with
+#        a hard-coded "L_interp - 80.0" calibration, in parallel with
+#        cispr_update_curve()'s offset/ViewBox-range approach. The two disagreed,
+#        so whichever one last executed - the timing depended on the worker
+#        thread's call to update_cispr_curve() racing this queued slot - won,
+#        which is why the line and its axis appeared to move relative to each
+#        other unpredictably. There is now a single source of truth.)
+#        """
+#        self.curve.setData(f, p)
+#        self.cispr_update_curve()
+
     @QtCore.pyqtSlot(object, object)
     def set_plot_data(self, f, p):
         """
@@ -7849,6 +9181,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         """
         self.curve.setData(f, p)
         self.cispr_update_curve()
+        self.sat_update_lines()      # keep the ADC saturation lines in step with gain / attenuator / calibration
 
     def save_csv(self):
         if self.freq_axis is None or self.power_axis is None:
