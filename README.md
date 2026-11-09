@@ -1,48 +1,119 @@
-<img width="1196" height="594" alt="image" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
-
-This program is intended as an experimental Python tool to use with RTL_SDR.COM V4.
-The intention is that it can be used to scan and view RF emissions over a wider frequency range than programs like SDRSHARP, and to allow the spectrum to be recorded.
-The code was originally set up to select between a number of SDR DLL locations, whilst trying to "get it to work". 
-The correct DLLs are set using ZADIG, and you should read the RTL and SDRSharp instructions on how to set these up.
-
-There are still many notable "issues"- The displays can show artefacts related to IF and other issues. The program should not be relied upon for scientific research in its current form. 
-Currently the program employs spectrum masks and averaging to help reduce the visual effect of these artefacts, but care should be used when "measuring".
-
-A Crispr spectrum in dBuV can be displayed, but this will need to be calibrated (offest) for the exact antenna/gain settings used, and is mainly for reference.  
-
-It has been written with assistance by Claude and ChatGPT/Microsoft Co-pilot. But the input from Claude has been much more useful.
- 
-If you wish to add features or modify the code I would recommend using Claude for this, as Copilot has a tendency to add spurious code, add bugs and suggest unwanted additional features.
-
-
-Notes:
-What set_direct_sampling(2) actually does
-
-Your normal (non-HF) scans go: antenna → R820T tuner (mixer + LNA + local oscillator) → tuner mixes your chosen frequency down to baseband → ADC digitizes that baseband signal. The tuner is what makes center_freq mean anything.
-
-HF/direct-sampling mode disconnects the R820T tuner from the signal path entirely and feeds the antenna straight into the RTL2832U's ADC (the "Q-branch" input, hence mode 2). There is no mixer, no LO, and — critically — no R820T at all in that path. You're just digitizing the raw antenna voltage.
-
-That has two consequences that line up exactly with what you're seeing:
-
-gain_db does nothing in HF mode. Your self.sdr.gain = self.gain_db call sets the R820T tuner's gain — but the tuner is bypassed in direct sampling. There is no gain stage at all on a stock dongle in this mode; sensitivity is fixed and it's quite low. If you need to actually detect a weak HF signal, a passive dongle alone usually isn't enough — you typically need an external LNA/preamp ahead of it (or a proper HF upconverter/SDRplay-class front end).
-center_freq is essentially a label, not a tuning command, in this mode. Since there's no mixer, setting self.sdr.center_freq = fc before each HF block doesn't retune anything physically — there's nothing to retune. What you're actually capturing is always the same fixed baseband window from 0 Hz up to sample_rate/2 (so at 2.4 MS/s, roughly 0–1.2 MHz), no matter what fc your code requested. Your sweep code then labels that captured spectrum using freqs_full = fftfreq(...) + fc, which in HF mode is putting a frequency axis on data that wasn't actually tuned to that point — so blocks at different "planned centers" in HF mode may just be re-labelling the same raw capture rather than showing different parts of the spectrum.
-
-BUT V4 is different, and The V4 should auto-route through its upconverter for anything below ~28.8 MHz.
-
-Has a Python RTL-SDR spectrum scanner program, rf_scan_portable.py (PyQt5 + pyqtgraph), with MODE preset buttons; presets and sweep defaults now load from a settings.csv file
-Sees multiple birdies (spikes) in the 150 kHz to 2 MHz band that change frequency with sample rate and appear at higher RF gain (roughly above 20-21 dB); a 10 dB attenuator at the antenna made no significant difference, so believes it is an internal artefact
-Asked for a live RF Gain slider, with Sample Rate moved onto the same row and both acting immediately
-Asked for an automatic gain/sample-rate survey mode that saves data for analysis; wants it limited to bands up to 1.2 MHz (single block per pass); uploaded first survey results (2.8 and 3.2 MS/s)
-Wants a scope-like time-domain display mode that switches away from the spectrum view; chose the tuned-IQ / envelope scope approach (option 2) and asked for an appropriately labelled selection button
-Wants the scope display to show exactly what the probe sees, like a normal scope: signals only up to half the sample rate, with no centre-frequency or bandwidth controls (the Sample Rate sets the range); also reported spin boxes showing decimal commas (French notation) and wants them to use a decimal point
-Scope tests: at 3.0 and 3.2 MS/s a regular pulse train appears (also with a 1 ms window, not probe-related) and disappears at 2.4 MS/s; injected a 3.3 V 200 kHz sine through a 20 dB attenuator: RF gain slider changed the amplitude only slightly, 200 kHz read 0.0099 FS pk-pk and 100 kHz about 0.002 FS, and square/triangle waves looked unrecognisable
-The scope Auto phase (mirror-band phase recovery) made a sine wave look like a square wave, so it was reverted; wants switching Scope to Spectrum, and changing spectrum presets, to start CONTINUOUS automatically; noticed the spectrum needs the RF gain swept up and back down after returning from the scope before it looks clean at low gain
-Has changed the scope's label to "Pseudo-SCOPE (100KHz- to Fs/2)" because of the receiver's high-pass response; code is to be left as is for now, with the new wording used at the next update
-Wants the gain/rate survey to work on all frequency ranges (not just bands up to 1.2 MHz), with the output as an Excel-usable surface chart: frequency along the horizontal axis, signal level vertical, gain as the depth axis with the lowest gain at the front
-The survey's purpose: mainly to find which spectrum features are caused by sample-rate effects, secondarily whether and when the gain stages introduce artefacts (clipping or distortion); the multiple output files did not work for them, wants a single summary output that is easy to view and review
-DC offset removal and IQ balance correction should both default to ON, with no front-panel tick boxes, controlled from settings.csv; the RTL-SDR driver selection should also be set in settings.csv so alternate drivers can be tried
-Wants the survey report biased towards identifying which signals are likely from the device under test: features constant over sample rate and tracking gain are "reliably sensed"; sample-rate artefacts (aliasing images, spurs) and gain artefacts (non-linearity) listed separately so they can be ignored; wants a maximum usable gain identified (their own visual estimate is that gains above roughly 20 dB add disproportionate distortion, to be confirmed or not by the analysis) and a best rate/gain spectrum setting
-Wants the survey report to open with the two maps (sample-rate effects and gain effects) and to drop the artefact discussion; each rate/gain setting is to be scanned at least twice, with a third (and further) scan when two disagree, until two consecutive scans match, and settings needing more than two scans listed after the maps; suspects the 3.2 MS/s data differs from 3 MS/s because the SDR is not settling; default lowest gain in the survey should be 0 dB
-Concerned that wide-range spectrum stitching may be wrong: with a 1.5 MS/s sample rate over 12-30 MHz and no input there is an obvious discontinuity from about 27.7 to 28.7 MHz that looks like a reflection of the DC response region, independent of averaging, with similar block-to-block discontinuities at other sample rates; this made them distrust the overall wide-range spectra
-Comparison run in SDR# showed spurious signals around 26-28 MHz that move when the sample rate changes; SDR# offers only 3.2, 2.8, 2.56, 2.4, 2.048, 1.92, 1.8, 1.4, 1.024, 0.900001 and 0.25 MS/s; wants the program's sample-rate choices limited to 1.024, 1.8, 2.048, 2.4, 2.56 and 3.2 MS/s (250 kS/s omitted), avoiding 0.3-0.9 MS/s, and suspects 3.2 MS/s has USB issues
-Wants a new single-frequency test mode: the centre frequency is selected and the SDR shows a single spectrum; the front panel needs a digital centre-frequency selector where individual digits can be selected and incremented or decremented, shown below the gain selection when the mode is selected; the mode button goes above the range selection buttons, same size and shape
+<img width="1196" height="594" alt="Screenshot of the RF scanner" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
+RF Scan Portable
+An experimental Python spectrum scanner for the RTL-SDR Blog V4. It sweeps a much wider frequency range than programs such as SDR#, stitches the blocks into one trace, shows it in dBµV, and lets you save the spectrum to CSV.
+It was written for investigating emissions (for example from marine electronics) and for finding out which spectrum features are real and which are artefacts of the receiver.
+> **Not for scientific research or compliance measurements.** The displays can still show artefacts caused by the IF, the sample rate and the gain stages. The program uses spectrum masks and averaging to reduce them, but care is needed when measuring. The CISPR limit line and the dBµV scale are for reference only unless you have calibrated them for your own antenna, attenuator and gain settings (see [Calibration](#calibration-dbµv)).
+Features
+Wide-range sweeps made of many FFT blocks (4096 bins), with the outer 15% of each block masked and the rest stitched edge to edge.
+MODE preset buttons (band, sample rate and gain), loaded from `settings.csv`.
+Live RF Gain slider and Sample Rate box that act immediately, even during a sweep.
+Time averaging, a frequency-marker overlay and a reference trace.
+Optional CISPR limit line (radiated or conducted).
+Per-sample-rate dB to dBµV calibration using the CAL button.
+Optional ADC saturation line that warns when the input is close to overloading the SDR.
+Test modes: Single Frequency, Stitch Check, Gain/Rate Survey, CAL Survey and a Baseband Scope.
+Requirements
+Windows PC (the program loads the RTL-SDR driver DLLs from a folder next to the script).
+An RTL-SDR Blog V4 dongle.
+Python 3 with:
+```
+  pip install numpy PyQt5 pyqtgraph
+  ```
+The RTL-SDR driver installed for the dongle using Zadig (WinUSB driver). Follow the RTL-SDR Blog and SDR# instructions for this step.
+Next to `rf_scan_portable.py`:
+the `pyrtlsdr_local` folder;
+a `drivers` folder holding the driver DLL sub-folders (`default`, `ms64`, `sdrsharp`, `experimental`). The program also looks in `C:/Spectrum/drivers`.
+Starting the program
+```
+python rf_scan_portable.py
+```
+The DLL and driver choice is made in `settings.csv` (see below). The code was originally set up to switch between several driver locations while getting the dongle to work, and that option is still there if you need to experiment.
+Quick start
+Plug in the dongle and start the program.
+Click one of the MODE preset buttons (for example VHF or 150k-2M). This sets the band, sample rate and RF gain.
+Click START CONTINUOUS to sweep repeatedly, or START SINGLE SWEEP for one pass. STOP ends a sweep.
+Adjust the RF Gain slider and Sample Rate box if needed. Both take effect straight away.
+Tick Time Averaging and set the number of averages for a smoother trace (slower sweep).
+Click SAVE CSV to save the current spectrum (`freq_hz,level_dbuv`).
+Controls at a glance
+Control	What it does
+MODE buttons	Load a band / sample rate / gain preset from `settings.csv`
+Single Frequency	Test mode: one centre frequency, one spectrum of the whole captured bandwidth. Set the frequency digit by digit (click a digit, scroll the mouse wheel to change it). Press any MODE button to go back to sweeping
+START CONTINUOUS / START SINGLE SWEEP / STOP	Run or stop sweeps
+SAVE CSV	Save the spectrum
+Show CISPR limit	Show the CISPR limit line (radiated dBµV/m at 10 m, or conducted dBµV)
+Time Averaging	Average several captures per block
+Show Freq Markers	Show the green (raw block) and cyan dashed (kept block) edges
+Capture Reference / Show Reference	Store the current trace (for example the system noise with the equipment off) and show it for comparison only. Nothing is subtracted
+Show ADC saturation line	See Saturation line
+BASEBAND SCOPE	Time-domain view of the input from DC to half the sample rate. The button changes to BACK TO SPECTRUM
+Sample rates
+Only the sample rates the RTL2832U handles well are offered: 1.024, 1.8, 2.048, 2.4, 2.56 and 3.2 MS/s. The chip does not accept 0.3 to 0.9 MS/s. Rates of about 2.4 to 2.56 MS/s give the most stable USB transfer. 3.2 MS/s can drop samples on many PCs and USB ports, so treat results at that rate with caution.
+settings.csv
+Presets, defaults and program options are read at start-up from `settings.csv`. The file is searched for next to the program (or `.exe`), then in the current folder, then in `C:/Spectrum`. If it is missing, built-in presets are used.
+Columns: `type,name,label,start,stop,sample_rate,gain_db,hf_mode,dbuv_cal`. Lines starting with `#` are comments. Frequencies accept `k`, `M` and `G` suffixes (`150k`, `2.4M`, `1G`).
+```csv
+# Sweep defaults used at start-up
+type,name,label,start,stop,sample_rate,gain_db,hf_mode,dbuv_cal
+default,,,88M,108M,2.4M,40.2,,
+# MODE buttons: the label is the button text
+preset,VHF,Broadcast VHF,88M,108M,2.4M,40.2,off,-47
+preset,LF2,150k-2M 3.2,150k,2M,3.2M,40.2,off,-47
+# Program options (the value goes in the label column)
+setting,dc_offset_removal,on
+setting,iq_balance_correction,on
+setting,driver,default
+setting,saturation_line,on
+setting,saturation_margin_db,10
+```
+Setting	Meaning
+`dc_offset_removal`	Remove the DC offset from each capture (default on)
+`iq_balance_correction`	Correct IQ imbalance (default on)
+`driver`	`default`, `ms64`, `sdrsharp`, `experimental`, a folder name under the driver root, or a full path
+`driver_root`	Folder that holds the driver sub-folders (optional)
+`driver_dialog`	`on` to be asked which driver to use at start-up
+`saturation_line`	Show the ADC saturation line at start-up (default on)
+`saturation_margin_db`	Distance of the orange warning line below full scale (default 10)
+`cal_<sample rate in Hz>`	dB to dBµV factor for one sample rate, written by the CAL button (see below)
+Calibration (dBµV)
+The display converts the raw SDR level to dBµV at the input of your external attenuator:
+```
+dBµV = SDR level (dB) - RF gain (dB) + attenuator (dB) + dB-to-dBµV factor
+```
+The factor is different for each sample rate, because the receiver's response changes with sample rate. Rates with no calibrated value use the default `CAL_SDR_DB_TO_DBUV` at the top of the script.
+Calibrating with the CAL button
+Feed a 1.5 MHz sine wave of known amplitude into the SDR through an attenuator. Aim for roughly 60 to 80 dBµV at the SDR input (about 1 to 10 mV rms). A larger level can overload the SDR.
+Click CAL..., enter the sine amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate.
+The program measures every rate at 0 dB RF gain, with the tone at several positions in the block, and works out the best factor for each rate.
+A table shows the old factor, the new factor, how much the level varies with tone position, the headroom below ADC full scale and the signal-to-noise ratio. A rate is rejected if the tone is too close to full scale or too close to the noise.
+You are then asked what to do:
+Use and SAVE to settings.csv keeps the factors permanently. Your previous file is copied to `settings.csv.bak` first.
+Use for this session only applies them until you close the program.
+Discard changes nothing. Use this to run CAL purely as a check.
+The Cal: label on the front panel shows the factor in use for the current sample rate.
+Limits of the calibration:
+It is set at 0 dB RF gain. The RTL-SDR's real gain at other settings differs from the nominal gain table (by up to about 14 dB at low settings), so displayed levels at other gains can read high. Use the same gain when you compare measurements.
+Levels are only reliable well below ADC full scale (see below).
+The level of the test tone at the SDR depends on your generator, so check that the amplitude you enter is really what reaches the attenuator (a generator set for a 50 ohm load read on an unterminated scope shows twice the real voltage).
+CAL SURVEY
+CAL SURVEY... is a diagnostic. It feeds a known tone and measures how its displayed level changes with every sample rate and RF gain. It writes an HTML report (levels, charts and findings) plus CSV files. Use it to see where the readings can be trusted. You can enter several tone positions to map the tuner's passband at each rate.
+ADC saturation line
+When Show ADC saturation line is ticked:
+The red line is the displayed level at which a single tone reaches ADC full scale, at the current RF gain and attenuator.
+The orange dashed line is 10 dB lower, where the front end starts to compress.
+A peak at or above the orange line is not a trustworthy level, and above the red line the SDR is clipping. Reduce the RF gain or add attenuation. The line is a guide for single spikes: a very strong signal outside the displayed band, or many signals adding together, can overload the SDR without any one spike reaching it.
+Other test modes
+STITCH CHECK sweeps the band twice, the second time with every block shifted by half a block, and compares the two. Real signals look the same both times. Anything that depends on where a frequency falls in a block (LO or DC leakage, images, filter edges) differs and is shaded magenta.
+GAIN/RATE SURVEY... steps automatically through sample rates and RF gains on the current band and writes one HTML report. It is for finding which spectrum features are caused by the sample rate and which by the gain stages, and which signals are consistently sensed.
+BASEBAND SCOPE shows the time-domain signal. Because the receiver has a high-pass response, treat it as a "pseudo-scope" for signals from about 100 kHz up to half the sample rate.
+Known issues
+Birdies (spurious spikes) appear in the 150 kHz to 2 MHz range. They move with sample rate and become more obvious at higher RF gain (roughly above 20 dB). They appear to be internal to the receiver, not external signals. Compare two sample rates: a real signal stays put, an artefact moves.
+Stitching wide ranges can show discontinuities at block edges (for example near the DC/LO region of a block). The edge masking reduces this but does not remove it.
+3.0 to 3.2 MS/s can show a regular pulse train and dropped USB samples that are not seen at 2.4 MS/s.
+Calibration is valid only at the gain it was done at, and only below ADC full scale (see above).
+Frequencies below about 28.8 MHz go through the V4's built-in upconverter. The scope and HF behaviour are not as well tested as the VHF/UHF modes.
+Notes on HF and direct sampling
+In direct-sampling mode the R820T tuner is bypassed and the antenna feeds the RTL2832U ADC directly. There is then no tuner gain, and the "centre frequency" does not retune anything. A stock dongle is quite insensitive in this mode and usually needs an external preamp.
+The RTL-SDR Blog V4 does not need this mode for HF: it routes anything below about 28.8 MHz through its upconverter automatically, so the normal tuned modes work. The tuner gain control is the only gain in the path.
+Development
+The code was written with the help of Claude and ChatGPT/Microsoft Copilot. Claude was much more useful. If you want to add features or change the code, I recommend using Claude: Copilot tended to add spurious code, introduce bugs and suggest unwanted extra features.
