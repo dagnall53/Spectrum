@@ -462,10 +462,10 @@ def cal_reference_db():
     return min(CAL_BY_RATE.values()) if CAL_BY_RATE else CAL_SDR_DB_TO_DBUV
 
 
-def settings_write_cal(cal_by_rate):
+def settings_write_cal(cal_by_rate, gain_db=None):
     """Write the per-rate factors into settings.csv as 'setting,cal_<Hz>,<value>' rows. Every other line (presets, other
     settings, comments) is kept exactly; old cal_ rows are replaced; the old file is first copied to settings.csv.bak.
-    The column the value goes in follows the file's own header ('value' if there is one, else 'label'). Returns the path."""
+    The column the value goes in follows the file's own header ('value' if there is one, else 'label'). The gain the CAL was made at is recorded in the comment line. Returns the path."""
     import shutil
     if SETTINGS_PATH:
         path = SETTINGS_PATH
@@ -501,7 +501,8 @@ def settings_write_cal(cal_by_rate):
         row[i_type], row[i_name], row[i_val] = "setting", name, val
         return ",".join(row)
 
-    keep.append("# dB -> dBuV factor per sample rate (written by the CAL button " + time.strftime("%Y-%m-%d %H:%M") + ")")
+    keep.append("# dB -> dBuV factor per sample rate (written by the CAL button " + time.strftime("%Y-%m-%d %H:%M") +
+                ("" if gain_db is None else f", made at RF gain {gain_db:g} dB") + ")")
     for rate, val in sorted(cal_by_rate.items()):
         keep.append(make_row(f"cal_{int(round(rate))}", f"{val:.2f}"))
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -4187,7 +4188,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_cal_quick = QtWidgets.QPushButton("CAL...")
         self.btn_cal_quick.setToolTip(
             "Calibrate the dB -> dBuV factor of EVERY sample rate: feed a 1.5 MHz sine of known amplitude; each rate is measured at "
-            "0 dB RF gain and the best factor is worked out. You are asked before anything is applied or written to settings.csv.")
+            "the RF gain set on the front panel and the best factor is worked out. Set the RF gain to about the value you will use for measurements first. "
+            "You are asked before anything is applied or written to settings.csv.")
         self.btn_cal_quick.clicked.connect(self.cal_quick_open_dialog)
         self.btn_cal = QtWidgets.QPushButton("CAL SURVEY...")
         self.btn_cal.setToolTip(
@@ -4880,13 +4882,16 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.continuous_when_idle()
 
     # ------------------------------------------------------------------------------------
-    # CAL button: one dB -> dBuV factor PER SAMPLE RATE, from a 1.5 MHz sine of known amplitude at 0 dB RF gain
+    # CAL button: one dB -> dBuV factor PER SAMPLE RATE, from a 1.5 MHz sine of known amplitude, at the RF gain set on the front panel
     # ------------------------------------------------------------------------------------
     # Each rate is tuned so the tone sits at several fixed positions in the block (+/-15 % and +/-30 % of the sample
-    # rate from the block centre, inside the part the display keeps) and measured at 0 dB RF gain, where the nominal
-    # gain table cannot matter. The factor for the rate is the median over those positions:
-    #       factor = true dBuV at the attenuator input - attenuator - tone level (SDR dB)
-    # so that  displayed = SDR dB - RF gain + attenuator + factor  reads the tone correctly. The spread over position is
+    # rate from the block centre, inside the part the display keeps) and measured at the RF gain that is set on the
+    # front panel when CAL is pressed - the user sets it to about the value to be used for measurements. The factor for
+    # the rate is the median over those positions:
+    #       factor = true dBuV at the attenuator input - attenuator - tone level (SDR dB) + RF gain
+    # so that  displayed = SDR dB - RF gain + attenuator + factor  reads the tone correctly AT THAT GAIN. Because the
+    # real tuner gain differs from the nominal gain table, the factor also absorbs that difference at this gain, which
+    # is why it is only right close to the gain it was made at. The spread over position is
     # reported (tuner passband ripple); a rate is only accepted if the tone is well clear of ADC full scale and of the
     # noise. Nothing is applied until the user says so, and settings.csv is only written if the user chooses that.
 
@@ -4902,9 +4907,13 @@ class EmcScanner(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
             f"Connect a {CAL_QUICK_TONE_HZ/1e6:g} MHz SINE WAVE of known amplitude to the SDR input (through the attenuator).\n"
-            "Choose a level that is small enough not to overload the SDR: at 0 dB RF gain the input to the SDR should be\n"
-            "roughly 60-80 dBuV (1-10 mV rms). Enter the amplitude you are feeding in, and the attenuator that is fitted."))
+            "The CAL is made at the RF gain set on the front panel, so set the RF Gain slider to about the value you will use\n"
+            "for measurements BEFORE pressing CAL. Choose a sine level small enough not to overload the SDR at that gain: with\n"
+            "the sine connected the tone should sit well below the red saturation line on the display (check with CONTINUOUS).\n"
+            "Enter the amplitude you are feeding in, and the attenuator that is fitted."))
         form = QtWidgets.QFormLayout()
+        cal_gain = float(self.gain_db)                 # the CAL is made at this RF gain (front panel), not at 0 dB
+        lbl_gain = QtWidgets.QLabel(f"<b>{cal_gain:g} dB</b>   (front-panel RF Gain - the CAL is made at this gain)")
         sp_vpp = QtWidgets.QDoubleSpinBox()
         sp_vpp.setLocale(SCOPE_LOCALE)
         sp_vpp.setRange(0.0001, 20.0)
@@ -4920,6 +4929,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         sp_att.setToolTip("Attenuator between the generator and the SDR. Defaults to the front-panel Attenuator setting. "
                           "Set the front-panel Attenuator to the value you normally use, not to this one, after the CAL.")
         lbl_exp = QtWidgets.QLabel("")
+        form.addRow("RF gain for the CAL", lbl_gain)
         form.addRow(f"Amplitude of the {CAL_QUICK_TONE_HZ/1e6:g} MHz sine (at the attenuator input)", sp_vpp)
         form.addRow("Attenuator fitted", sp_att)
         form.addRow("True level at the attenuator input", lbl_exp)
@@ -4944,14 +4954,14 @@ class EmcScanner(QtWidgets.QMainWindow):
             exp = self.cal_expected_dbuv(sp_vpp.value())
             lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
             at_sdr = exp - sp_att.value()
+            # rough headroom below ADC full scale at this gain, from the calibration in use (the measurement itself checks properly)
+            head = self.sat_full_scale_p() + cal_reference_db() - cal_gain - at_sdr
             warn = ""
-            if at_sdr > 82.0:
-                warn = f"   WARNING: {at_sdr:.0f} dBuV at the SDR is probably too large - risk of overload"
-            elif at_sdr < 50.0:
-                warn = f"   WARNING: {at_sdr:.0f} dBuV at the SDR is probably too small - noisy result"
+            if head < CAL_MIN_HEADROOM_DB + 2.0:
+                warn = f"   WARNING: only about {head:.0f} dB below ADC full scale at {cal_gain:g} dB gain - probably too large, lower the level"
             n_avg = self.avg_get_active_count()
             tot = sum((0.12 + 0.15 + n_avg * (NFFT / r + 0.004)) * len(CAL_POS_FRACTIONS) * (CAL_QUICK_SCANS + 1) for r in chosen())
-            info.setText(f"About {at_sdr:.0f} dBuV reaches the SDR.{warn}\n{len(chosen())} rate(s) x {len(CAL_POS_FRACTIONS)} tone positions, "
+            info.setText(f"About {at_sdr:.0f} dBuV reaches the SDR; estimated headroom {head:.0f} dB at {cal_gain:g} dB RF gain.{warn}\n{len(chosen())} rate(s) x {len(CAL_POS_FRACTIONS)} tone positions, "
                          f"roughly {self.survey_fmt_seconds(tot)}. Averaging setting is used as-is.")
 
         sp_vpp.valueChanged.connect(refresh)
@@ -4968,10 +4978,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         if not rates:
             self.log("CAL: no sample rate selected")
             return
-        combos = [(r, round(fr * r / 1e3, 3), 0.0) for r in rates for fr in CAL_POS_FRACTIONS]
+        combos = [(r, round(fr * r / 1e3, 3), cal_gain) for r in rates for fr in CAL_POS_FRACTIONS]
         self.cal_start({"quick": True, "tone_hz": CAL_QUICK_TONE_HZ, "vpp": sp_vpp.value(), "atten": sp_att.value(),
                         "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": CAL_WINDOW_HZ_DEFAULT,
-                        "use_band": False, "combos": combos, "scans": CAL_QUICK_SCANS, "path": ""})
+                        "use_band": False, "combos": combos, "scans": CAL_QUICK_SCANS, "path": "", "gain": cal_gain})
 
     def cal_quick_evaluate(self, c):
         """Reduce the CAL results to one row per sample rate: the factor, its spread over tone position, the headroom below
@@ -4983,7 +4993,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             row = {"rate": r, "old": cal_for_rate(r), "had": cal_has_rate(r), "new": None, "spread": None, "head": None,
                    "snr": None, "ok": False, "note": "no tone found"}
             if rs:
-                vals = [c["expected"] - c["atten"] - x["tone_p"] for x in rs]          # factor implied at each tone position
+                vals = [c["expected"] - c["atten"] - x["tone_p"] + c["gain"] for x in rs]    # factor implied at each tone position (at the CAL gain)
                 row["new"] = float(np.median(vals))
                 row["spread"] = float(max(vals) - min(vals))
                 row["head"] = float(fs_p - max(x["tone_p"] for x in rs))
@@ -5018,7 +5028,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         dlg.setWindowTitle("CAL result")
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
-            f"Sine {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, 0 dB RF gain.\n"
+            f"Sine {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, RF gain {c['gain']:g} dB.\n"
             f"'Old' is the factor in use now (the default {CAL_SDR_DB_TO_DBUV:g} where a rate has none of its own). "
             f"Headroom = dB below ADC full scale; SNR = dB above the noise."))
         txt = QtWidgets.QPlainTextEdit(table)
@@ -5049,10 +5059,10 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         for x in good:
             CAL_BY_RATE[float(x["rate"])] = round(x["new"], 2)
-        self.log(f"CAL: {len(good)} per-rate factor(s) applied for this session")
+        self.log(f"CAL: {len(good)} per-rate factor(s) applied for this session (made at RF gain {c['gain']:g} dB)")
         if v == "save":
             try:
-                path = settings_write_cal(CAL_BY_RATE)
+                path = settings_write_cal(CAL_BY_RATE, c["gain"])
                 self.log(f"CAL: saved to {path} (the previous file is kept as {path}.bak)")
             except Exception as e:
                 self.log(f"CAL: ERROR - could not write settings.csv: {e}")
