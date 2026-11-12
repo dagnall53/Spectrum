@@ -17,6 +17,7 @@ It was written for investigating emissions (for example from marine electronics)
 - Optional CISPR limit line (radiated or conducted).
 - **Per-sample-rate dB to dBµV calibration** using the CAL button.
 - Optional **ADC saturation line** that warns when the input is close to overloading the SDR.
+- Optional **waterfall** below the graph, to show effects that repeat or come and go.
 - Test modes: **Single Frequency**, **Stitch Check**, **Gain/Rate Survey**, **CAL Survey** and a **Baseband Scope**.
 
 ## Requirements
@@ -64,6 +65,7 @@ The DLL and driver choice is made in `settings.csv` (see below). The code was or
 | Show Freq Markers | Show the green (raw block) and cyan dashed (kept block) edges |
 | Capture Reference / Show Reference | Store the current trace (for example the system noise with the equipment off) and show it for comparison only. Nothing is subtracted |
 | Show ADC saturation line | See [Saturation line](#adc-saturation-line) |
+| Show waterfall | Show a spectrum history below the graph. See [Waterfall](#waterfall) |
 | BASEBAND SCOPE | Time-domain view of the input from DC to half the sample rate. The button changes to *BACK TO SPECTRUM* |
 
 ### Sample rates
@@ -100,6 +102,8 @@ setting,saturation_margin_db,10
 | `driver_dialog` | `on` to be asked which driver to use at start-up |
 | `saturation_line` | Show the ADC saturation line at start-up (default on) |
 | `saturation_margin_db` | Distance of the orange warning line below full scale (default 10) |
+| `waterfall` | Show the waterfall at start-up (default off) |
+| `waterfall_rows` | Rows of history kept in the waterfall (default 150) |
 | `cal_<sample rate in Hz>` | dB to dBµV factor for one sample rate, written by the CAL button (see below) |
 
 ## Calibration (dBµV)
@@ -114,12 +118,13 @@ The factor is **different for each sample rate**, because the receiver's respons
 
 ### Calibrating with the CAL button
 
-1. Feed a **1.5 MHz sine wave** of known amplitude into the SDR through an attenuator. Aim for roughly 60 to 80 dBµV at the SDR input (about 1 to 10 mV rms). A larger level can overload the SDR.
-2. Click **CAL...**, enter the sine amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate.
-3. The program measures every rate at **0 dB RF gain**, with the tone at several positions in the block, and works out the best factor for each rate.
-4. A table shows the old factor, the new factor, how much the level varies with tone position, the headroom below ADC full scale and the signal-to-noise ratio. A rate is rejected if the tone is too close to full scale or too close to the noise.
-5. You are then asked what to do:
-   - **Use and SAVE to settings.csv** keeps the factors permanently. Your previous file is copied to `settings.csv.bak` first.
+1. Set the **RF Gain** slider to about the value you will use for your measurements. The CAL is made at this gain, so the factor is right close to it.
+2. Feed a **1.5 MHz sine wave** of known amplitude into the SDR through an attenuator. Use a level small enough not to overload the SDR at that gain. With the sine connected and CONTINUOUS running, the tone should sit well below the red saturation line.
+3. Click **CAL...**. The dialog shows the RF gain that will be used. Enter the sine amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate. The dialog also estimates how far below ADC full scale the tone will be.
+4. The program measures every rate at the front-panel RF gain, with the tone at several positions in the block, and works out the best factor for each rate.
+5. A table shows the old factor, the new factor, how much the level varies with tone position, the headroom below ADC full scale and the signal-to-noise ratio. A rate is rejected if the tone is too close to full scale or too close to the noise.
+6. You are then asked what to do:
+   - **Use and SAVE to settings.csv** keeps the factors permanently. The RF gain used is noted in a comment line in the file, and your previous file is copied to `settings.csv.bak` first.
    - **Use for this session only** applies them until you close the program.
    - **Discard** changes nothing. Use this to run CAL purely as a check.
 
@@ -127,7 +132,7 @@ The **Cal:** label on the front panel shows the factor in use for the current sa
 
 **Limits of the calibration:**
 
-- It is set at 0 dB RF gain. The RTL-SDR's real gain at other settings differs from the nominal gain table (by up to about 14 dB at low settings), so displayed levels at other gains can read high. Use the same gain when you compare measurements.
+- The factor is made at one RF gain. The RTL-SDR's real gain differs from the nominal gain table (by up to about 14 dB at low settings), and the factor absorbs that difference at the gain it was made at. Displayed levels at other gains can therefore read high or low. Calibrate at, and measure at, about the same RF gain, and repeat the CAL if you change it.
 - Levels are only reliable well below ADC full scale (see below).
 - The level of the test tone at the SDR depends on your generator, so check that the amplitude you enter is really what reaches the attenuator (a generator set for a 50 ohm load read on an unterminated scope shows twice the real voltage).
 
@@ -143,6 +148,25 @@ When **Show ADC saturation line** is ticked:
 - The **orange dashed line** is 10 dB lower, where the front end starts to compress.
 
 A peak at or above the orange line is not a trustworthy level, and above the red line the SDR is clipping. Reduce the RF gain or add attenuation. The line is a guide for single spikes: a very strong signal outside the displayed band, or many signals adding together, can overload the SDR without any one spike reaching it.
+
+## Waterfall
+
+Tick **Show waterfall** and a panel appears below the graph. It shows the spectrum history with the **newest row at the top**, coloured by level in dBµV (same calibration as the trace). Its frequency axis is linked to the main graph, so zooming or panning either one moves both.
+
+There are two kinds of row:
+
+- **Sweep rows (default):** one row per finished sweep. In the normal modes a row is a whole stitched sweep. In single-frequency mode a row is one spectrum. Use this to see what comes and goes from sweep to sweep. The time axis is the sweep time, which is seconds per row.
+- **Fast rows (single-frequency mode only):** tick **Fast rows**. After each normal pass the program records 128 x 4096 contiguous samples and shows every FFT as its own unaveraged row, about 1.7 ms per row at 2.4 MS/s. A burst that repeats every 200 ms then appears as a bright line every 117 rows or so. Batches are separated by a dark line, because the sweep pass between them is not in the picture. So a repeat period longer than one batch (about 0.2 s at 2.4 MS/s) only shows if more than one burst falls inside a batch.
+
+Other controls:
+
+| Control | What it does |
+|---|---|
+| Rows | How many rows of history to keep (20 to 2000) |
+| Auto colours | Picks the colour range from the data. Untick it to set the bottom and top dBµV yourself |
+| Clear | Empties the history. It also clears itself when the band, sample rate or row type changes |
+
+Very wide bands are reduced to at most 4096 columns by taking the peak of each group of bins, so narrow spikes still show. Set the defaults with `setting,waterfall,on|off` and `setting,waterfall_rows,150` in `settings.csv`.
 
 ## Other test modes
 

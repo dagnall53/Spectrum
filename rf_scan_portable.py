@@ -230,7 +230,7 @@ def _parse_bool(text):
 SETTINGS_EXTRA = {}
 # (previous: _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog"))
 _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog",
-                   "saturation_line", "saturation_margin_db")   # (plus cal_<sample rate Hz> rows, see CAL_BY_RATE)
+                   "saturation_line", "saturation_margin_db", "waterfall", "waterfall_rows")   # (plus cal_<sample rate Hz> rows)
 
 
 # ---- previous load_settings() (warned about cal_ rows), kept in case of problems ----
@@ -508,6 +508,15 @@ def settings_write_cal(cal_by_rate, gain_db=None):
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(nl.join(keep) + nl)
     return path
+
+
+# Waterfall display (settings.csv:  setting,waterfall,on|off   setting,waterfall_rows,150)
+WATERFALL_ON = _setting_bool("waterfall", False)
+try:
+    WATERFALL_ROWS = max(20, min(2000, int(float(SETTINGS_EXTRA.get("waterfall_rows") or 150))))
+except ValueError:
+    print(f"settings: warning - waterfall_rows = {SETTINGS_EXTRA.get('waterfall_rows')!r} is not a number - using 150")
+    WATERFALL_ROWS = 150
 
 # Any preset sample rate that is not already offered gets added to the live Sample Rate
 # dropdown, so the combo can always display the active preset's rate.
@@ -1299,6 +1308,17 @@ class CalSurveySignals(QtCore.QObject):
     # calibration survey worker thread -> GUI thread
     done = QtCore.pyqtSignal(object)      # True if stopped early
     progress = QtCore.pyqtSignal()        # a new rate/gain setting has started: move the Sample Rate box / gain slider
+
+
+# ---- WATERFALL defaults (see EmcScanner.wf_build_ui) ----
+WF_MAX_BINS = 4096                 # a row wider than this is reduced by peak-preserving max pooling (keeps the image light)
+WF_FAST_ROWS = 128                 # rows in one contiguous "fast" capture (single-frequency mode): 128 x 4096 samples
+WF_DEFAULT_ROWS = 150              # history depth (rows) unless settings.csv says otherwise
+
+
+class WaterfallSignals(QtCore.QObject):
+    # worker thread -> GUI thread: new waterfall rows
+    rows = QtCore.pyqtSignal(object, object, str, float)   # freqs (Hz), rows (n x bins, NEWEST FIRST, dBuV), kind, seconds per row
 
 
 # ---- Baseband SCOPE defaults (see the EmcScanner.scope_* methods) ----
@@ -3302,7 +3322,18 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
         self.sweep_thread.start()
 
+    # ---- sweep_loop() is wrapped: the original body is now _sweep_loop_orig(); this wrapper runs it, then hands a finished
+    # ---- clean pass to the waterfall (when it is switched on). Everything that called sweep_loop() still does.
     def sweep_loop(self):
+        seq0 = self._pass_seq
+        self._sweep_loop_orig()
+        if getattr(self, "wf_enabled", False) and self._pass_seq != seq0:
+            try:
+                self.wf_note_pass(self._last_pass)
+            except Exception as e:
+                print(f"waterfall: could not add a row: {e!r}")
+
+    def _sweep_loop_orig(self):    # (was: def sweep_loop(self):)
         # Clear the restart request BEFORE reading the live settings below: a change made
         # after this point sets it again and is caught at the next block boundary.
         self._restart_pass = False
@@ -5134,6 +5165,292 @@ class EmcScanner(QtWidgets.QMainWindow):
         rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
         return f"Cal: {cal_for_rate(rate):+.1f} dB" + ("" if cal_has_rate(rate) else " (default)")
 
+    # ------------------------------------------------------------------------------------
+    # WATERFALL: spectrum history below the main graph, to show periodic / intermittent effects
+    # ------------------------------------------------------------------------------------
+    # Tick "Show waterfall" and a panel appears under the graph; its frequency axis is linked to the main graph (zoom or
+    # pan either one). Colours are dBuV, with the same calibration as the trace. Newest row at the top.
+    # Two sources of rows:
+    #   * SWEEP rows (default): one row per completed pass - a whole stitched sweep in the normal modes, one spectrum in
+    #     single-frequency mode. Shows what comes and goes from sweep to sweep. Time per row = the sweep time (seconds).
+    #   * FAST rows (single-frequency mode, "Fast rows" ticked): after each normal pass the program reads one CONTIGUOUS
+    #     record of 128 x 4096 samples and shows a row per FFT (about 1.7 ms each at 2.4 MS/s), unaveraged. A burst that
+    #     repeats every 200 ms then shows as a bright line every ~117 rows. Batches are separated by a dark line (the
+    #     sweep pass between them is not in the picture), so periods longer than one batch (0.2 s at 2.4 MS/s) show
+    #     within a batch only.
+
+    def wf_build_ui(self):
+        self.wf_enabled = False                 # read by the worker thread
+        self.wf_fast = False
+        self._wf_f = None
+        self._wf_buf = None
+        self._wf_kind = ""
+        self._wf_dt = 1.0
+        self._wf_last_t = None
+        self._wf_dt_ema = None
+        self._wf_levels = None
+        self.wf_signals = WaterfallSignals()
+        self.wf_signals.rows.connect(self.wf_on_rows)
+
+        self.wf_box = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(self.wf_box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        ctl = QtWidgets.QHBoxLayout()
+        ctl.setContentsMargins(0, 0, 0, 0)
+        ctl.addWidget(QtWidgets.QLabel("Waterfall  rows:"))
+        self.wf_spin_rows = QtWidgets.QSpinBox()
+        self.wf_spin_rows.setRange(20, 2000)
+        self.wf_spin_rows.setValue(int(WATERFALL_ROWS))
+        self.wf_spin_rows.setToolTip("How many rows of history to keep.")
+        self.wf_spin_rows.valueChanged.connect(lambda _v: self.wf_redraw())
+        ctl.addWidget(self.wf_spin_rows)
+        self.wf_chk_fast = QtWidgets.QCheckBox("Fast rows (single-frequency mode)")
+        self.wf_chk_fast.setToolTip(
+            "Single-frequency mode only: after each normal pass, record 128 x 4096 contiguous samples and show every FFT as a row\n"
+            "(about 1.7 ms each at 2.4 MS/s, unaveraged). This is what shows short bursts that repeat every few hundred ms.\n"
+            "Batches are separated by a dark line. Unticked: one row per sweep pass (seconds per row).")
+        self.wf_chk_fast.toggled.connect(self.wf_on_fast_toggled)
+        ctl.addWidget(self.wf_chk_fast)
+        self.wf_chk_auto = QtWidgets.QCheckBox("Auto colours")
+        self.wf_chk_auto.setChecked(True)
+        self.wf_chk_auto.toggled.connect(lambda _on: self.wf_redraw())
+        ctl.addWidget(self.wf_chk_auto)
+        self.wf_sp_lo = QtWidgets.QDoubleSpinBox()
+        self.wf_sp_hi = QtWidgets.QDoubleSpinBox()
+        for sp, val in ((self.wf_sp_lo, 20.0), (self.wf_sp_hi, 80.0)):
+            sp.setRange(-100.0, 200.0)
+            sp.setDecimals(0)
+            sp.setSuffix(" dBuV")
+            sp.setValue(val)
+            sp.valueChanged.connect(lambda _v: self.wf_redraw())
+        self.wf_sp_lo.setToolTip("Colour scale bottom (used when Auto colours is off).")
+        self.wf_sp_hi.setToolTip("Colour scale top (used when Auto colours is off).")
+        ctl.addWidget(self.wf_sp_lo)
+        ctl.addWidget(self.wf_sp_hi)
+        btn_clear = QtWidgets.QPushButton("Clear")
+        btn_clear.clicked.connect(self.wf_clear)
+        ctl.addWidget(btn_clear)
+        ctl.addStretch(1)
+        v.addLayout(ctl)
+
+        self.wf_plot = pg.PlotWidget()
+        self.wf_plot.setLabel("bottom", "Frequency", units="Hz")
+        self.wf_plot.setLabel("left", "Time ago", units="s")
+        self.wf_plot.invertY(True)                                   # newest row at the top
+        self.wf_plot.setMouseEnabled(x=True, y=False)
+        self.wf_img = pg.ImageItem()
+        try:
+            self.wf_img.setOpts(axisOrder="col-major")               # array is indexed [frequency, row]
+        except Exception:
+            pass
+        self.wf_plot.addItem(self.wf_img)
+        self.wf_plot.setXLink(self.plot)                             # same frequency axis as the main graph
+        self.wf_plot.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)   # the main graph owns the X range (a linked auto-ranging
+        self.wf_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)   # view would drag it around); the rows set the Y range
+        pos = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        col = np.array([[0, 0, 40, 255], [0, 70, 170, 255], [0, 200, 200, 255], [240, 240, 60, 255], [255, 60, 0, 255]], dtype=np.ubyte)
+        self._wf_lut = pg.ColorMap(pos, col).getLookupTable(0.0, 1.0, 256)
+        v.addWidget(self.wf_plot, 1)
+        self.wf_box.setVisible(False)
+
+        lay = self.find_layout_with(self.plot)
+        if lay is not None:
+            idx = lay.indexOf(self.plot)
+            lay.setStretchFactor(self.plot, 3)
+            lay.insertWidget(idx + 1, self.wf_box, 2)
+        else:
+            self.centralWidget().layout().addWidget(self.wf_box)
+
+        self.chk_wf = QtWidgets.QCheckBox("Show waterfall")
+        self.chk_wf.setToolTip("Show a waterfall (spectrum history, newest at the top) below the graph, to reveal effects that repeat "
+                               "or come and go. Default: settings.csv  setting,waterfall,on|off   setting,waterfall_rows,150")
+        sub = self.find_layout_with(self.chk_markers)
+        if sub is not None:
+            sub.addWidget(self.chk_wf)
+        else:
+            self.centralWidget().layout().addWidget(self.chk_wf)
+        self.chk_wf.toggled.connect(self.wf_on_toggled)
+        if WATERFALL_ON:
+            self.chk_wf.setChecked(True)
+
+    def wf_on_toggled(self, on):
+        self.wf_enabled = bool(on)
+        self.wf_box.setVisible(bool(on))
+        if on:
+            self._wf_last_t = None
+            QtCore.QTimer.singleShot(60, self.wf_sync_axes)
+            self.log("Waterfall on" + (" (fast rows need single-frequency mode)" if self.wf_chk_fast.isChecked() else ""))
+
+    def wf_on_fast_toggled(self, on):
+        self.wf_fast = bool(on)
+        self.wf_clear()
+        if on and not getattr(self, "single_mode", False):
+            self.log("Waterfall: fast rows are only taken in single-frequency mode - normal sweep rows are shown until you select it")
+
+    def wf_sync_axes(self):
+        """Give the waterfall the same left / right margins as the main graph so the frequency axes line up."""
+        try:
+            wl = int(max(self.plot.getAxis("left").width(), 60))
+            wr = int(max(self.plot.getAxis("right").width(), 30))
+            self.plot.getAxis("left").setWidth(wl)
+            self.wf_plot.getAxis("left").setWidth(wl)
+            self.wf_plot.showAxis("right")
+            ax = self.wf_plot.getAxis("right")
+            ax.setStyle(showValues=False, tickLength=0)
+            ax.setPen(pg.mkPen(None))
+            ax.setWidth(wr)
+        except Exception as e:
+            print("wf_sync_axes:", e)
+
+    def wf_clear(self):
+        self._wf_buf = None
+        self._wf_f = None
+        self._wf_levels = None
+        try:
+            self.wf_img.clear()
+        except Exception:
+            pass
+
+    @staticmethod
+    def wf_reduce(f, p):
+        """Reduce to at most WF_MAX_BINS columns by max pooling (a narrow spike must survive). p may be 1-D or n x bins."""
+        n = f.size
+        g = int(math.ceil(n / float(WF_MAX_BINS)))
+        if g <= 1:
+            return f, p
+        m = (n // g) * g
+        f2 = f[:m].reshape(-1, g).mean(axis=1)
+        if p.ndim == 1:
+            return f2, np.fmax.reduce(p[:m].reshape(-1, g), axis=1)
+        return f2, np.fmax.reduce(p[:, :m].reshape(p.shape[0], -1, g), axis=2)
+
+    def wf_note_pass(self, lp):
+        """WORKER thread: one finished clean pass -> one waterfall row (calibrated, in dBuV)."""
+        if lp is None or self._survey is not None or self._stitch is not None:
+            return                                       # survey / CAL / stitch-check passes are not wanted here
+        if self.wf_fast and getattr(self, "single_mode", False):
+            return                                       # fast rows replace the pass rows in single-frequency mode
+        now = time.time()
+        last = self._wf_last_t
+        self._wf_last_t = now
+        if last is not None and 0.0 < now - last < 120.0:
+            self._wf_dt_ema = (now - last) if self._wf_dt_ema is None else 0.7 * self._wf_dt_ema + 0.3 * (now - last)
+        f = np.asarray(lp["f"], dtype=np.float64)
+        p = np.asarray(lp["p"], dtype=np.float64)
+        ok = np.isfinite(f) & np.isfinite(p)
+        f, p = f[ok], p[ok]
+        if f.size < 8:
+            return
+        order = np.argsort(f)
+        f, p = f[order], p[order]
+        gain = 0.0 if self.hf_mode else float(lp["gain"])
+        p = p + cal_for_rate(lp["rate"]) - gain + float(self.input_atten_db)       # SDR dB -> dBuV at the attenuator input
+        f, p = self.wf_reduce(f, p)
+        self.wf_signals.rows.emit(f, p[None, :].astype(np.float32), "pass", float(self._wf_dt_ema or 1.0))
+
+    def wf_fast_capture(self):
+        """WORKER thread (called after each pass in continuous mode): in single-frequency mode with Fast rows on, read one
+        contiguous record and turn every 4096-sample piece into a row - the time structure the averaged pass cannot show."""
+        if not (self.wf_enabled and self.wf_fast and getattr(self, "single_mode", False)):
+            return
+        if self.stop_flag.is_set() or self._survey is not None or self.sdr is None:
+            return
+        rate = float(getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE)
+        centre = float(self.centers[0]) if len(self.centers) else float(self.START_FREQ)
+        try:
+            x = self._read_normalized_iq(NFFT * WF_FAST_ROWS)
+        except OSError as e:
+            print(f"wf_fast_capture: read error: {e}")
+            return
+        m = (x.size // NFFT) * NFFT
+        if m < NFFT:
+            return
+        seg = x[:m].reshape(-1, NFFT) * np.hanning(NFFT).astype(np.float32)[None, :]
+        spec = np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1) / NFFT
+        db = 10.0 * np.log10(np.abs(spec) ** 2 + 1e-12) + self._psd_to_dbuv_const + self.cal_total_offset_db()
+        f = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / rate)) + centre
+        f, db = self.wf_reduce(f, db)
+        rows = np.vstack([db[::-1], np.full((1, db.shape[1]), np.nan)]).astype(np.float32)   # newest first, then a dark separator
+        self.wf_signals.rows.emit(f, rows, "fast", float(NFFT) / rate)
+
+    def wf_on_rows(self, f, rows, kind, dt):
+        """GUI thread: add rows (newest first) to the history and redraw."""
+        if not self.wf_enabled:
+            return
+        f = np.asarray(f, dtype=np.float64)
+        rows = np.asarray(rows, dtype=np.float32)
+        if rows.ndim == 1:
+            rows = rows[None, :]
+        cap = int(self.wf_spin_rows.value())
+        nx = f.size
+        df = abs(f[1] - f[0]) if nx > 1 else 1.0
+        same = (self._wf_f is not None and self._wf_f.size == nx and kind == self._wf_kind and
+                abs(self._wf_f[0] - f[0]) < 0.6 * df and abs(self._wf_f[-1] - f[-1]) < 0.6 * df)
+        if not same or self._wf_buf is None:
+            self._wf_buf = np.full((cap, nx), np.nan, dtype=np.float32)
+            self._wf_f = f
+            self._wf_kind = kind
+            self._wf_levels = None
+        n = rows.shape[0]
+        old = self._wf_buf
+        if old.shape[0] != cap:                                   # history depth changed: keep what fits
+            keep = np.full((cap, nx), np.nan, dtype=np.float32)
+            k = min(cap, old.shape[0])
+            keep[:k] = old[:k]
+            old = keep
+        self._wf_buf = rows[:cap].copy() if n >= cap else np.concatenate([rows, old[:cap - n]], axis=0)
+        if self._wf_buf.shape[0] < cap:
+            pad = np.full((cap - self._wf_buf.shape[0], nx), np.nan, dtype=np.float32)
+            self._wf_buf = np.concatenate([self._wf_buf, pad], axis=0)
+        self._wf_dt = max(float(dt), 1e-6)
+        self.wf_redraw()
+
+    def wf_redraw(self):
+        """GUI thread: draw the history buffer (levels, image placement, time axis)."""
+        buf = getattr(self, "_wf_buf", None)
+        if buf is None or getattr(self, "_wf_f", None) is None:
+            return
+        cap = int(self.wf_spin_rows.value())
+        if buf.shape[0] != cap:                                   # the spin box changed: resize the history
+            new = np.full((cap, buf.shape[1]), np.nan, dtype=np.float32)
+            k = min(cap, buf.shape[0])
+            new[:k] = buf[:k]
+            self._wf_buf = buf = new
+        finite = np.isfinite(buf)
+        if not finite.any():
+            return
+        if self.wf_chk_auto.isChecked():
+            vals = buf[finite]
+            if vals.size > 200000:
+                vals = vals[::max(1, vals.size // 200000)]
+            lo = float(np.percentile(vals, 3.0))
+            hi = float(np.percentile(vals, 99.7))
+            if hi - lo < 15.0:
+                hi = lo + 15.0
+            if self._wf_levels is not None:                       # smooth, so the colours do not flicker from row to row
+                lo = 0.7 * self._wf_levels[0] + 0.3 * lo
+                hi = 0.7 * self._wf_levels[1] + 0.3 * hi
+            self._wf_levels = (lo, hi)
+            for sp, val in ((self.wf_sp_lo, lo), (self.wf_sp_hi, hi)):
+                sp.blockSignals(True)
+                sp.setValue(round(val))
+                sp.blockSignals(False)
+        else:
+            lo, hi = float(self.wf_sp_lo.value()), float(self.wf_sp_hi.value())
+            if hi <= lo:
+                hi = lo + 1.0
+        disp = np.where(finite, buf, np.float32(lo))                # empty rows and separators show as the bottom colour
+        self.wf_img.setImage(np.ascontiguousarray(disp.T), autoLevels=False, levels=(lo, hi), lut=self._wf_lut)
+        f = self._wf_f
+        nx = f.size
+        dx = (f[-1] - f[0]) / (nx - 1) if nx > 1 else 1.0
+        tr = QtGui.QTransform()
+        tr.translate(float(f[0] - dx / 2.0), 0.0)
+        tr.scale(float(dx), 1.0)
+        self.wf_img.setTransform(tr)
+        self.wf_plot.setYRange(0.0, float(cap), padding=0.0)
+        self.wf_plot.getAxis("left").setScale(self._wf_dt)         # tick values in seconds ago
     # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
 #    def survey_connect_signals(self):
 #        self.survey_signals = SurveySignals()
@@ -5156,6 +5473,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             "test being run. Press STOP to end early (a partial report is saved).")
         self.cal_build_ui()                # CAL and CAL SURVEY buttons + signals: known-tone calibration
         self.sat_build_ui()                # optional ADC saturation lines on the display
+        self.wf_build_ui()                 # optional waterfall below the graph
 
     def survey_sync_controls(self):
         """GUI thread: show the settings of the survey test now running on the Sample Rate box, the RF Gain
@@ -8991,6 +9309,26 @@ class EmcScanner(QtWidgets.QMainWindow):
 #                 traceback.print_exc()
 #                 time.sleep(0.5)
 
+    # ---- previous continuous_loop() (no waterfall hook), kept in case of problems ----
+#    def continuous_loop(self):
+#        try:
+#            self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
+#        except Exception as e:
+#            print(f"continuous_loop: settle_radio failed: {e!r}")
+#        while not self.stop_flag.is_set():
+#            self.single_apply_pending()     # single-frequency mode: a new centre chosen on the front panel starts here
+#            try:
+#                self.sweep_loop()   # run one sweep
+#            except Exception as e:
+#                # Last-resort safety net: an unhandled exception anywhere in
+#                # sweep_loop() used to kill this whole thread (silently, from the
+#                # GUI's point of view, apart from a console traceback). Log it and
+#                # keep the continuous scan alive instead of letting it die.
+#                import traceback
+#                print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
+#                traceback.print_exc()
+#                time.sleep(0.5)
+
     def continuous_loop(self):
         try:
             self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
@@ -9000,6 +9338,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.single_apply_pending()     # single-frequency mode: a new centre chosen on the front panel starts here
             try:
                 self.sweep_loop()   # run one sweep
+                self.wf_fast_capture()   # waterfall, single-frequency fast rows (does nothing otherwise)
             except Exception as e:
                 # Last-resort safety net: an unhandled exception anywhere in
                 # sweep_loop() used to kill this whole thread (silently, from the

@@ -25,9 +25,9 @@ setting,driver_root,,,,,,,
 setting,driver_dialog,off,,,,,,
 default,,,95M,102M,2.4M,10,,
 preset,LF2,10k-1M 2.4,10k,1M,2.4M,0,FALSE,-47
-preset,LF1,100k-2M 3.2,100k,2.0 M,3.2M,0,FALSE,-47
-preset,LF3,100k-6M 3.2,100k,6M,3.2M,0,FALSE,-47
-preset,LF4,6M-12 3.2,6M,12M,3.2M,0,FALSE,-47
+preset,LF1,100k-2M 2.4,100k,2.0 M,2.4M,0,FALSE,-47
+preset,LF3,100k-6M 2.4,100k,6M,2.4M,0,FALSE,-47
+preset,LF4,6M-12 2.4,6M,12M,2.4M,0,FALSE,-47
 preset,30M3,12-30Mhz 3.2,12M,30M,3.2M,0,FALSE,-47
 preset,30-200M,30-200Mhz 3,30M,200M,3.2M,0,FALSE,-47
 preset,200-900,200-900Mhz 3,200M,900M,3.2M,0,FALSE,-47
@@ -37,9 +37,18 @@ preset,VHF,Broadcast VHF,88M,108M,2.4M,0,FALSE,-47
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-09 10:31)
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-10 13:00, made at RF gain 8.7 dB)
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-10 13:01, made at RF gain 8.7 dB)
-setting,cal_1024000,91.85,,,,,,
-setting,cal_1800000,92.01,,,,,,
-setting,cal_2048000,89.59,,,,,,
-setting,cal_2400000,89.84,,,,,,
-setting,cal_2560000,98.65,,,,,,
-setting,cal_3200000,109.59,,,,,,
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 11:22, made at RF gain 0 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 11:36, made at RF gain 8.7 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 11:37, made at RF gain 8.7 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 11:42, made at RF gain 14.4 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 11:46, made at RF gain 14.4 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 12:00, made at RF gain 2.7 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 12:00, made at RF gain 12.5 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 12:04, made at RF gain 12.5 dB)
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-11 12:07, made at RF gain 14.4 dB)
+setting,cal_1024000,96.85,,,,,,
+setting,cal_1800000,97.06,,,,,,
+setting,cal_2048000,94.65,,,,,,
+setting,cal_2400000,96.72,,,,,,
+setting,cal_2560000,103.77,,,,,,
+setting,cal_3200000,115.02,,,,,,
