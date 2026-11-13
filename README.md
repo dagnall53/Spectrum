@@ -1,4 +1,4 @@
-<img width="1196" height="594" alt="Screenshot of the RF scanner" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
+<img width="1311" height="820" alt="SweepRunning" src="https://github.com/user-attachments/assets/a765cceb-7a31-429f-899c-8cdeeb278556" />
 
 # RF Scan Portable
 
