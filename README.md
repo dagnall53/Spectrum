@@ -1,4 +1,4 @@
-<img width="1311" height="820" alt="SweepRunning" src="https://github.com/user-attachments/assets/a765cceb-7a31-429f-899c-8cdeeb278556" />
+<img width="1196" height="594" alt="Screenshot of the RF scanner" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
 
 # RF Scan Portable
 
@@ -62,6 +62,7 @@ The DLL and driver choice is made in `settings.csv` (see below). The code was or
 | START CONTINUOUS / START SINGLE SWEEP / STOP | Run or stop sweeps |
 | SAVE CSV | Save the spectrum |
 | Show CISPR limit | Show the CISPR limit line (radiated dBµV/m at 10 m, or conducted dBµV) |
+| Antenna factor / LISN corr. | The box next to the Radiated / Conducted choice. Its value is **added to every displayed level**. See [Antenna factor and LISN correction](#antenna-factor-and-lisn-correction) |
 | Time Averaging | Average several captures per block |
 | Show Freq Markers | Show the green (raw block) and cyan dashed (kept block) edges. Off at start-up |
 | Capture Reference / Show Reference | Store the current trace (for example the system noise with the equipment off) and show it for comparison only. Nothing is subtracted |
@@ -120,13 +121,13 @@ The display converts the raw SDR level to dBµV at the input of your external at
 dBµV = SDR level (dB) - RF gain (dB) + attenuator (dB) + dB-to-dBµV factor
 ```
 
-The factor is **different for each sample rate**, because the receiver's response changes with sample rate. Rates with no calibrated value use the default `CAL_SDR_DB_TO_DBUV` at the top of the script.
+The factor is **different for each sample rate** (and the CAL tone can be at any frequency; the factor applies at the frequency it was made at, which is noted in the comment line the CAL writes to `settings.csv`), because the receiver's response changes with sample rate. Rates with no calibrated value use the default `CAL_SDR_DB_TO_DBUV` at the top of the script.
 
 ### Calibrating with the CAL button
 
 1. Set the **RF Gain** slider to about the value you will use for your measurements. The CAL is made at this gain, so the factor is right close to it.
-2. Feed a **1.5 MHz sine wave** of known amplitude into the SDR through an attenuator. Use a level small enough not to overload the SDR at that gain. With the sine connected and CONTINUOUS running, the tone should sit well below the red saturation line.
-3. Click **CAL...**. The dialog shows the RF gain that will be used. Enter the sine amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate. The dialog also estimates how far below ADC full scale the tone will be.
+2. Feed a **sine wave** of known frequency (1.5 MHz by default) and amplitude into the SDR through an attenuator. Use a level small enough not to overload the SDR at that gain. With the sine connected and CONTINUOUS running, the tone should sit well below the red saturation line.
+3. Click **CAL...**. The dialog shows the RF gain that will be used. Enter the sine frequency, its amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate. The dialog also estimates how far below ADC full scale the tone will be.
 4. The program measures every rate at the front-panel RF gain, with the tone at several positions in the block, and works out the best factor for each rate.
 5. A table shows the old factor, the new factor, how much the level varies with tone position, the headroom below ADC full scale and the signal-to-noise ratio. A rate is rejected if the tone is too close to full scale or too close to the noise.
 6. You are then asked what to do:
@@ -154,6 +155,15 @@ When **Show ADC saturation line** is ticked:
 - The **orange dashed line** is 10 dB lower, where the front end starts to compress.
 
 A peak at or above the orange line is not a trustworthy level, and above the red line the SDR is clipping. Reduce the RF gain or add attenuation. The line is a guide for single spikes: a very strong signal outside the displayed band, or many signals adding together, can overload the SDR without any one spike reaching it.
+
+## Antenna factor and LISN correction
+
+The box next to the Radiated / Conducted choice is **Antenna factor** in Radiated mode and **LISN corr.** in Conducted mode. Its value (in dB) is **added to every displayed level**, so the trace reads in:
+
+- dBµV/m in Radiated mode (the antenna factor, plus any cable loss);
+- dBµV at the LISN measuring port in Conducted mode (the correction for the LISN or coupling network).
+
+With 0 dB the display is plain dBµV at the attenuator input, and the axis label tells you which units are shown. The CISPR limit line is drawn on the same scale as the trace, so you compare them directly. Each mode remembers its own value. Changing the value moves the trace, the waterfall colours, the reference trace and the saturation lines by the same amount, and the graph slides with them so the same data stays in view. The correction is ignored in dBFS mode. The CAL does not use it, so the per-rate factors never depend on it. **SAVE CSV** names its column `level_dbuv_per_m` or `level_dbuv_lisn` when a correction is in use.
 
 ## dBFS display
 

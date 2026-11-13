@@ -462,7 +462,7 @@ def cal_reference_db():
     return min(CAL_BY_RATE.values()) if CAL_BY_RATE else CAL_SDR_DB_TO_DBUV
 
 
-def settings_write_cal(cal_by_rate, gain_db=None):
+def settings_write_cal(cal_by_rate, gain_db=None, tone_hz=None):
     """Write the per-rate factors into settings.csv as 'setting,cal_<Hz>,<value>' rows. Every other line (presets, other
     settings, comments) is kept exactly; old cal_ rows are replaced; the old file is first copied to settings.csv.bak.
     The column the value goes in follows the file's own header ('value' if there is one, else 'label'). The gain the CAL was made at is recorded in the comment line. Returns the path."""
@@ -502,7 +502,8 @@ def settings_write_cal(cal_by_rate, gain_db=None):
         return ",".join(row)
 
     keep.append("# dB -> dBuV factor per sample rate (written by the CAL button " + time.strftime("%Y-%m-%d %H:%M") +
-                ("" if gain_db is None else f", made at RF gain {gain_db:g} dB") + ")")
+                ("" if gain_db is None else f", made at RF gain {gain_db:g} dB") +
+                ("" if tone_hz is None else f" with a {tone_hz/1e6:g} MHz tone") + ")")
     for rate, val in sorted(cal_by_rate.items()):
         keep.append(make_row(f"cal_{int(round(rate))}", f"{val:.2f}"))
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -2648,19 +2649,45 @@ class EmcScanner(QtWidgets.QMainWindow):
     #     """Offset of the right (CISPR) axis relative to the left axis. The left axis is already dBuV."""
     #     return float(getattr(self, "cispr_offset_db", 0.0))
 
+    # ---- previous cispr_get_effective_offset() (right axis shifted by the correction instead), kept in case of problems ----
+#    def cispr_get_effective_offset(self):
+#        """
+#        Offset of the right (CISPR) axis relative to the left axis. The spinbox value is a
+#        CORRECTION added to the displayed level to get the quantity the limit is written in
+#        (antenna factor for Radiated, LISN / coupling-network loss for Conducted), so the
+#        right axis reads (left axis + correction): effective offset = -correction.
+#        """
+#        return -float(getattr(self, "cispr_offset_db", 0.0))
+
     def cispr_get_effective_offset(self):
         """
-        Offset of the right (CISPR) axis relative to the left axis. The spinbox value is a
-        CORRECTION added to the displayed level to get the quantity the limit is written in
-        (antenna factor for Radiated, LISN / coupling-network loss for Conducted), so the
-        right axis reads (left axis + correction): effective offset = -correction.
+        Offset of the right (CISPR) axis relative to the left axis. The antenna factor (Radiated) / LISN correction (Conducted) is now
+        ADDED DIRECTLY to the displayed values (see display_offset_for), so the trace is already in the units the limit is written in
+        and the two axes coincide: the offset is 0.
         """
-        return -float(getattr(self, "cispr_offset_db", 0.0))
+        return 0.0
 
     def cispr_axis_label(self):
         if getattr(self, "cispr_mode", "radiated") == "conducted":
             return "CISPR conducted (dBµV)"
         return "CISPR radiated (dBµV/m @10 m)"
+
+    # ---- previous cispr_refresh_corr_ui() (tooltip said the right axis was shifted), kept in case of problems ----
+#    def cispr_refresh_corr_ui(self):
+#        """Set the correction spinbox's label/tooltip for the current limit type."""
+#        try:
+#            if self.cispr_mode == "conducted":
+#                self.cispr_offset_label.setText("LISN corr.")
+#                self.cispr_offset_spin.setToolTip(
+#                    "Correction ADDED to the displayed level to get the level at the LISN measuring port "
+#                    "(e.g. the loss of a coupling network). The right axis reads left axis + this value.")
+#            else:
+#                self.cispr_offset_label.setText("Antenna factor")
+#                self.cispr_offset_spin.setToolTip(
+#                    "Antenna factor (plus cable loss), dB(1/m), ADDED to the displayed level to give field "
+#                    "strength in dBuV/m. The right axis reads left axis + this value.")
+#        except Exception:
+#            pass
 
     def cispr_refresh_corr_ui(self):
         """Set the correction spinbox's label/tooltip for the current limit type."""
@@ -2669,12 +2696,12 @@ class EmcScanner(QtWidgets.QMainWindow):
                 self.cispr_offset_label.setText("LISN corr.")
                 self.cispr_offset_spin.setToolTip(
                     "Correction ADDED to the displayed level to get the level at the LISN measuring port "
-                    "(e.g. the loss of a coupling network). The right axis reads left axis + this value.")
+                    "(e.g. the loss of a coupling network). The displayed values already include it, so the trace is compared directly with the limit line.")
             else:
                 self.cispr_offset_label.setText("Antenna factor")
                 self.cispr_offset_spin.setToolTip(
                     "Antenna factor (plus cable loss), dB(1/m), ADDED to the displayed level to give field "
-                    "strength in dBuV/m. The right axis reads left axis + this value.")
+                    "strength in dBuV/m. The displayed values already include it, so the trace is compared directly with the limit line.")
         except Exception:
             pass
 
@@ -4260,7 +4287,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cal_signals.progress.connect(self.survey_sync_controls)
         self.btn_cal_quick = QtWidgets.QPushButton("CAL...")
         self.btn_cal_quick.setToolTip(
-            "Calibrate the dB -> dBuV factor of EVERY sample rate: feed a 1.5 MHz sine of known amplitude; each rate is measured at "
+            "Calibrate the dB -> dBuV factor of EVERY sample rate: feed a sine of known frequency (default 1.5 MHz) and amplitude; each rate is measured at "
             "the RF gain set on the front panel and the best factor is worked out. Set the RF gain to about the value you will use for measurements first. "
             "You are asked before anything is applied or written to settings.csv.")
         self.btn_cal_quick.clicked.connect(self.cal_quick_open_dialog)
@@ -4955,7 +4982,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.continuous_when_idle()
 
     # ------------------------------------------------------------------------------------
-    # CAL button: one dB -> dBuV factor PER SAMPLE RATE, from a 1.5 MHz sine of known amplitude, at the RF gain set on the front panel
+    # CAL button: one dB -> dBuV factor PER SAMPLE RATE, from a sine of known frequency (default 1.5 MHz) and amplitude, at the RF gain set on the front panel
     # ------------------------------------------------------------------------------------
     # Each rate is tuned so the tone sits at several fixed positions in the block (+/-15 % and +/-30 % of the sample
     # rate from the block centre, inside the part the display keeps) and measured at the RF gain that is set on the
@@ -4979,14 +5006,23 @@ class EmcScanner(QtWidgets.QMainWindow):
         dlg.setWindowTitle("CAL - dB to dBuV factor for every sample rate")
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
-            f"Connect a {CAL_QUICK_TONE_HZ/1e6:g} MHz SINE WAVE of known amplitude to the SDR input (through the attenuator).\n"
+            "Connect a SINE WAVE of known amplitude and frequency to the SDR input (through the attenuator).\n"
             "The CAL is made at the RF gain set on the front panel, so set the RF Gain slider to about the value you will use\n"
             "for measurements BEFORE pressing CAL. Choose a sine level small enough not to overload the SDR at that gain: with\n"
             "the sine connected the tone should sit well below the red saturation line on the display (check with CONTINUOUS).\n"
-            "Enter the amplitude you are feeding in, and the attenuator that is fitted."))
+            "Enter the frequency and amplitude you are feeding in, and the attenuator that is fitted. The factor you get applies at\n"
+            "that frequency, so calibrate at a frequency in the part of the spectrum you will measure."))
         form = QtWidgets.QFormLayout()
         cal_gain = float(self.gain_db)                 # the CAL is made at this RF gain (front panel), not at 0 dB
         lbl_gain = QtWidgets.QLabel(f"<b>{cal_gain:g} dB</b>   (front-panel RF Gain - the CAL is made at this gain)")
+        sp_freq = QtWidgets.QDoubleSpinBox()
+        sp_freq.setLocale(SCOPE_LOCALE)
+        sp_freq.setRange(0.1, 1700.0)
+        sp_freq.setDecimals(4)
+        sp_freq.setSuffix(" MHz")
+        sp_freq.setValue(CAL_QUICK_TONE_HZ / 1e6)
+        sp_freq.setToolTip("Frequency of the test sine. Each sample rate is measured with the tone at several positions in the block,\n"
+                           "so the tuner must be able to tune below the tone: a low tone frequency cannot be used with the widest sample rates.")
         sp_vpp = QtWidgets.QDoubleSpinBox()
         sp_vpp.setLocale(SCOPE_LOCALE)
         sp_vpp.setRange(0.0001, 20.0)
@@ -5003,7 +5039,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                           "Set the front-panel Attenuator to the value you normally use, not to this one, after the CAL.")
         lbl_exp = QtWidgets.QLabel("")
         form.addRow("RF gain for the CAL", lbl_gain)
-        form.addRow(f"Amplitude of the {CAL_QUICK_TONE_HZ/1e6:g} MHz sine (at the attenuator input)", sp_vpp)
+        form.addRow("Frequency of the sine", sp_freq)
+        form.addRow("Amplitude of the sine (at the attenuator input)", sp_vpp)
         form.addRow("Attenuator fitted", sp_att)
         form.addRow("True level at the attenuator input", lbl_exp)
         lay.addLayout(form)
@@ -5023,6 +5060,14 @@ class EmcScanner(QtWidgets.QMainWindow):
         def chosen():
             return [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count()) if lst.item(i).checkState() == QtCore.Qt.Checked]
 
+        def positions(rate):
+            """Tone positions (fractions of the sample rate from the block centre) whose block centre is a legal tuner frequency."""
+            tone = sp_freq.value() * 1e6
+            return [fr for fr in CAL_POS_FRACTIONS if 50e3 < tone - fr * rate < 1.7e9]
+
+        def usable(rates):
+            return [r for r in rates if len(positions(r)) >= 2]
+
         def refresh(*_):
             exp = self.cal_expected_dbuv(sp_vpp.value())
             lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
@@ -5033,10 +5078,15 @@ class EmcScanner(QtWidgets.QMainWindow):
             if head < CAL_MIN_HEADROOM_DB + 2.0:
                 warn = f"   WARNING: only about {head:.0f} dB below ADC full scale at {cal_gain:g} dB gain - probably too large, lower the level"
             n_avg = self.avg_get_active_count()
-            tot = sum((0.12 + 0.15 + n_avg * (NFFT / r + 0.004)) * len(CAL_POS_FRACTIONS) * (CAL_QUICK_SCANS + 1) for r in chosen())
-            info.setText(f"About {at_sdr:.0f} dBuV reaches the SDR; estimated headroom {head:.0f} dB at {cal_gain:g} dB RF gain.{warn}\n{len(chosen())} rate(s) x {len(CAL_POS_FRACTIONS)} tone positions, "
-                         f"roughly {self.survey_fmt_seconds(tot)}. Averaging setting is used as-is.")
+            ok_rates = usable(chosen())
+            skipped = [r for r in chosen() if r not in ok_rates]
+            tot = sum((0.12 + 0.15 + n_avg * (NFFT / r + 0.004)) * len(positions(r)) * (CAL_QUICK_SCANS + 1) for r in ok_rates)
+            note = ("" if not skipped else "\nNot possible at this tone frequency (the block would reach below 50 kHz): " +
+                    ", ".join(f"{r/1e6:.3f}" for r in skipped) + " MS/s - they will be skipped.")
+            info.setText(f"About {at_sdr:.0f} dBuV reaches the SDR; estimated headroom {head:.0f} dB at {cal_gain:g} dB RF gain.{warn}\n"
+                         f"{len(ok_rates)} rate(s) to calibrate, roughly {self.survey_fmt_seconds(tot)}. Averaging setting is used as-is.{note}")
 
+        sp_freq.valueChanged.connect(refresh)
         sp_vpp.valueChanged.connect(refresh)
         sp_att.valueChanged.connect(refresh)
         lst.itemChanged.connect(refresh)
@@ -5051,9 +5101,17 @@ class EmcScanner(QtWidgets.QMainWindow):
         if not rates:
             self.log("CAL: no sample rate selected")
             return
-        combos = [(r, round(fr * r / 1e3, 3), cal_gain) for r in rates for fr in CAL_POS_FRACTIONS]
-        self.cal_start({"quick": True, "tone_hz": CAL_QUICK_TONE_HZ, "vpp": sp_vpp.value(), "atten": sp_att.value(),
-                        "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": CAL_WINDOW_HZ_DEFAULT,
+        tone = sp_freq.value() * 1e6
+        for r in rates:
+            if r not in usable(rates):
+                self.log(f"CAL: {r/1e6:.3f} MS/s skipped - at a {tone/1e6:g} MHz tone the block would reach below 50 kHz")
+        rates = usable(rates)
+        if not rates:
+            self.log("CAL: none of the chosen sample rates can be calibrated at this tone frequency")
+            return
+        combos = [(r, round(fr * r / 1e3, 3), cal_gain) for r in rates for fr in positions(r)]
+        self.cal_start({"quick": True, "tone_hz": tone, "vpp": sp_vpp.value(), "atten": sp_att.value(),
+                        "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": max(CAL_WINDOW_HZ_DEFAULT, 20e-6 * tone),
                         "use_band": False, "combos": combos, "scans": CAL_QUICK_SCANS, "path": "", "gain": cal_gain})
 
     def cal_quick_evaluate(self, c):
@@ -5071,6 +5129,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                 row["spread"] = float(max(vals) - min(vals))
                 row["head"] = float(fs_p - max(x["tone_p"] for x in rs))
                 row["snr"] = float(min(x["snr"] for x in rs))
+                row["npos"] = len(rs)
                 if row["head"] < CAL_MIN_HEADROOM_DB:
                     row["note"] = f"REJECTED: tone only {row['head']:.0f} dB below ADC full scale - reduce the input level"
                 elif row["snr"] < CAL_MIN_SNR_DB:
@@ -5079,6 +5138,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                     row["ok"] = True
                     row["note"] = "ok" if row["spread"] <= CAL_POS_SPREAD_WARN_DB else \
                         f"ok - level varies {row['spread']:.1f} dB with tone position in the block"
+                    if row["npos"] < len(CAL_POS_FRACTIONS):
+                        row["note"] += f" (only {row['npos']} of {len(CAL_POS_FRACTIONS)} tone positions possible at this frequency)"
             rows.append(row)
         return rows
 
@@ -5101,7 +5162,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         dlg.setWindowTitle("CAL result")
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
-            f"Sine {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, RF gain {c['gain']:g} dB.\n"
+            f"Sine {c['tone_hz']/1e6:g} MHz, {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, RF gain {c['gain']:g} dB.\n"
             f"'Old' is the factor in use now (the default {CAL_SDR_DB_TO_DBUV:g} where a rate has none of its own). "
             f"Headroom = dB below ADC full scale; SNR = dB above the noise."))
         txt = QtWidgets.QPlainTextEdit(table)
@@ -5135,7 +5196,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(f"CAL: {len(good)} per-rate factor(s) applied for this session (made at RF gain {c['gain']:g} dB)")
         if v == "save":
             try:
-                path = settings_write_cal(CAL_BY_RATE, c["gain"])
+                path = settings_write_cal(CAL_BY_RATE, c["gain"], c["tone_hz"])
                 self.log(f"CAL: saved to {path} (the previous file is kept as {path}.bak)")
             except Exception as e:
                 self.log(f"CAL: ERROR - could not write settings.csv: {e}")
@@ -5190,7 +5251,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         gain = float(applied if applied is not None else self.gain_db)
         if self.hf_mode:
             gain = 0.0
-        return self.sat_full_scale_p() + cal_reference_db() - gain + float(self.input_atten_db)
+        return self.sat_full_scale_p() + cal_reference_db() - gain + float(self.input_atten_db) + float(getattr(self, "cispr_offset_db", 0.0))
 
     def sat_update_lines(self):
         """GUI thread: place (or hide) the saturation lines. Called on every plot update and when the box is ticked."""
@@ -5698,11 +5759,12 @@ class EmcScanner(QtWidgets.QMainWindow):
         if getattr(self, "display_dbfs", False):
             return -self.sat_full_scale_p()
         g = 0.0 if self.hf_mode else float(gain)
-        return cal_for_rate(rate) - g + float(self.input_atten_db)
+        # the antenna factor (Radiated) / LISN correction (Conducted) is part of the displayed value
+        return cal_for_rate(rate) - g + float(self.input_atten_db) + float(getattr(self, "cispr_offset_db", 0.0))
 
     def dbfs_apply_labels(self):
         try:
-            self.plot.setLabel("left", "Level (dBFS)" if self.display_dbfs else "Level at input (dBµV)")
+            self.plot.setLabel("left", self.units_label())
             self.chk_cispr.setEnabled(not self.display_dbfs)
             self.chk_cispr.setToolTip("CISPR limits are in dBuV - not available while the display is in dBFS." if self.display_dbfs else "")
         except Exception:
@@ -5744,6 +5806,75 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.update_plot()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------------------------
+    # Antenna factor / LISN correction: part of the displayed values
+    # ------------------------------------------------------------------------------------
+    # The box next to "Show CISPR limit" is "Antenna factor" in Radiated mode and "LISN corr." in Conducted mode. Its value is ADDED to
+    # every displayed level, so the trace reads in dBuV/m (Radiated) or dBuV at the LISN measuring port (Conducted), and the limit line
+    # is drawn on the same scale (the right axis now coincides with the left). With 0 dB the display is plain dBuV at the attenuator
+    # input. Changing the value moves the trace, the waterfall colours, the reference trace and the saturation lines by the same amount
+    # (the view slides with them, so the same data stays on screen). It is ignored in dBFS mode. The CAL does not use it.
+
+    def corr_build_ui(self):
+        self._corr_last = float(self.cispr_offset_db)
+        self.cispr_offset_spin.valueChanged.connect(self.corr_changed)            # these run AFTER the existing handlers, which have
+        self.cispr_mode_combo.currentIndexChanged.connect(self.corr_changed)      # already stored the new value in cispr_offset_db
+        self.dbfs_apply_labels()
+
+    def units_label(self):
+        """Left-axis label for the current units."""
+        if getattr(self, "display_dbfs", False):
+            return "Level (dBFS)"
+        if abs(float(self.cispr_offset_db)) < 1e-9:
+            return "Level at input (dBµV)"
+        return "Level at LISN port (dBµV)" if self.cispr_mode == "conducted" else "Field strength (dBµV/m)"
+
+    def csv_level_name(self):
+        """Column name for SAVE CSV in the current units."""
+        if getattr(self, "display_dbfs", False):
+            return "level_dbfs"
+        if abs(float(self.cispr_offset_db)) < 1e-9:
+            return "level_dbuv"
+        return "level_dbuv_lisn" if self.cispr_mode == "conducted" else "level_dbuv_per_m"
+
+    def corr_changed(self, *_):
+        """GUI thread: the antenna factor / LISN correction (or the Radiated / Conducted choice) changed."""
+        new = float(self.cispr_offset_db)
+        old = float(self._corr_last)
+        if abs(new - old) < 1e-9:
+            return
+        self._corr_last = new
+        self.dbfs_apply_labels()
+        if getattr(self, "display_dbfs", False):
+            return                                        # corrections are ignored in dBFS: nothing on screen moves
+        delta = new - old                                 # how far every displayed level moves
+        try:
+            vb = self.plot.getViewBox()
+            y0, y1 = vb.viewRange()[1]
+            vb.setYRange(y0 + delta, y1 + delta, padding=0)
+        except Exception:
+            pass
+        if getattr(self, "_wf_buf", None) is not None:   # waterfall history: every row moves by the same amount
+            self._wf_buf = self._wf_buf + np.float32(delta)
+            if self._wf_levels is not None:
+                self._wf_levels = (self._wf_levels[0] + delta, self._wf_levels[1] + delta)
+            for sp in (self.wf_sp_lo, self.wf_sp_hi):
+                sp.blockSignals(True)
+                sp.setValue(sp.value() + delta)
+                sp.blockSignals(False)
+            self.wf_redraw()
+        if getattr(self, "reference_power", None) is not None:      # the captured reference trace moves too
+            try:
+                self.reference_power = np.asarray(self.reference_power, dtype=np.float64) + delta
+                self.reference_curve.setData(self.reference_freq, self.reference_power)
+            except Exception:
+                pass
+        self.sat_update_lines()
+        try:
+            self.update_plot()
+        except Exception:
+            pass
     # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
 #    def survey_connect_signals(self):
 #        self.survey_signals = SurveySignals()
@@ -5768,6 +5899,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sat_build_ui()                # optional ADC saturation lines on the display
         self.wf_build_ui()                 # optional waterfall below the graph
         self.dbfs_build_ui()               # optional dBFS display (no calibration)
+        self.corr_build_ui()               # antenna factor / LISN correction applied to the displayed values
 
     def survey_sync_controls(self):
         """GUI thread: show the settings of the survey test now running on the Sample Rate box, the RF Gain
@@ -9898,7 +10030,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             # No reference captured - unchanged behaviour from before.
             data = np.column_stack((f, p))
             # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
-            np.savetxt(path, data, delimiter=",", header=("freq_hz,level_dbfs" if self.display_dbfs else "freq_hz,level_dbuv"), comments="")
+            np.savetxt(path, data, delimiter=",", header="freq_hz," + self.csv_level_name(), comments="")
             self.log(f"Saved live trace ({len(f)} points) to {path}")
             return
 
@@ -9912,7 +10044,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         n = max(len(f), len(rf))
         with open(path, "w", newline="") as fh:
             # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
-            fh.write("freq_hz,level_dbfs,ref_freq_hz,ref_level_dbfs\n" if self.display_dbfs else "freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
+            fh.write("freq_hz,%s,ref_freq_hz,ref_%s\n" % (self.csv_level_name(), self.csv_level_name()))
             for i in range(n):
                 a = f"{f[i]:.6f}" if i < len(f) else ""
                 b = f"{p[i]:.3f}" if i < len(p) else ""
