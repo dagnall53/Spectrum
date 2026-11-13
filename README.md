@@ -17,6 +17,7 @@ It was written for investigating emissions (for example from marine electronics)
 - Optional CISPR limit line (radiated or conducted).
 - **Per-sample-rate dB to dBµV calibration** using the CAL button.
 - Optional **ADC saturation line** that warns when the input is close to overloading the SDR.
+- Optional **dBFS display** that ignores all calibration and shows the raw level relative to ADC full scale.
 - Optional **waterfall** below the graph, to show effects that repeat or come and go.
 - Test modes: **Single Frequency**, **Stitch Check**, **Gain/Rate Survey**, **CAL Survey** and a **Baseband Scope**.
 
@@ -62,9 +63,10 @@ The DLL and driver choice is made in `settings.csv` (see below). The code was or
 | SAVE CSV | Save the spectrum |
 | Show CISPR limit | Show the CISPR limit line (radiated dBµV/m at 10 m, or conducted dBµV) |
 | Time Averaging | Average several captures per block |
-| Show Freq Markers | Show the green (raw block) and cyan dashed (kept block) edges |
+| Show Freq Markers | Show the green (raw block) and cyan dashed (kept block) edges. Off at start-up |
 | Capture Reference / Show Reference | Store the current trace (for example the system noise with the equipment off) and show it for comparison only. Nothing is subtracted |
-| Show ADC saturation line | See [Saturation line](#adc-saturation-line) |
+| Show ADC saturation line | See [Saturation line](#adc-saturation-line). Off at start-up |
+| Display in dBFS | Show levels relative to ADC full scale, with no calibration. See [dBFS display](#dbfs-display) |
 | Show waterfall | Show a spectrum history below the graph. See [Waterfall](#waterfall) |
 | BASEBAND SCOPE | Time-domain view of the input from DC to half the sample rate. The button changes to *BACK TO SPECTRUM* |
 
@@ -89,7 +91,9 @@ preset,LF2,150k-2M 3.2,150k,2M,3.2M,40.2,off,-47
 setting,dc_offset_removal,on
 setting,iq_balance_correction,on
 setting,driver,default
-setting,saturation_line,on
+setting,saturation_line,off
+setting,display_dbfs,off
+setting,y_span_above_floor_db,60
 setting,saturation_margin_db,10
 ```
 
@@ -100,7 +104,9 @@ setting,saturation_margin_db,10
 | `driver` | `default`, `ms64`, `sdrsharp`, `experimental`, a folder name under the driver root, or a full path |
 | `driver_root` | Folder that holds the driver sub-folders (optional) |
 | `driver_dialog` | `on` to be asked which driver to use at start-up |
-| `saturation_line` | Show the ADC saturation line at start-up (default on) |
+| `saturation_line` | Show the ADC saturation line at start-up (default off) |
+| `display_dbfs` | Start with the display in dBFS (default off, meaning dBµV) |
+| `y_span_above_floor_db` | Height of the graph, in dB, above the lowest level measured when a mode is selected (default 60) |
 | `saturation_margin_db` | Distance of the orange warning line below full scale (default 10) |
 | `waterfall` | Show the waterfall at start-up (default off) |
 | `waterfall_rows` | Rows of history kept in the waterfall (default 150) |
@@ -149,9 +155,19 @@ When **Show ADC saturation line** is ticked:
 
 A peak at or above the orange line is not a trustworthy level, and above the red line the SDR is clipping. Reduce the RF gain or add attenuation. The line is a guide for single spikes: a very strong signal outside the displayed band, or many signals adding together, can overload the SDR without any one spike reaching it.
 
+## dBFS display
+
+Tick **Display in dBFS** to show every level in dB relative to ADC full scale. A full-scale sine reads 0 dBFS in its peak bin. In this mode the dB-to-dBµV factors, the RF gain compensation and the attenuator are all **ignored**, so you see the raw level at the SDR output, and changing the RF gain moves the trace. The saturation line becomes simply 0 dBFS (red), with the orange line 10 dB below it. The CISPR limit is in dBµV, so it is switched off in this mode.
+
+When you switch units the graph keeps showing the same data, the waterfall history and any captured reference trace are cleared (they were in the old units), and **SAVE CSV** labels its column `level_dbfs`.
+
+## Graph view
+
+When you select a mode, the first complete sweep sets the graph's view. The frequency axis covers the mode's range, and the level axis starts just under the lowest level measured and reaches `y_span_above_floor_db` (60 dB by default) above it. After that the view is yours, and zooming or panning is not undone until you pick another mode.
+
 ## Waterfall
 
-Tick **Show waterfall** and a panel appears below the graph. It shows the spectrum history with the **newest row at the top**, coloured by level in dBµV (same calibration as the trace). Its frequency axis is linked to the main graph, so zooming or panning either one moves both.
+Tick **Show waterfall** and a panel appears below the graph. **Drag the thin bar between the graph and the waterfall** to change how tall each one is. It shows the spectrum history with the **newest row at the top**, coloured by level in dBµV (same calibration as the trace). Its frequency axis is linked to the main graph, so zooming or panning either one moves both.
 
 There are two kinds of row:
 
@@ -164,13 +180,13 @@ Other controls:
 |---|---|
 | Rows | How many rows of history to keep (20 to 2000) |
 | Auto colours | Picks the colour range from the data. Untick it to set the bottom and top dBµV yourself |
-| Clear | Empties the history. It also clears itself when the band, sample rate or row type changes |
+| Clear | Empties the history. It also clears itself when the band (or, for fast rows, the centre frequency) changes, or when you switch between dBµV and dBFS. Changing the sample rate or the RF gain does **not** clear it |
 
 Very wide bands are reduced to at most 4096 columns by taking the peak of each group of bins, so narrow spikes still show. Set the defaults with `setting,waterfall,on|off` and `setting,waterfall_rows,150` in `settings.csv`.
 
 ## Other test modes
 
-- **STITCH CHECK** sweeps the band twice, the second time with every block shifted by half a block, and compares the two. Real signals look the same both times. Anything that depends on where a frequency falls in a block (LO or DC leakage, images, filter edges) differs and is shaded magenta.
+- **STITCH CHECK** (the overlay tick box next to it is off at start-up) sweeps the band twice, the second time with every block shifted by half a block, and compares the two. Real signals look the same both times. Anything that depends on where a frequency falls in a block (LO or DC leakage, images, filter edges) differs and is shaded magenta.
 - **GAIN/RATE SURVEY...** steps automatically through sample rates and RF gains on the current band and writes one HTML report. It is for finding which spectrum features are caused by the sample rate and which by the gain stages, and which signals are consistently sensed.
 - **BASEBAND SCOPE** shows the time-domain signal. Because the receiver has a high-pass response, treat it as a "pseudo-scope" for signals from about 100 kHz up to half the sample rate.
 

@@ -230,7 +230,7 @@ def _parse_bool(text):
 SETTINGS_EXTRA = {}
 # (previous: _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog"))
 _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog",
-                   "saturation_line", "saturation_margin_db", "waterfall", "waterfall_rows")   # (plus cal_<sample rate Hz> rows)
+                   "saturation_line", "saturation_margin_db", "waterfall", "waterfall_rows", "y_span_above_floor_db", "display_dbfs")   # (plus cal_<sample rate Hz> rows)
 
 
 # ---- previous load_settings() (warned about cal_ rows), kept in case of problems ----
@@ -436,8 +436,8 @@ for _k, _v in SETTINGS_EXTRA.items():
 if CAL_BY_RATE:
     print("settings: per-sample-rate dB->dBuV factors: " + ", ".join(f"{r/1e6:g} MS/s = {v:.2f}" for r, v in sorted(CAL_BY_RATE.items())))
 
-# ADC saturation line on the display (settings.csv:  setting,saturation_line,on|off   setting,saturation_margin_db,10)
-SATURATION_LINE = _setting_bool("saturation_line", True)
+# ADC saturation line on the display, off unless asked for (settings.csv:  setting,saturation_line,on|off   setting,saturation_margin_db,10)
+SATURATION_LINE = _setting_bool("saturation_line", False)
 try:
     SATURATION_MARGIN_DB = float(SETTINGS_EXTRA.get("saturation_margin_db") or 10.0)
 except ValueError:
@@ -518,6 +518,19 @@ except ValueError:
     print(f"settings: warning - waterfall_rows = {SETTINGS_EXTRA.get('waterfall_rows')!r} is not a number - using 150")
     WATERFALL_ROWS = 150
 
+
+# Initial Y range of the graph when a mode is selected: from just under the lowest level measured up to this many dB above it
+# (settings.csv:  setting,y_span_above_floor_db,60)
+Y_MARGIN_BELOW_FLOOR_DB = 3.0
+try:
+    Y_SPAN_ABOVE_FLOOR_DB = max(3.0, float(SETTINGS_EXTRA.get("y_span_above_floor_db") or 60.0))
+except ValueError:
+    print(f"settings: warning - y_span_above_floor_db = {SETTINGS_EXTRA.get('y_span_above_floor_db')!r} is not a number - using 60")
+    Y_SPAN_ABOVE_FLOOR_DB = 60.0
+
+# Display units at start-up (settings.csv:  setting,display_dbfs,on|off). dBFS = level relative to ADC full scale at the SDR output,
+# with NO calibration: the dB -> dBuV factors, RF gain and attenuator are all ignored. Default off (dBuV at the attenuator input).
+DISPLAY_DBFS = _setting_bool("display_dbfs", False)
 # Any preset sample rate that is not already offered gets added to the live Sample Rate
 # dropdown, so the combo can always display the active preset's rate.
 SAMPLE_RATE_CHOICES = sorted(set(SAMPLE_RATE_CHOICES) | {p[4] for p in PRESETS} | {SAMPLE_RATE})
@@ -1319,6 +1332,28 @@ WF_DEFAULT_ROWS = 150              # history depth (rows) unless settings.csv sa
 class WaterfallSignals(QtCore.QObject):
     # worker thread -> GUI thread: new waterfall rows
     rows = QtCore.pyqtSignal(object, object, str, float)   # freqs (Hz), rows (n x bins, NEWEST FIRST, dBuV), kind, seconds per row
+
+
+
+class VisibilityFilter(QtCore.QObject):
+    """Event filter: calls back when the watched widget is explicitly shown or hidden (ShowToParent / HideToParent, which -
+    unlike Show / Hide - are NOT sent when only a parent is shown or hidden, so there is no feedback loop)."""
+    def __init__(self, callback, parent=None):
+        super().__init__(parent)
+        self._cb = callback
+
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QtCore.QEvent.ShowToParent, QtCore.QEvent.HideToParent):
+            try:
+                self._cb()
+            except Exception:
+                pass
+        return False
+
+
+class ViewSignals(QtCore.QObject):
+    # worker thread -> GUI thread: set the graph's X / Y range (a NaN Y range means "leave Y alone")
+    apply = QtCore.pyqtSignal(float, float, float, float)
 
 
 # ---- Baseband SCOPE defaults (see the EmcScanner.scope_* methods) ----
@@ -2353,6 +2388,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.survey_connect_signals()      # survey runs on the worker thread and reports back by signal
         self.stitch_build_ui(left_layout)  # STITCH CHECK button: is a feature real or made by the block layout?
         self.single_build_ui(left_layout)  # SINGLE FREQUENCY mode: button above the ranges + digit selector under the gain row
+        self.layout_tidy(left_layout)      # compact front panel: 2-line message box, waterfall splitter, regrouped buttons
 
 
 
@@ -2594,14 +2630,13 @@ class EmcScanner(QtWidgets.QMainWindow):
 #        return CAL_SDR_DB_TO_DBUV - gain + float(self.input_atten_db)
 
     def cal_total_offset_db(self):
-        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator. The dB -> dBuV factor is
-        the one for the sample rate in use (per-rate values from settings.csv / the CAL button, else the default)."""
+        """dB to ADD to a stored 'SDR dB' value to get the displayed level: in dBuV mode dBuV at the INPUT of the external attenuator
+        (the dB -> dBuV factor of the sample rate in use, minus the RF gain, plus the attenuator); in dBFS mode simply dB relative to
+        ADC full scale with no calibration at all."""
         applied = getattr(self, "_applied_gain_db", None)
         gain = float(applied if applied is not None else self.gain_db)
-        if self.hf_mode:
-            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by the dB -> dBuV factors)
         rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
-        return cal_for_rate(rate) - gain + float(self.input_atten_db)
+        return self.display_offset_for(rate, gain)
 
     def atten_on_changed(self, val):
         """Attenuator spinbox -> model; redraw the stored trace at the new calibration."""
@@ -3326,12 +3361,19 @@ class EmcScanner(QtWidgets.QMainWindow):
     # ---- clean pass to the waterfall (when it is switched on). Everything that called sweep_loop() still does.
     def sweep_loop(self):
         seq0 = self._pass_seq
+        key0 = self.view_band_key() if hasattr(self, "view_signals") else None     # band as it was when this pass started
         self._sweep_loop_orig()
-        if getattr(self, "wf_enabled", False) and self._pass_seq != seq0:
-            try:
-                self.wf_note_pass(self._last_pass)
-            except Exception as e:
-                print(f"waterfall: could not add a row: {e!r}")
+        if self._pass_seq != seq0:
+            if key0 is not None:
+                try:
+                    self.view_note_pass(self._last_pass, key0)                      # first pass in a new band: set the graph's view
+                except Exception as e:
+                    print(f"view: could not set the initial range: {e!r}")
+            if getattr(self, "wf_enabled", False):
+                try:
+                    self.wf_note_pass(self._last_pass)
+                except Exception as e:
+                    print(f"waterfall: could not add a row: {e!r}")
 
     def _sweep_loop_orig(self):    # (was: def sweep_loop(self):)
         # Clear the restart request BEFORE reading the live settings below: a change made
@@ -5140,7 +5182,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         return 10.0 * math.log10(0.25 / (128.0 ** 2)) + float(self._psd_to_dbuv_const)
 
     def sat_full_scale_display(self):
-        """Displayed dBuV at which a single tone reaches ADC full scale, at the current RF gain and attenuator."""
+        """Displayed level at which a single tone reaches ADC full scale: 0 dBFS in dBFS mode, else dBuV at the current RF gain
+        and attenuator."""
+        if getattr(self, "display_dbfs", False):
+            return 0.0
         applied = getattr(self, "_applied_gain_db", None)
         gain = float(applied if applied is not None else self.gain_db)
         if self.hf_mode:
@@ -5162,6 +5207,8 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     def cal_label_text(self):
         """Text of the front-panel 'Cal:' label for the sample rate in use."""
+        if getattr(self, "display_dbfs", False):
+            return "Cal: off (dBFS)"
         rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
         return f"Cal: {cal_for_rate(rate):+.1f} dB" + ("" if cal_has_rate(rate) else " (default)")
 
@@ -5280,7 +5327,18 @@ class EmcScanner(QtWidgets.QMainWindow):
         if on:
             self._wf_last_t = None
             QtCore.QTimer.singleShot(60, self.wf_sync_axes)
+            QtCore.QTimer.singleShot(0, self.wf_first_sizes)
             self.log("Waterfall on" + (" (fast rows need single-frequency mode)" if self.wf_chk_fast.isChecked() else ""))
+
+    def wf_first_sizes(self):
+        """First time the waterfall is shown: give it about 40 % of the height. After that the user's splitter position is kept."""
+        sp = getattr(self, "wf_split", None)
+        if sp is None or getattr(self, "_wf_sized", True):
+            return
+        self._wf_sized = True
+        total = sp.height()
+        if total > 100:
+            sp.setSizes([int(total * 0.6), int(total * 0.4)])
 
     def wf_on_fast_toggled(self, on):
         self.wf_fast = bool(on)
@@ -5344,10 +5402,10 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         order = np.argsort(f)
         f, p = f[order], p[order]
-        gain = 0.0 if self.hf_mode else float(lp["gain"])
-        p = p + cal_for_rate(lp["rate"]) - gain + float(self.input_atten_db)       # SDR dB -> dBuV at the attenuator input
+        p = p + self.display_offset_for(lp["rate"], lp["gain"])                    # SDR dB -> the display's units (dBuV or dBFS)
         f, p = self.wf_reduce(f, p)
-        self.wf_signals.rows.emit(f, p[None, :].astype(np.float32), "pass", float(self._wf_dt_ema or 1.0))
+        kind = f"pass:{self.START_FREQ:.0f}-{self.STOP_FREQ:.0f}"          # a new band starts a new history; a new rate / gain does not
+        self.wf_signals.rows.emit(f, p[None, :].astype(np.float32), kind, float(self._wf_dt_ema or 1.0))
 
     def wf_fast_capture(self):
         """WORKER thread (called after each pass in continuous mode): in single-frequency mode with Fast rows on, read one
@@ -5372,7 +5430,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         f = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / rate)) + centre
         f, db = self.wf_reduce(f, db)
         rows = np.vstack([db[::-1], np.full((1, db.shape[1]), np.nan)]).astype(np.float32)   # newest first, then a dark separator
-        self.wf_signals.rows.emit(f, rows, "fast", float(NFFT) / rate)
+        self.wf_signals.rows.emit(f, rows, f"fast:{centre:.0f}", float(NFFT) / rate)    # a new centre starts a new history; a new rate does not
 
     def wf_on_rows(self, f, rows, kind, dt):
         """GUI thread: add rows (newest first) to the history and redraw."""
@@ -5383,15 +5441,18 @@ class EmcScanner(QtWidgets.QMainWindow):
         if rows.ndim == 1:
             rows = rows[None, :]
         cap = int(self.wf_spin_rows.value())
-        nx = f.size
-        df = abs(f[1] - f[0]) if nx > 1 else 1.0
-        same = (self._wf_f is not None and self._wf_f.size == nx and kind == self._wf_kind and
-                abs(self._wf_f[0] - f[0]) < 0.6 * df and abs(self._wf_f[-1] - f[-1]) < 0.6 * df)
-        if not same or self._wf_buf is None:
-            self._wf_buf = np.full((cap, nx), np.nan, dtype=np.float32)
+        if self._wf_buf is None or kind != self._wf_kind or self._wf_f is None:
+            # first rows, or a different band / centre / row type: start a new history
+            self._wf_buf = np.full((cap, f.size), np.nan, dtype=np.float32)
             self._wf_f = f
             self._wf_kind = kind
             self._wf_levels = None
+        elif f.size != self._wf_f.size or abs(f[0] - self._wf_f[0]) > 1e-3 or abs(f[-1] - self._wf_f[-1]) > 1e-3:
+            # same band, but the bins are laid out differently (the sample rate changed): fit the new rows to the history's
+            # frequency grid instead of clearing it
+            rows = self.wf_to_grid(f, rows, self._wf_f)
+            f = self._wf_f
+        nx = f.size
         n = rows.shape[0]
         old = self._wf_buf
         if old.shape[0] != cap:                                   # history depth changed: keep what fits
@@ -5405,6 +5466,22 @@ class EmcScanner(QtWidgets.QMainWindow):
             self._wf_buf = np.concatenate([self._wf_buf, pad], axis=0)
         self._wf_dt = max(float(dt), 1e-6)
         self.wf_redraw()
+
+    @staticmethod
+    def wf_to_grid(f_new, rows, f_grid):
+        """Fit rows (n x len(f_new)) to the frequency grid f_grid. Where the new bins are much finer, take the peak of each
+        group first so narrow spikes survive; where the new rows do not cover the grid the result is NaN (shown dark)."""
+        d_new = abs(f_new[1] - f_new[0]) if f_new.size > 1 else 1.0
+        d_grid = abs(f_grid[1] - f_grid[0]) if f_grid.size > 1 else 1.0
+        g = int(d_grid // d_new)
+        if g >= 2:
+            m = (f_new.size // g) * g
+            f_new = f_new[:m].reshape(-1, g).mean(axis=1)
+            rows = np.fmax.reduce(rows[:, :m].reshape(rows.shape[0], -1, g), axis=2)
+        out = np.full((rows.shape[0], f_grid.size), np.nan, dtype=np.float32)
+        for i in range(rows.shape[0]):
+            out[i] = np.interp(f_grid, f_new, rows[i], left=np.nan, right=np.nan)
+        return out
 
     def wf_redraw(self):
         """GUI thread: draw the history buffer (levels, image placement, time axis)."""
@@ -5451,6 +5528,222 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.wf_img.setTransform(tr)
         self.wf_plot.setYRange(0.0, float(cap), padding=0.0)
         self.wf_plot.getAxis("left").setScale(self._wf_dt)         # tick values in seconds ago
+    # ------------------------------------------------------------------------------------
+    # Front-panel tidy-up (called once at the end of __init__, after every builder has run)
+    # ------------------------------------------------------------------------------------
+    # * the message box is two lines high, to leave the room to the graph and the waterfall
+    # * the waterfall and the graph share a vertical splitter: drag the thin bar between them to set the height
+    # * the RF Gain slider is shorter; BASEBAND SCOPE joins GAIN/RATE SURVEY, CAL and CAL SURVEY on the gain row
+    # * STITCH CHECK (and its overlay tick box) joins the Show Freq Markers / Reference row
+    # * those buttons, and Capture Reference, are all one size
+
+    def layout_tidy(self, left_layout):
+        self.view_init()
+        # 0. these three start switched off (the tick boxes can be turned on at any time; the saturation line also has a
+        #    settings.csv default)
+        self.chk_markers.setChecked(False)
+        self.chk_stitch_show.setChecked(False)
+        # 1. message box: two lines
+        fm = self.debug.fontMetrics()
+        h = 2 * fm.lineSpacing() + 2 * self.debug.frameWidth() + int(2 * self.debug.document().documentMargin()) + 2
+        self.debug.setMinimumHeight(h)
+        self.debug.setMaximumHeight(h)
+
+        # 2. graph + waterfall in a vertical splitter
+        self.wf_install_splitter(left_layout)
+
+        # 3. gain row: shorter slider, BASEBAND SCOPE moved in from its own row
+        self.gain_slider.setMinimumWidth(110)
+        self.gain_slider.setMaximumWidth(170)
+        rf = self.find_layout_with(self.btn_survey)
+        old = self.find_layout_with(self.btn_scope)
+        if rf is not None and old is not None and old is not rf:
+            old.removeWidget(self.btn_scope)
+            rf.addWidget(self.btn_scope)
+            rf.addStretch(1)
+            # the scope read-out line belonged to the scope button's row; it is only meaningful in scope mode, so it now sits
+            # at the top of the scope controls (which are only visible then) and the empty row disappears
+            old.removeWidget(self.scope_status)
+            vb = self.scope_ctrl_widget.layout()
+            if vb is not None:
+                vb.insertWidget(0, self.scope_status)
+            try:
+                left_layout.removeItem(old)
+            except Exception:
+                pass
+
+        # 4. STITCH CHECK + overlay tick box -> the Show Freq Markers row
+        mk = self.find_layout_with(self.chk_markers)
+        st = self.find_layout_with(self.btn_stitch)
+        if mk is not None and st is not None and st is not mk:
+            st.removeWidget(self.btn_stitch)
+            st.removeWidget(self.chk_stitch_show)
+            mk.addWidget(self.btn_stitch)
+            mk.addWidget(self.chk_stitch_show)
+            try:
+                st.removeWidget(self.stitch_label)
+                left_layout.removeItem(st)
+                left_layout.addWidget(self.stitch_label)      # its own line, only has text after a stitch check
+            except Exception:
+                pass
+
+        # 5. one size for all of these buttons
+        btns = [self.btn_scope, self.btn_survey, self.btn_cal_quick, self.btn_cal, self.btn_stitch, self.btn_capture_ref]
+        w = max(b.sizeHint().width() for b in btns)
+        hh = max(b.sizeHint().height() for b in btns)
+        for b in btns:
+            b.setFixedSize(w, hh)
+
+    def wf_install_splitter(self, left_layout):
+        """Put the graph and the waterfall in one vertical splitter so the waterfall's height is adjustable."""
+        idx = left_layout.indexOf(self.plot)
+        if idx < 0:
+            return
+        self.wf_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.wf_split.setChildrenCollapsible(False)
+        self.wf_split.setHandleWidth(7)
+        self.wf_split.setToolTip("")
+        self.wf_split.setStyleSheet("QSplitter::handle { background: #c4c8cc; margin: 1px 0; } QSplitter::handle:hover { background: #7f9db5; }")
+        left_layout.removeWidget(self.wf_box)
+        left_layout.removeWidget(self.plot)
+        self.wf_split.addWidget(self.plot)
+        self.wf_split.addWidget(self.wf_box)
+        self.wf_split.setStretchFactor(0, 3)
+        self.wf_split.setStretchFactor(1, 2)
+        left_layout.insertWidget(idx, self.wf_split, 3)
+        self._wf_sized = False
+        # scope mode hides self.plot: hide the whole splitter then (otherwise the waterfall would stay on screen)
+        self._wf_vis_filter = VisibilityFilter(lambda: self.wf_split.setVisible(not self.plot.isHidden()), self)
+        self.plot.installEventFilter(self._wf_vis_filter)
+
+    # ------------------------------------------------------------------------------------
+    # Initial view of the graph when a mode is selected
+    # ------------------------------------------------------------------------------------
+    # The first complete pass in a new band sets the X axis to the mode's frequency range and the Y axis to start just under the
+    # lowest level measured (0.5 percentile, so one odd bin does not decide it) and to reach Y_SPAN_ABOVE_FLOOR_DB above it
+    # (default 60 dB; settings.csv  setting,y_span_above_floor_db,60). After that the view is the user's: zoom and pan freely.
+    # In single-frequency mode a new centre or sample rate only re-sets X (the spectrum moves with the centre); Y is left alone.
+
+    def view_init(self):
+        self._view_key = None
+        self.view_signals = ViewSignals()
+        self.view_signals.apply.connect(self.view_apply)
+
+    def view_band_key(self):
+        single = bool(getattr(self, "single_mode", False))
+        return (round(float(self.START_FREQ)), round(float(self.STOP_FREQ)), single,
+                round(float(self.SAMPLE_RATE)) if single else 0)
+
+    def view_note_pass(self, lp, key0):
+        """WORKER thread: called after each finished clean pass with the band key taken before the pass started."""
+        if lp is None or key0 == getattr(self, "_view_key", ()) or self._survey is not None or self._stitch is not None:
+            return
+        if getattr(self, "view_signals", None) is None:
+            return
+        f = np.asarray(lp["f"], dtype=np.float64)
+        p = np.asarray(lp["p"], dtype=np.float64)
+        ok = np.isfinite(f) & np.isfinite(p)
+        if ok.sum() < 20:
+            return
+        prev = self._view_key
+        self._view_key = key0
+        single = key0[2]
+        x0, x1 = (float(f[ok].min()), float(f[ok].max())) if single else (float(key0[0]), float(key0[1]))
+        if single and prev is not None and prev[2]:
+            ylo = yhi = float("nan")                 # only the centre / rate changed: keep the user's Y range
+        else:
+            disp = p[ok] + self.display_offset_for(lp["rate"], lp["gain"])
+            floor = float(np.percentile(disp, 0.5))
+            ylo, yhi = floor - Y_MARGIN_BELOW_FLOOR_DB, floor + Y_SPAN_ABOVE_FLOOR_DB
+        self.view_signals.apply.emit(x0, x1, ylo, yhi)
+
+    def view_apply(self, x0, x1, ylo, yhi):
+        """GUI thread: set the graph's view (this also stops the X auto-range, so the view stays where the user puts it)."""
+        if x1 > x0:
+            self.plot.setXRange(x0, x1, padding=0.01)
+        if ylo == ylo and yhi == yhi and yhi > ylo:
+            self.plot.setYRange(ylo, yhi, padding=0)
+        try:
+            self.cispr_update_curve()                # bring the right-hand CISPR axis into step
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------------------------
+    # dBFS display option
+    # ------------------------------------------------------------------------------------
+    # "Display in dBFS" switches every level shown to dB relative to ADC full scale (a full-scale sine reads 0 dBFS in its peak bin),
+    # ignoring the dB -> dBuV calibration, the RF gain compensation and the attenuator. The raw SDR-output level is what you see,
+    # so changing the RF gain moves the trace. The saturation line becomes simply 0 dBFS (and the orange line below it). CISPR limit lines
+    # are in dBuV and are therefore switched off in this mode. The waterfall history and the captured reference trace were in the old
+    # units, so they are cleared when the units are changed.
+
+    def dbfs_build_ui(self):
+        self.display_dbfs = bool(DISPLAY_DBFS)
+        self.chk_dbfs = QtWidgets.QCheckBox("Display in dBFS")
+        self.chk_dbfs.setToolTip(
+            "Show levels in dB relative to ADC full scale (0 dBFS = a full-scale sine), ignoring the dB-to-dBuV calibration,\n"
+            "the RF gain compensation and the attenuator. Clips at 0 dBFS. CISPR limits are dBuV, so they are switched off.\n"
+            "Default: settings.csv  setting,display_dbfs,on|off")
+        sub = self.find_layout_with(self.chk_markers)
+        if sub is not None:
+            sub.addWidget(self.chk_dbfs)
+        else:
+            self.centralWidget().layout().addWidget(self.chk_dbfs)
+        self.chk_dbfs.setChecked(self.display_dbfs)
+        self.chk_dbfs.toggled.connect(self.dbfs_on_toggled)
+        self.dbfs_apply_labels()
+
+    def display_offset_for(self, rate, gain):
+        """dB to ADD to a stored 'SDR dB' value for the display in the current units."""
+        if getattr(self, "display_dbfs", False):
+            return -self.sat_full_scale_p()
+        g = 0.0 if self.hf_mode else float(gain)
+        return cal_for_rate(rate) - g + float(self.input_atten_db)
+
+    def dbfs_apply_labels(self):
+        try:
+            self.plot.setLabel("left", "Level (dBFS)" if self.display_dbfs else "Level at input (dBµV)")
+            self.chk_cispr.setEnabled(not self.display_dbfs)
+            self.chk_cispr.setToolTip("CISPR limits are in dBuV - not available while the display is in dBFS." if self.display_dbfs else "")
+        except Exception:
+            pass
+
+    def dbfs_on_toggled(self, on):
+        rate = getattr(self, "_applied_sample_rate", None) or self.SAMPLE_RATE
+        applied = getattr(self, "_applied_gain_db", None)
+        gain = float(applied if applied is not None else self.gain_db)
+        self.display_dbfs = False
+        off_dbuv = self.display_offset_for(rate, gain)
+        self.display_dbfs = True
+        off_dbfs = self.display_offset_for(rate, gain)
+        self.display_dbfs = bool(on)
+        delta = (off_dbfs - off_dbuv) if on else (off_dbuv - off_dbfs)      # how far every displayed level moves
+        try:
+            vb = self.plot.getViewBox()
+            y0, y1 = vb.viewRange()[1]
+            vb.setYRange(y0 + delta, y1 + delta, padding=0)                  # keep the same data in view
+        except Exception:
+            pass
+        if on and self.chk_cispr.isChecked():
+            self.chk_cispr.setChecked(False)
+        self.dbfs_apply_labels()
+        self.wf_clear()
+        if getattr(self, "reference_power", None) is not None:
+            self.reference_power = None
+            self.reference_freq = None
+            try:
+                self.reference_curve.setData([], [])
+                self.reference_curve.setVisible(False)
+            except Exception:
+                pass
+            self.log("Reference trace cleared (the display units changed)")
+        self.log("Display units: " + ("dBFS (no calibration applied)" if on else "dBuV at the attenuator input"))
+        self.update_status_panel()
+        self.sat_update_lines()
+        try:
+            self.update_plot()
+        except Exception:
+            pass
     # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
 #    def survey_connect_signals(self):
 #        self.survey_signals = SurveySignals()
@@ -5474,6 +5767,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cal_build_ui()                # CAL and CAL SURVEY buttons + signals: known-tone calibration
         self.sat_build_ui()                # optional ADC saturation lines on the display
         self.wf_build_ui()                 # optional waterfall below the graph
+        self.dbfs_build_ui()               # optional dBFS display (no calibration)
 
     def survey_sync_controls(self):
         """GUI thread: show the settings of the survey test now running on the Sample Rate box, the RF Gain
@@ -9532,6 +9826,54 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_update_curve()
         self.sat_update_lines()      # keep the ADC saturation lines in step with gain / attenuator / calibration
 
+    # ---- previous save_csv() (header always dBuV), kept in case of problems ----
+#    def save_csv(self):
+#        if self.freq_axis is None or self.power_axis is None:
+#            self.log("Save FFT: no live data to save yet")
+#            return
+
+#        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+#            self, "Save Spectrum CSV", "spectrum.csv", "CSV Files (*.csv)"
+#        )
+#        if not path:
+#            return
+
+#        idx = np.argsort(self.freq_axis)
+#        f = self.freq_axis[idx]
+#        # p = self.power_axis[idx]
+#        p = self.power_axis[idx] + self.cal_total_offset_db()   # dBuV at attenuator input
+
+#        have_ref = (getattr(self, "reference_freq", None) is not None
+#                    and getattr(self, "reference_power", None) is not None
+#                    and len(self.reference_freq) > 0)
+
+#        if not have_ref:
+#            # No reference captured - unchanged behaviour from before.
+#            data = np.column_stack((f, p))
+#            # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
+#            np.savetxt(path, data, delimiter=",", header="freq_hz,level_dbuv", comments="")
+#            self.log(f"Saved live trace ({len(f)} points) to {path}")
+#            return
+
+#        # A captured reference trace may have been taken under different sweep settings
+#        # (different MODE, sample rate, etc.) than the current live trace, so it can have
+#        # a different length and a different frequency grid. Rather than assume the two
+#        # line up row-for-row, write them as two independent (freq, level) column pairs;
+#        # whichever trace is shorter just leaves its trailing cells blank.
+#        rf = np.asarray(self.reference_freq, dtype=np.float64)
+#        rp = np.asarray(self.reference_power, dtype=np.float64)
+#        n = max(len(f), len(rf))
+#        with open(path, "w", newline="") as fh:
+#            # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
+#            fh.write("freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
+#            for i in range(n):
+#                a = f"{f[i]:.6f}" if i < len(f) else ""
+#                b = f"{p[i]:.3f}" if i < len(p) else ""
+#                c = f"{rf[i]:.6f}" if i < len(rf) else ""
+#                d = f"{rp[i]:.3f}" if i < len(rp) else ""
+#                fh.write(f"{a},{b},{c},{d}\n")
+#        self.log(f"Saved live ({len(f)} pts) + reference ({len(rf)} pts) trace to {path}")
+
     def save_csv(self):
         if self.freq_axis is None or self.power_axis is None:
             self.log("Save FFT: no live data to save yet")
@@ -9556,7 +9898,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             # No reference captured - unchanged behaviour from before.
             data = np.column_stack((f, p))
             # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
-            np.savetxt(path, data, delimiter=",", header="freq_hz,level_dbuv", comments="")
+            np.savetxt(path, data, delimiter=",", header=("freq_hz,level_dbfs" if self.display_dbfs else "freq_hz,level_dbuv"), comments="")
             self.log(f"Saved live trace ({len(f)} points) to {path}")
             return
 
@@ -9570,7 +9912,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         n = max(len(f), len(rf))
         with open(path, "w", newline="") as fh:
             # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
-            fh.write("freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
+            fh.write("freq_hz,level_dbfs,ref_freq_hz,ref_level_dbfs\n" if self.display_dbfs else "freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
             for i in range(n):
                 a = f"{f[i]:.6f}" if i < len(f) else ""
                 b = f"{p[i]:.3f}" if i < len(p) else ""
