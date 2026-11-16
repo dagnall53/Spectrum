@@ -51,9 +51,10 @@ preset,VHF,Broadcast VHF,88M,108M,2.4M,12,FALSE,
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-13 10:00, made at RF gain 7.7 dB with a 1 MHz tone)
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-13 10:06, made at RF gain 8.7 dB with a 1 MHz tone)
 # dB -> dBuV factor per sample rate (written by the CAL button 2026-11-13 10:08, made at RF gain 8.7 dB with a 1 MHz tone)
-setting,cal_1024000,116.70,,,,,,
-setting,cal_1800000,115.01,,,,,,
-setting,cal_2048000,116.26,,,,,,
-setting,cal_2400000,114.64,,,,,,
-setting,cal_2560000,123.53,,,,,,
-setting,cal_3200000,134.18,,,,,,
+# dB -> dBuV factor per sample rate (written by the CAL button 2026-11-16 19:13, made at RF gain 12.5 dB with a 0.7 MHz tone)
+setting,cal_1024000,96.70,,,,,,
+setting,cal_1800000,96.87,,,,,,
+setting,cal_2048000,96.27,,,,,,
+setting,cal_2400000,96.45,,,,,,
+setting,cal_2560000,103.49,,,,,,
+setting,cal_3200000,114.09,,,,,,

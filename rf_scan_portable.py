@@ -462,6 +462,53 @@ def cal_reference_db():
     return min(CAL_BY_RATE.values()) if CAL_BY_RATE else CAL_SDR_DB_TO_DBUV
 
 
+# =====================================================================================================================
+# HOW THE dB -> dBuV CALIBRATION FACTORS ARE USED - everything in one place
+# =====================================================================================================================
+# "SDR dB" is the level the program stores for every FFT bin: 10*log10(|FFT/N|^2) + 33.5 of the samples as read, with NO gain
+# compensation. From it the DISPLAYED level is built in these steps, and every place that does so goes through these functions:
+#
+#   1. factor            cal_for_rate(sample_rate): the factor of this sample rate - its own cal_<Hz> row in settings.csv (written by
+#                        the CAL button) or, if it has none, the default CAL_SDR_DB_TO_DBUV at the top of the file.
+#   2. THE FORMULA       cal_model_offset_db(factor, RF gain, attenuator):
+#                            dBuV at the INPUT of the external attenuator  =  SDR dB  -  RF gain  +  attenuator  +  factor
+#                        (RF gain: the gain applied to the pass; attenuator: the front-panel Attenuator box = the external attenuator.)
+#   3. correction        + the Antenna factor (Radiated) / LISN correction (Conducted) box (cispr_offset_db). NOT part of the CAL.
+#   4. dBFS option       bypasses steps 1-3: displayed = SDR dB relative to ADC full scale, no calibration of any kind.
+#
+# Where they are used:
+#   display (trace, waterfall rows, initial graph view, CSV):  EmcScanner.display_offset_for()  (steps 1-4);  cal_total_offset_db() calls it
+#   ADC saturation lines:        EmcScanner.sat_full_scale_display()   (steps 2-3 with the most sensitive rate's factor, cal_reference_db())
+#   CAL button / CAL SURVEY:     cal_measure() converts a measured tone with step 2;  cal_quick_evaluate() and the survey's "implied"
+#                                column solve step 2 backwards with cal_solve_factor() to find the factor that reads the tone correctly
+#   the CAL's own test level:    cal_source_dbuv(): generator amplitude -> series (dropper) resistor -> attenuator input impedance
+#   reading / writing:           CAL_BY_RATE above (read at start-up);  settings_write_cal() below (written only if the user agrees)
+# The CAL never includes step 3 (so the factors never depend on the antenna factor) and is not affected by the dBFS option.
+
+
+def cal_model_offset_db(factor, rf_gain_db, attenuator_db):
+    """Step 2 of the chain above: dB to ADD to an SDR dB value to get dBuV at the INPUT of the external attenuator."""
+    return float(factor) - float(rf_gain_db) + float(attenuator_db)
+
+
+def cal_solve_factor(true_dbuv, tone_sdr_db, rf_gain_db, attenuator_db):
+    """Step 2 solved backwards: the factor for which cal_model_offset_db() makes a tone of SDR level tone_sdr_db read true_dbuv
+    (true_dbuv = its real level at the attenuator input)."""
+    return float(true_dbuv) - float(tone_sdr_db) + float(rf_gain_db) - float(attenuator_db)
+
+
+def cal_source_dbuv(vpp_generator, r_series_ohm=0.0, z_in_ohm=50.0):
+    """Level of the CAL test signal at the INPUT of the external attenuator. vpp_generator is the generator amplitude (V pk-pk) as
+    measured at the generator output; it drives r_series_ohm (the series 'dropper' resistor) into z_in_ohm (the 50 ohm input of the
+    attenuator / SDR), so  V_in = V_generator * z_in / (r_series + z_in).
+    Returns (dBuV, V_in pk-pk, V_in rms). With r_series = 0 the generator drives the attenuator directly."""
+    z = max(float(z_in_ohm), 1e-6)
+    r = max(float(r_series_ohm), 0.0)
+    vin_pp = float(vpp_generator) * z / (r + z)
+    vrms = vin_pp / (2.0 * math.sqrt(2.0))
+    return 20.0 * math.log10(max(vrms, 1e-15) / 1e-6), vin_pp, vrms
+
+
 def settings_write_cal(cal_by_rate, gain_db=None, tone_hz=None):
     """Write the per-rate factors into settings.csv as 'setting,cal_<Hz>,<value>' rows. Every other line (presets, other
     settings, comments) is kept exactly; old cal_ rows are replaced; the old file is first copied to settings.csv.bak.
@@ -1310,6 +1357,8 @@ CAL_AGREE_DB = 1.0                 # sample rates "agree" at a gain if their lev
 CAL_DEPART_DB = 1.0                # a rate "departs" at the first gain where it is this far from its low-gain level
 CAL_SPREAD_WARN_DB = 0.5           # repeat scans of one setting differing by more than this are flagged
 CAL_QUICK_TONE_HZ = 1.5e6          # the CAL button's test tone
+CAL_QUICK_VPP_DEFAULT = 2.85        # CAL button: generator amplitude offered first (V pk-pk, as measured at the generator output)
+CAL_QUICK_RSERIES_DEFAULT = 10000.0  # CAL button: series (dropper) resistor offered first (ohm)
 CAL_QUICK_SCANS = 2                # scans per tone position in the CAL button's measurement
 CAL_POS_FRACTIONS = (-0.30, -0.15, 0.15, 0.30)   # tone positions in the block, as a fraction of the sample rate from the centre
 CAL_POS_SPREAD_WARN_DB = 3.0       # CAL: tell the user if the level varies more than this with tone position
@@ -4263,7 +4312,7 @@ class EmcScanner(QtWidgets.QMainWindow):
     # Feed a sine of known level (default 1.5 MHz, 0.11 Vpp, via an attenuator) and press CAL SURVEY.
     # For every sample rate x RF gain (x tone position in the block) the program measures the tone and converts it
     # with the SAME formula the main display uses:
-    #       dBuV = SDR dB - RF gain + attenuator + CAL_SDR_DB_TO_DBUV
+    #       dBuV = SDR dB - RF gain + attenuator + factor of the sample rate   (see "HOW THE dB -> dBuV CALIBRATION FACTORS ARE USED" near the top)
     # then compares it with the level the tone really has (from Vpp). If one CAL_SDR_DB_TO_DBUV were right
     # everywhere, every rate/gain would read the same. The report shows where that holds, where it does not,
     # and which CAL_SDR_DB_TO_DBUV would be right for the region that does agree.
@@ -4331,6 +4380,60 @@ class EmcScanner(QtWidgets.QMainWindow):
         """dBuV of a sine of this peak-to-peak voltage: 20*log10(Vrms / 1 uV)."""
         return 20.0 * math.log10(max(float(vpp), 1e-12) / (2.0 * math.sqrt(2.0)) / 1e-6)
 
+    def cal_source_rows(self, form, on_change, defaults):
+        """Add the test-signal rows to a form: generator amplitude (V pk-pk, as MEASURED at the generator output), the series (dropper)
+        resistor and the input impedance it works into (the 50 ohm attenuator). The level at the attenuator input is worked out by
+        cal_source_dbuv() and shown. Values used last time are offered again. Returns get(), a function giving a dict:
+        vpp_gen, r_series, z_in, vpp_in (V pk-pk at the attenuator input), dbuv (its level), text (a description for the report)."""
+        last = getattr(self, "_cal_source_last", None)
+        vpp0, rs0, zin0 = (last["vpp_gen"], last["r_series"], last["z_in"]) if last else defaults
+        sp_vpp = QtWidgets.QDoubleSpinBox()
+        sp_vpp.setLocale(SCOPE_LOCALE)
+        sp_vpp.setRange(0.0001, 50.0)
+        sp_vpp.setDecimals(4)
+        sp_vpp.setSuffix(" V pk-pk")
+        sp_vpp.setValue(vpp0)
+        sp_vpp.setToolTip("Peak-to-peak amplitude of the signal generator, as measured at its OUTPUT with the scope - with a load comparable to\n"
+                          "what it really drives (series resistor + input impedance). A 10 kohm scope load does that for a 10 kohm dropper.\n"
+                          "A generator with a high output impedance reads lower when loaded, so measure it loaded, as it will be used.")
+        sp_rs = QtWidgets.QDoubleSpinBox()
+        sp_rs.setLocale(SCOPE_LOCALE)
+        sp_rs.setRange(0.0, 1.0e7)
+        sp_rs.setDecimals(1)
+        sp_rs.setSingleStep(100.0)
+        sp_rs.setSuffix(" ohm")
+        sp_rs.setValue(rs0)
+        sp_rs.setToolTip("Series (dropper) resistor between the generator and the attenuator input. 0 = the generator drives the attenuator directly.")
+        sp_zin = QtWidgets.QDoubleSpinBox()
+        sp_zin.setLocale(SCOPE_LOCALE)
+        sp_zin.setRange(1.0, 10000.0)
+        sp_zin.setDecimals(1)
+        sp_zin.setSuffix(" ohm")
+        sp_zin.setValue(zin0)
+        sp_zin.setToolTip("Input impedance of the external attenuator / SDR that the series resistor works into (50 ohm).")
+        lbl = QtWidgets.QLabel("")
+
+        def get():
+            dbuv, vin_pp, vrms = cal_source_dbuv(sp_vpp.value(), sp_rs.value(), sp_zin.value())
+            text = (f"generator {sp_vpp.value():g} Vpp" + (f" through {sp_rs.value():g} ohm into {sp_zin.value():g} ohm = {vin_pp * 1e3:.4g} mVpp "
+                    f"at the attenuator input" if sp_rs.value() > 0 else " direct to the attenuator input"))
+            return {"vpp_gen": sp_vpp.value(), "r_series": sp_rs.value(), "z_in": sp_zin.value(), "vpp_in": vin_pp, "dbuv": dbuv, "text": text}
+
+        def update(*_):
+            g = get()
+            lbl.setText(f"<b>{g['dbuv']:.2f} dBuV</b>   ({g['vpp_in'] * 1e3:.4g} mV pk-pk = {g['vpp_in'] / (2 * math.sqrt(2)) * 1e3:.4g} mV rms)")
+            on_change()
+
+        form.addRow("Generator amplitude (V pk-pk, measured at the generator output)", sp_vpp)
+        form.addRow("Series (dropper) resistor", sp_rs)
+        form.addRow("Input impedance it feeds (the attenuator)", sp_zin)
+        form.addRow("= Level at the attenuator input", lbl)
+        for sp in (sp_vpp, sp_rs, sp_zin):
+            sp.valueChanged.connect(update)
+        g0 = get()
+        lbl.setText(f"<b>{g0['dbuv']:.2f} dBuV</b>   ({g0['vpp_in'] * 1e3:.4g} mV pk-pk = {g0['vpp_in'] / (2 * math.sqrt(2)) * 1e3:.4g} mV rms)")
+        return get
+
     @staticmethod
     def cal_parse_offsets(text):
         """'200' or '-300, -150; 150, 300' -> list of kHz floats. Raises ValueError on rubbish."""
@@ -4364,12 +4467,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         sp_tone.setDecimals(4)
         sp_tone.setSuffix(" MHz")
         sp_tone.setValue(CAL_TONE_HZ_DEFAULT / 1e6)
-        sp_vpp = QtWidgets.QDoubleSpinBox()
-        sp_vpp.setLocale(SCOPE_LOCALE)
-        sp_vpp.setRange(0.0001, 20.0)
-        sp_vpp.setDecimals(4)
-        sp_vpp.setSuffix(" V pk-pk")
-        sp_vpp.setValue(CAL_TONE_VPP_DEFAULT)
         sp_att = QtWidgets.QDoubleSpinBox()
         sp_att.setLocale(SCOPE_LOCALE)
         sp_att.setRange(0.0, 100.0)
@@ -4377,7 +4474,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         sp_att.setSuffix(" dB")
         sp_att.setValue(float(self.input_atten_db))
         sp_att.setToolTip("Attenuator between the generator and the SDR. Defaults to the front-panel Attenuator setting.")
-        lbl_exp = QtWidgets.QLabel("")
         sp_win = QtWidgets.QDoubleSpinBox()
         sp_win.setLocale(SCOPE_LOCALE)
         sp_win.setRange(1.0, 500.0)
@@ -4406,9 +4502,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         sp_scans.setRange(1, 5)
         sp_scans.setValue(CAL_SCANS_DEFAULT)
         form.addRow("Tone frequency", sp_tone)
-        form.addRow("Tone amplitude (generator / attenuator input)", sp_vpp)
+        src_get = self.cal_source_rows(form, lambda: refresh_info(), (CAL_TONE_VPP_DEFAULT, 0.0, 50.0))
         form.addRow("Attenuator fitted", sp_att)
-        form.addRow("True level at attenuator input", lbl_exp)
         form.addRow("Search window", sp_win)
         form.addRow("", chk_band)
         form.addRow("Tone offset from block centre (kHz)", ed_off)
@@ -4463,15 +4558,13 @@ class EmcScanner(QtWidgets.QMainWindow):
             return tot
 
         def refresh_info(*_):
-            exp = self.cal_expected_dbuv(sp_vpp.value())
-            lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value():.4f} Vpp = {sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
             rates, gains, ro = n_points()
             bad = (not chk_band.isChecked()) and offsets_or_none() is None
             info.setText("Offsets must be numbers (kHz), comma separated." if bad else
                          f"{len(rates)} rates x {len(gains)} gains, {len(ro)} rate/offset combination(s), {sp_scans.value()} scan(s) each "
                          f"- roughly {self.survey_fmt_seconds(total_seconds())}")
 
-        for wdg in (sp_tone, sp_vpp, sp_att, sp_win):
+        for wdg in (sp_tone, sp_att, sp_win):
             wdg.valueChanged.connect(refresh_info)
         for wdg in (cb_lo, cb_hi):
             wdg.currentIndexChanged.connect(refresh_info)
@@ -4510,8 +4603,10 @@ class EmcScanner(QtWidgets.QMainWindow):
             self, "Save calibration survey (base name; writes .html and _*.csv)", "rf_cal_survey.html", "HTML report (*.html)")
         if not path:
             return
-        params = {"tone_hz": sp_tone.value() * 1e6, "vpp": sp_vpp.value(), "atten": sp_att.value(),
-                  "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": sp_win.value() * 1e3,
+        src = src_get()
+        self._cal_source_last = src
+        params = {"tone_hz": sp_tone.value() * 1e6, "vpp": src["vpp_in"], "atten": sp_att.value(), "source_text": src["text"],
+                  "expected": src["dbuv"], "win_hz": sp_win.value() * 1e3,
                   "use_band": use_band, "combos": combos, "scans": sp_scans.value(), "path": path}
         self.cal_start(params)
 
@@ -4692,8 +4787,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         """Worker thread: measure the tone in one finished scan, convert to dBuV, store the record and one CSV row."""
         c = self._cal
         m = self.cal_tone_levels(lp["f"], lp["p"], rate, c["tone_hz"], c["win_hz"])
-        cal_r = cal_for_rate(rate)                                         # this sample rate's dB -> dBuV factor
-        conv = -float(gain) + float(c["atten"]) + cal_r                   # SDR dB -> dBuV at the attenuator input
+        cal_r = cal_for_rate(rate)                                         # step 1: the factor of THIS sample rate
+        conv = cal_model_offset_db(cal_r, gain, c["atten"])               # step 2: SDR dB -> dBuV at the attenuator input (no step 3)
         nan = float("nan")
         blk = nan
         if c["use_band"]:
@@ -4703,7 +4798,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             blk = float(off)
         tone = m["tone_db"] + conv
         rec = {"rate": rate, "off": off, "blk": blk, "gain": gain, "scan": scan_no, "found": m["found"], "f_pk": m["f_pk"],
-               "tone": tone, "pk": m["pk_db"] + conv, "err": tone - c["expected"], "implied": cal_r - (tone - c["expected"]), "cal": cal_r, "tone_p": m["tone_db"],
+               "tone": tone, "pk": m["pk_db"] + conv, "err": tone - c["expected"], "implied": cal_solve_factor(c["expected"], m["tone_db"], gain, c["atten"]), "cal": cal_r, "tone_p": m["tone_db"],
                "floor": m["floor_db"] + conv, "snr": m["tone_db"] - m["floor_db"], "g_f": m["g_f"], "g_db": m["g_db"] + conv,
                "other": m["other_louder"], "n_avg": lp["n_avg"]}
         c["records"].append(rec)
@@ -4870,7 +4965,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                "th{background:#1d2026}td.g{background:#1d2026;font-weight:600}.scroll{overflow:auto;max-width:100%}")
         h = ['<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>RF calibration survey</title><style>' + css + '</style></head><body>',
              '<h1>RF scan - calibration survey (known tone)</h1>']
-        h.append(f'<div class="sub">tone {c["tone_hz"]/1e6:.4f} MHz, {c["vpp"]:g} Vpp = <b>{c["expected"]:.1f} dBuV</b> at the attenuator input, '
+        h.append(f'<div class="sub">tone {c["tone_hz"]/1e6:.4f} MHz, {c.get("source_text", f'{c["vpp"]:g} Vpp at the attenuator input')} = <b>{c["expected"]:.2f} dBuV</b> at the attenuator input, '
                  f'attenuator {c["atten"]:g} dB, dB-to-dBuV: default {c["cal0"]:g}, {len(CAL_BY_RATE)} per-rate value(s) in use, averaging {c["n_avg"]}, '
                  f'{len(c["results"])} setting(s) x {c["scans"]} scan(s)' + (' | <b>PARTIAL RESULT - stopped early</b>' if partial else '') +
                  f' | {time.strftime("%Y-%m-%d %H:%M")}</div>')
@@ -5023,26 +5118,18 @@ class EmcScanner(QtWidgets.QMainWindow):
         sp_freq.setValue(CAL_QUICK_TONE_HZ / 1e6)
         sp_freq.setToolTip("Frequency of the test sine. Each sample rate is measured with the tone at several positions in the block,\n"
                            "so the tuner must be able to tune below the tone: a low tone frequency cannot be used with the widest sample rates.")
-        sp_vpp = QtWidgets.QDoubleSpinBox()
-        sp_vpp.setLocale(SCOPE_LOCALE)
-        sp_vpp.setRange(0.0001, 20.0)
-        sp_vpp.setDecimals(4)
-        sp_vpp.setSuffix(" V pk-pk")
-        sp_vpp.setValue(CAL_TONE_VPP_DEFAULT)
         sp_att = QtWidgets.QDoubleSpinBox()
         sp_att.setLocale(SCOPE_LOCALE)
         sp_att.setRange(0.0, 100.0)
         sp_att.setDecimals(1)
         sp_att.setSuffix(" dB")
         sp_att.setValue(float(self.input_atten_db))
-        sp_att.setToolTip("Attenuator between the generator and the SDR. Defaults to the front-panel Attenuator setting. "
-                          "Set the front-panel Attenuator to the value you normally use, not to this one, after the CAL.")
-        lbl_exp = QtWidgets.QLabel("")
+        sp_att.setToolTip("The external attenuator between the signal and the SDR (20 dB for example). Defaults to the front-panel Attenuator setting. "
+                          "Levels are calibrated at ITS INPUT. Leave the front-panel Attenuator at this value afterwards.")
         form.addRow("RF gain for the CAL", lbl_gain)
         form.addRow("Frequency of the sine", sp_freq)
-        form.addRow("Amplitude of the sine (at the attenuator input)", sp_vpp)
+        src_get = self.cal_source_rows(form, lambda: refresh(), (CAL_QUICK_VPP_DEFAULT, CAL_QUICK_RSERIES_DEFAULT, 50.0))
         form.addRow("Attenuator fitted", sp_att)
-        form.addRow("True level at the attenuator input", lbl_exp)
         lay.addLayout(form)
         lay.addWidget(QtWidgets.QLabel("Sample rates to calibrate:"))
         lst = QtWidgets.QListWidget()
@@ -5069,11 +5156,11 @@ class EmcScanner(QtWidgets.QMainWindow):
             return [r for r in rates if len(positions(r)) >= 2]
 
         def refresh(*_):
-            exp = self.cal_expected_dbuv(sp_vpp.value())
-            lbl_exp.setText(f"{exp:.1f} dBuV  ({sp_vpp.value() / (2 * math.sqrt(2)) * 1000:.2f} mV rms)")
+            exp = src_get()["dbuv"]
             at_sdr = exp - sp_att.value()
-            # rough headroom below ADC full scale at this gain, from the calibration in use (the measurement itself checks properly)
-            head = self.sat_full_scale_p() + cal_reference_db() - cal_gain - at_sdr
+            # rough headroom below ADC full scale at this gain, from the calibration in use (the measurement itself checks properly):
+            # the displayed level at which a tone reaches full scale (formula of step 2, most sensitive factor) minus the tone's level
+            head = self.sat_full_scale_p() + cal_model_offset_db(cal_reference_db(), cal_gain, sp_att.value()) - exp
             warn = ""
             if head < CAL_MIN_HEADROOM_DB + 2.0:
                 warn = f"   WARNING: only about {head:.0f} dB below ADC full scale at {cal_gain:g} dB gain - probably too large, lower the level"
@@ -5087,7 +5174,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                          f"{len(ok_rates)} rate(s) to calibrate, roughly {self.survey_fmt_seconds(tot)}. Averaging setting is used as-is.{note}")
 
         sp_freq.valueChanged.connect(refresh)
-        sp_vpp.valueChanged.connect(refresh)
         sp_att.valueChanged.connect(refresh)
         lst.itemChanged.connect(refresh)
         refresh()
@@ -5110,8 +5196,10 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.log("CAL: none of the chosen sample rates can be calibrated at this tone frequency")
             return
         combos = [(r, round(fr * r / 1e3, 3), cal_gain) for r in rates for fr in positions(r)]
-        self.cal_start({"quick": True, "tone_hz": tone, "vpp": sp_vpp.value(), "atten": sp_att.value(),
-                        "expected": self.cal_expected_dbuv(sp_vpp.value()), "win_hz": max(CAL_WINDOW_HZ_DEFAULT, 20e-6 * tone),
+        src = src_get()
+        self._cal_source_last = src                  # offered again next time
+        self.cal_start({"quick": True, "tone_hz": tone, "vpp": src["vpp_in"], "atten": sp_att.value(), "source_text": src["text"],
+                        "expected": src["dbuv"], "win_hz": max(CAL_WINDOW_HZ_DEFAULT, 20e-6 * tone),
                         "use_band": False, "combos": combos, "scans": CAL_QUICK_SCANS, "path": "", "gain": cal_gain})
 
     def cal_quick_evaluate(self, c):
@@ -5124,7 +5212,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             row = {"rate": r, "old": cal_for_rate(r), "had": cal_has_rate(r), "new": None, "spread": None, "head": None,
                    "snr": None, "ok": False, "note": "no tone found"}
             if rs:
-                vals = [c["expected"] - c["atten"] - x["tone_p"] + c["gain"] for x in rs]    # factor implied at each tone position (at the CAL gain)
+                vals = [cal_solve_factor(c["expected"], x["tone_p"], c["gain"], c["atten"]) for x in rs]   # factor implied at each tone position
                 row["new"] = float(np.median(vals))
                 row["spread"] = float(max(vals) - min(vals))
                 row["head"] = float(fs_p - max(x["tone_p"] for x in rs))
@@ -5162,7 +5250,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         dlg.setWindowTitle("CAL result")
         lay = QtWidgets.QVBoxLayout(dlg)
         lay.addWidget(QtWidgets.QLabel(
-            f"Sine {c['tone_hz']/1e6:g} MHz, {c['vpp']:g} Vpp = {c['expected']:.1f} dBuV at the attenuator input, attenuator {c['atten']:g} dB, RF gain {c['gain']:g} dB.\n"
+            f"Sine {c['tone_hz']/1e6:g} MHz: {c.get('source_text', '')} = {c['expected']:.2f} dBuV at the attenuator input.\n"
+            f"Attenuator {c['atten']:g} dB, RF gain {c['gain']:g} dB.\n"
             f"'Old' is the factor in use now (the default {CAL_SDR_DB_TO_DBUV:g} where a rate has none of its own). "
             f"Headroom = dB below ADC full scale; SNR = dB above the noise."))
         txt = QtWidgets.QPlainTextEdit(table)
@@ -5251,7 +5340,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         gain = float(applied if applied is not None else self.gain_db)
         if self.hf_mode:
             gain = 0.0
-        return self.sat_full_scale_p() + cal_reference_db() - gain + float(self.input_atten_db) + float(getattr(self, "cispr_offset_db", 0.0))
+        return (self.sat_full_scale_p() + cal_model_offset_db(cal_reference_db(), gain, self.input_atten_db)      # steps 1-2, most sensitive factor
+                + float(getattr(self, "cispr_offset_db", 0.0)))                                                     # step 3
 
     def sat_update_lines(self):
         """GUI thread: place (or hide) the saturation lines. Called on every plot update and when the box is ticked."""
@@ -5755,12 +5845,16 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.dbfs_apply_labels()
 
     def display_offset_for(self, rate, gain):
-        """dB to ADD to a stored 'SDR dB' value for the display in the current units."""
+        """dB to ADD to a stored 'SDR dB' value for the display in the current units - the whole chain, see "HOW THE dB -> dBuV
+        CALIBRATION FACTORS ARE USED" near the top of the file:
+            dBFS mode:  -(full-scale level)                                     (no calibration of any kind)
+            dBuV mode:  step 1 factor of this sample rate, step 2 formula (factor - RF gain + attenuator), step 3 + antenna factor / LISN corr."""
         if getattr(self, "display_dbfs", False):
             return -self.sat_full_scale_p()
         g = 0.0 if self.hf_mode else float(gain)
-        # the antenna factor (Radiated) / LISN correction (Conducted) is part of the displayed value
-        return cal_for_rate(rate) - g + float(self.input_atten_db) + float(getattr(self, "cispr_offset_db", 0.0))
+        factor = cal_for_rate(rate)                                          # step 1: the factor of THIS sample rate
+        offset = cal_model_offset_db(factor, g, self.input_atten_db)         # step 2: dBuV at the attenuator input
+        return offset + float(getattr(self, "cispr_offset_db", 0.0))        # step 3: antenna factor (Radiated) / LISN correction (Conducted)
 
     def dbfs_apply_labels(self):
         try:

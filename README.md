@@ -1,4 +1,5 @@
 <img width="1196" height="594" alt="Screenshot of the RF scanner" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
+<img width="1311" height="820" alt="SweepRunning" src="https://github.com/user-attachments/assets/a765cceb-7a31-429f-899c-8cdeeb278556" />
 
 # RF Scan Portable
 
@@ -126,8 +127,8 @@ The factor is **different for each sample rate** (and the CAL tone can be at any
 ### Calibrating with the CAL button
 
 1. Set the **RF Gain** slider to about the value you will use for your measurements. The CAL is made at this gain, so the factor is right close to it.
-2. Feed a **sine wave** of known frequency (1.5 MHz by default) and amplitude into the SDR through an attenuator. Use a level small enough not to overload the SDR at that gain. With the sine connected and CONTINUOUS running, the tone should sit well below the red saturation line.
-3. Click **CAL...**. The dialog shows the RF gain that will be used. Enter the sine frequency, its amplitude (V peak-to-peak at the attenuator input) and the attenuator you fitted, and choose the sample rates to calibrate. The dialog also estimates how far below ADC full scale the tone will be.
+2. Feed a **sine wave** of known frequency (1.5 MHz by default) into the SDR through the external attenuator, usually via a series (dropper) resistor from the generator. Use a level small enough not to overload the SDR at that gain. With the sine connected and CONTINUOUS running, the tone should sit well below the red saturation line.
+3. Click **CAL...**. The dialog shows the RF gain that will be used. Enter the sine frequency; the **generator amplitude** (V pk-pk, measured with the scope at the generator output, loaded about as it will be used); the **series resistor** (0 if the generator drives the attenuator directly); the input impedance it feeds (50 ohm); and the attenuator you fitted. Then choose the sample rates to calibrate. The dialog works out and shows the level at the attenuator input: V = V<sub>gen</sub> x Z<sub>in</sub> / (R<sub>series</sub> + Z<sub>in</sub>), for example 2.85 V pk-pk through 10 kohm into 50 ohm is 14.2 mV pk-pk, or 74.0 dBµV. The values you used are offered again next time. The dialog also estimates how far below ADC full scale the tone will be.
 4. The program measures every rate at the front-panel RF gain, with the tone at several positions in the block, and works out the best factor for each rate.
 5. A table shows the old factor, the new factor, how much the level varies with tone position, the headroom below ADC full scale and the signal-to-noise ratio. A rate is rejected if the tone is too close to full scale or too close to the noise.
 6. You are then asked what to do:
@@ -136,6 +137,8 @@ The factor is **different for each sample rate** (and the CAL tone can be at any
    - **Discard** changes nothing. Use this to run CAL purely as a check.
 
 The **Cal:** label on the front panel shows the factor in use for the current sample rate.
+
+**How the factors are used.** The stored level (SDR dB) becomes the displayed level in these steps: (1) the factor of the sample rate in use, or the default `CAL_SDR_DB_TO_DBUV` if that rate has none; (2) the formula `dBµV at the attenuator input = SDR dB - RF gain + attenuator + factor`; (3) plus the antenna factor / LISN correction. The dBFS option skips all three. The CAL measures with step 2 only and solves it backwards for the factor, so it never includes the antenna factor. The code has a comment block headed "HOW THE dB -> dBuV CALIBRATION FACTORS ARE USED" that lists every place these steps are used.
 
 **Limits of the calibration:**
 
