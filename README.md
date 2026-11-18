@@ -1,6 +1,4 @@
-<img width="1196" height="594" alt="Screenshot of the RF scanner" src="https://github.com/user-attachments/assets/3c855afe-d875-4537-927c-740117cbf734" />
-<img width="1311" height="820" alt="SweepRunning" src="https://github.com/user-attachments/assets/a765cceb-7a31-429f-899c-8cdeeb278556" />
-
+<img width="1294" height="836" alt="image" src="https://github.com/user-attachments/assets/3ca4a116-8d88-458e-a614-55d32bb19f7b" />
 # RF Scan Portable
 
 An experimental Python spectrum scanner for the **RTL-SDR Blog V4**. It sweeps a much wider frequency range than programs such as SDR#, stitches the blocks into one trace, shows it in dBµV, and lets you save the spectrum to CSV.
@@ -20,28 +18,76 @@ It was written for investigating emissions (for example from marine electronics)
 - Optional **ADC saturation line** that warns when the input is close to overloading the SDR.
 - Optional **dBFS display** that ignores all calibration and shows the raw level relative to ADC full scale.
 - Optional **waterfall** below the graph, to show effects that repeat or come and go.
+- **Peak detection**: a peak detector, a peak-hold trace and markers that give the frequency and level of the strongest peaks.
+- A **standalone portable version** (no Python needed on the target PC) and installer scripts.
 - Test modes: **Single Frequency**, **Stitch Check**, **Gain/Rate Survey**, **CAL Survey** and a **Baseband Scope**.
 
 ## Requirements
 
-- Windows PC (the program loads the RTL-SDR driver DLLs from a folder next to the script).
+- Windows PC (the program loads the RTL-SDR driver DLLs from a folder next to the program).
 - An RTL-SDR Blog V4 dongle.
-- Python 3 with:
-
-  ```
-  pip install numpy PyQt5 pyqtgraph
-  ```
-
-- The RTL-SDR driver installed for the dongle using **Zadig** (WinUSB driver). Follow the RTL-SDR Blog and SDR# instructions for this step.
-- Next to `rf_scan_portable.py`:
-  - the `pyrtlsdr_local` folder;
+- The **WinUSB driver** for the dongle, installed with Zadig (see step 0 below).
+- Either Python 3 with `numpy`, `PyQt5`, `pyqtgraph` and `pyrtlsdr` (routes A and B below), or nothing at all (route C, the standalone version).
+- Next to the program:
+  - the `pyrtlsdr_local` folder (not needed for the standalone version, it is built in);
   - a `drivers` folder holding the driver DLL sub-folders (`default`, `ms64`, `sdrsharp`, `experimental`). The program also looks in `C:/Spectrum/drivers`.
 
+## Installing
+
+Three ways to get it running. All of them need step 0.
+
+### 0. The WinUSB driver (every route)
+
+Plug the dongle in and run **Zadig**. Choose *Options > List All Devices*, pick the RTL-SDR entry (*Bulk-In, Interface (Interface 0)*) and install **WinUSB**, exactly as for SDR#. Follow the RTL-SDR Blog instructions if you have not done this before.
+
+### A. Run from Python, with the installer (`Install.bat`)
+
+Needs Python 3 already installed (from python.org, with *Add python.exe to PATH* ticked).
+
+1. Put these in one folder: `Install.bat`, `rf_scan_portable.py`, the `pyrtlsdr_local` folder and the `drivers` folder. `settings.csv` and `README.md` are optional. Loose `librtlsdr.dll`, `libusb-1.0.dll` and `pthreadVC2.dll` next to the installer are used as `drivers\default` if there is no `drivers` folder.
+2. Double-click `Install.bat`. It asks for administrator rights, then:
+   - creates `C:\Spectrum` and copies the program, `pyrtlsdr_local` and `drivers` into it;
+   - **never overwrites an existing `C:\Spectrum\settings.csv`**, so your presets and CAL factors are safe;
+   - installs `numpy`, `PyQt5`, `pyqtgraph` and `pyrtlsdr` with pip, for all users;
+   - creates `C:\Spectrum\run_rf_scan.bat` and an **RF Scan** icon on the desktop;
+   - lets normal users change files in `C:\Spectrum` (the CAL needs this to save `settings.csv`).
+3. Start the program with the desktop icon.
+
+### B. Run from Python, by hand
+
+```
+pip install numpy PyQt5 pyqtgraph pyrtlsdr
+python rf_scan_portable.py
+```
+
+with `pyrtlsdr_local` and `drivers` next to `rf_scan_portable.py`.
+
+### C. The standalone portable version (no Python on the target PC)
+
+**Build it once**, on a PC that runs the program from Python:
+
+1. Put `build_exe.bat` in the same folder as `rf_scan_portable.py`, `pyrtlsdr_local` and `drivers` (they are copied from `C:\Spectrum` if missing). Optional: `settings.csv`, `README.md` and `Install_portable.bat`, which are copied into the result.
+2. Run `build_exe.bat`. It installs PyInstaller and the packages, then builds. This takes a few minutes.
+3. The result is the folder `dist\EMC_Sweep` (with `EMC_Sweep.exe` in it, drivers included) and `dist\EMC_Sweep.zip`.
+4. If the finished program will not start, run `build_exe.bat console` instead. That version opens a console window that shows the error messages.
+
+**Use it on another PC:**
+
+1. Copy the `EMC_Sweep` folder (or unzip `EMC_Sweep.zip`) to that PC and do step 0 (Zadig).
+2. Either run `EMC_Sweep.exe` from inside the folder, or run `Install_portable.bat` from inside it. The installer copies the folder to `C:\Spectrum\EMC_Sweep`, keeps an existing `settings.csv` there, makes the folder writable for normal users and adds the **RF Scan** desktop icon.
+3. `settings.csv` lives next to `EMC_Sweep.exe`. Edit it with Notepad. The CAL saves into it, so keep the folder somewhere writable (not under *Program Files*).
+
+Notes: if Windows reports a missing DLL, install the *Microsoft Visual C++ Redistributable 2015-2022 (x64)*. Antivirus and SmartScreen sometimes flag unsigned PyInstaller programs; use *More info > Run anyway* or add an exception, or build it yourself as above. After you change `rf_scan_portable.py`, build again.
+
 ## Starting the program
+
+From Python:
 
 ```
 python rf_scan_portable.py
 ```
+
+or use the **RF Scan** desktop icon (routes A and C) or run `EMC_Sweep.exe` (route C).
 
 The DLL and driver choice is made in `settings.csv` (see below). The code was originally set up to switch between several driver locations while getting the dongle to work, and that option is still there if you need to experiment.
 
@@ -64,12 +110,16 @@ The DLL and driver choice is made in `settings.csv` (see below). The code was or
 | SAVE CSV | Save the spectrum |
 | Show CISPR limit | Show the CISPR limit line (radiated dBµV/m at 10 m, or conducted dBµV) |
 | Antenna factor / LISN corr. | The box next to the Radiated / Conducted choice. Its value is **added to every displayed level**. See [Antenna factor and LISN correction](#antenna-factor-and-lisn-correction) |
-| Time Averaging | Average several captures per block |
+| Time Averaging | Average several captures per block (also the number of captures the Peak detector looks at) |
 | Show Freq Markers | Show the green (raw block) and cyan dashed (kept block) edges. Off at start-up |
 | Capture Reference / Show Reference | Store the current trace (for example the system noise with the equipment off) and show it for comparison only. Nothing is subtracted |
 | Show ADC saturation line | See [Saturation line](#adc-saturation-line). Off at start-up |
 | Display in dBFS | Show levels relative to ADC full scale, with no calibration. See [dBFS display](#dbfs-display) |
 | Show waterfall | Show a spectrum history below the graph. See [Waterfall](#waterfall) |
+| Average / Peak detector | How the captures of one block are combined. See [Peak detection](#peak-detection) |
+| Peak hold / Reset peak | Keep the highest level seen at every frequency over successive sweeps, as an orange trace |
+| Mark peaks / top N | Mark the N strongest peaks on screen with their frequency and level |
+| Save peaks... | Save the peak table and the hold / live traces to a CSV file |
 | BASEBAND SCOPE | Time-domain view of the input from DC to half the sample rate. The button changes to *BACK TO SPECTRUM* |
 
 ### Sample rates
@@ -177,6 +227,17 @@ When you switch units the graph keeps showing the same data, the waterfall histo
 ## Graph view
 
 When you select a mode, the first complete sweep sets the graph's view. The frequency axis covers the mode's range, and the level axis starts just under the lowest level measured and reaches `y_span_above_floor_db` (60 dB by default) above it. After that the view is yours, and zooming or panning is not undone until you pick another mode.
+
+## Peak detection
+
+Three tools on the **Peak:** row, under the Show Freq Markers row. They can be used together.
+
+- **Detector: Average / Peak.** This is how the captures inside one block are combined. *Average* (the default) takes the mean power, which gives a smooth trace but dilutes short bursts. *Peak* keeps the **largest power seen in each bin** over the captures, so a burst that falls inside the window shows at its full height. The number of captures is the **Time Averaging** count: tick Time Averaging and set a number (with it off there is one capture per block and the two detectors are the same). Surveys, the CAL and the stitch check always use the average detector. In a test with a 4 ms burst every 200 ms and 20 captures per block, the peak detector read the burst 9 dB higher than the average detector.
+- **Peak hold** (and **Reset peak**). Keeps, for every frequency, the highest level seen over successive sweeps and draws it as an orange trace on top of the live one. It restarts by itself when the band changes or you switch units. Press **Reset peak** after changing the RF gain, the attenuator or the sample rate if you do not want the old maxima to stay.
+- **Mark peaks**, with **top N**. Marks the N strongest peaks of the trace (of the peak-hold trace if Peak hold is on, otherwise the live trace) with a diamond and a label giving the **frequency and level in the units being displayed** (dBµV, dBµV/m, dBµV at the LISN port or dBFS, including any antenna factor or LISN correction). Only the part of the spectrum that is on screen is searched, so zooming in re-picks the strongest peaks of what you are looking at. The strongest peak is always marked; the others must stand at least 6 dB above the median level and be at least 2% of the span apart. The markers update once per finished sweep.
+- **Save peaks...** writes the peak table (as comment lines at the top) and the peak-hold and live traces to a CSV file.
+
+This is a sample-peak detector with a resolution bandwidth of about 1 kHz. It is **not** a CISPR quasi-peak detector, and the CISPR measurement bandwidth is 9 kHz, so levels of broadband impulses will differ from a CISPR receiver.
 
 ## Waterfall
 

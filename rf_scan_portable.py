@@ -1406,6 +1406,16 @@ class ViewSignals(QtCore.QObject):
     apply = QtCore.pyqtSignal(float, float, float, float)
 
 
+# ---- PEAK detection defaults (see EmcScanner.peak_build_ui) ----
+PEAK_MIN_ABOVE_MEDIAN_DB = 6.0     # a marked peak (other than the strongest) must stand this far above the median level of the trace
+PEAK_MAX_MARKERS = 10
+
+
+class PeakSignals(QtCore.QObject):
+    # worker thread -> GUI thread: one finished pass for peak hold / peak markers
+    update = QtCore.pyqtSignal(object, object, str)      # freqs (Hz), levels (displayed units), band key
+
+
 # ---- Baseband SCOPE defaults (see the EmcScanner.scope_* methods) ----
 SCOPE_MAX_SAMPLES = 2097152     # most samples captured per scope frame (2**21)
 SCOPE_MIN_SAMPLES = 512         # fewest samples ever displayed per frame
@@ -3445,6 +3455,11 @@ class EmcScanner(QtWidgets.QMainWindow):
                     self.view_note_pass(self._last_pass, key0)                      # first pass in a new band: set the graph's view
                 except Exception as e:
                     print(f"view: could not set the initial range: {e!r}")
+            if getattr(self, "peak_hold_on", False) or getattr(self, "peak_mark_on", False):
+                try:
+                    self.peak_note_pass(self._last_pass)                            # peak hold / markers
+                except Exception as e:
+                    print(f"peak: could not use the finished pass: {e!r}")
             if getattr(self, "wf_enabled", False):
                 try:
                     self.wf_note_pass(self._last_pass)
@@ -3588,6 +3603,9 @@ class EmcScanner(QtWidgets.QMainWindow):
             # off) this reduces to exactly the original single-capture formula, since
             # 10*log10(|spec|^2) == 20*log10(|spec|).
             power_acc = None
+            # Peak detector (EmcScanner.peak_*): keep the largest power per bin over the captures instead of the mean. Surveys, the CAL
+            # and the stitch check always use the average detector.
+            peak_det = bool(getattr(self, 'detector_peak', False)) and self._survey is None and self._stitch is None
             captures_done = 0
             read_failed = False
             for _k in range(n_avg):
@@ -3606,7 +3624,11 @@ class EmcScanner(QtWidgets.QMainWindow):
                 spec = np.fft.fftshift(np.fft.fft(samples * window))
                 spec = spec / NFFT
                 power = np.abs(spec) ** 2
-                power_acc = power if power_acc is None else power_acc + power
+                # (previous: power_acc = power if power_acc is None else power_acc + power)
+                if peak_det:
+                    power_acc = power if power_acc is None else np.maximum(power_acc, power)
+                else:
+                    power_acc = power if power_acc is None else power_acc + power
                 captures_done += 1
 
             if read_failed:
@@ -3625,7 +3647,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                 # Stopped before a single capture completed - nothing to store this block.
                 continue
 
-            mean_power = power_acc / float(captures_done)
+            # (previous: mean_power = power_acc / float(captures_done))
+            mean_power = power_acc if peak_det else power_acc / float(captures_done)   # peak detector: the maximum itself, not a mean
             psd_full = 10.0 * np.log10(mean_power + 1e-12) + self._psd_to_dbuv_const
 
             # Frequency axis for this FFT block (use same fc). Use the LIVE sample rate
@@ -4742,6 +4765,21 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.START_FREQ, self.STOP_FREQ = sf, st
             self.SAMPLE_RATE, self.gain_db = sr, sg
             self.centers = (np.array([sf], dtype=np.float64) if sf == st else self.build_centers(sf, st, sr))
+            # Put the RADIO back too. This is the worker thread, the only one allowed to touch the driver. Without this the radio stayed at
+            # the LAST rate and gain of the CAL while the front panel showed the user's, and because the display's factor is looked up for
+            # the rate the radio is applied at, the "Cal:" label and the scaling of the trace used the wrong rate's factor until something
+            # re-applied the user's rate (a new sweep, or changing the sample rate).
+            try:
+                if self.sdr is not None:
+                    self.sdr.sample_rate = sr
+                    self._applied_sample_rate = sr
+                    self.apply_gain_if_changed()                      # re-applies self.gain_db (= sg, restored above)
+            except Exception as e:
+                print(f"cal_loop: could not put the radio back to {sr/1e6:.3f} MS/s: {e!r}")
+            # Drop the CAL's last spectrum too: it is one block taken at the last CAL rate, and must not be shown with the user's rate's
+            # factor. (The sweep re-allocates its arrays when it next runs.)
+            self.freq_axis = np.array([], dtype=np.float64)
+            self.power_axis = np.array([], dtype=np.float64)
             self.cal_signals.done.emit(bool(aborted))
 
     @staticmethod
@@ -5048,6 +5086,12 @@ class EmcScanner(QtWidgets.QMainWindow):
                 self.log(f"CAL survey: could not write the report: {e}")
         self.sync_sample_rate_combo()
         self.sync_gain_slider()
+        try:
+            self.curve.setData([], [])                       # the CAL's last spectrum is gone (see cal_loop): do not leave it on screen
+        except Exception:
+            pass
+        self._plot_freq_axis = np.array([], dtype=np.float64)
+        self._plot_power_axis = np.array([], dtype=np.float64)
         self.update_status_panel()
         self.survey_set_lock(False)
         self._cal = None
@@ -5745,6 +5789,9 @@ class EmcScanner(QtWidgets.QMainWindow):
         for b in btns:
             b.setFixedSize(w, hh)
 
+        # 6. peak detection row (detector, peak hold, peak markers) under the Show Freq Markers row
+        self.peak_build_ui(left_layout)
+
     def wf_install_splitter(self, left_layout):
         """Put the graph and the waterfall in one vertical splitter so the waterfall's height is adjustable."""
         idx = left_layout.indexOf(self.plot)
@@ -5884,6 +5931,9 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.chk_cispr.setChecked(False)
         self.dbfs_apply_labels()
         self.wf_clear()
+        if hasattr(self, "peak_curve"):
+            self.peak_reset()                                     # the held maxima were in the old units
+            self._peak_live = None
         if getattr(self, "reference_power", None) is not None:
             self.reference_power = None
             self.reference_freq = None
@@ -5958,6 +6008,12 @@ class EmcScanner(QtWidgets.QMainWindow):
                 sp.setValue(sp.value() + delta)
                 sp.blockSignals(False)
             self.wf_redraw()
+        if getattr(self, "_peak_live", None) is not None:           # peak hold / marker data moves too
+            self._peak_live = (self._peak_live[0], self._peak_live[1] + delta)
+            if self._peak_y is not None:
+                self._peak_y = self._peak_y + delta
+                self.peak_curve.setData(self._peak_f, self._peak_y)
+            self.peak_update_markers()
         if getattr(self, "reference_power", None) is not None:      # the captured reference trace moves too
             try:
                 self.reference_power = np.asarray(self.reference_power, dtype=np.float64) + delta
@@ -5969,6 +6025,259 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.update_plot()
         except Exception:
             pass
+    # ------------------------------------------------------------------------------------
+    # PEAK DETECTION: peak detector, peak hold (max hold) and peak markers
+    # ------------------------------------------------------------------------------------
+    # Three separate tools, on their own row under the Show Freq Markers row:
+    #   * Detector  Average (default) | Peak.  How the captures inside ONE block are combined. Average: the mean power (smooth trace,
+    #               bursts are diluted). Peak: the largest power seen in each bin over the captures - a short burst that falls inside the
+    #               averaging window shows at full height. The number of captures is the Time Averaging count (tick it and set the number;
+    #               with it off there is one capture per block and the two detectors are the same). Surveys, the CAL and the stitch check
+    #               always use the average detector.
+    #   * Peak hold Keeps, for every frequency, the highest level seen over successive passes (sweeps) and draws it as a second trace.
+    #               It restarts by itself when the band changes or the units change; use Reset after changing the gain, the attenuator
+    #               or the sample rate if you do not want the old maxima to stay.
+    #   * Mark peaks Marks the N strongest peaks of the trace (the peak-hold trace if Peak hold is on, otherwise the live trace) within the
+    #               part of the spectrum that is on screen, with their frequency and level in the units being displayed. Zoom in and the
+    #               markers re-pick the strongest peaks of the part you are looking at. Updated once per finished sweep.
+    # "Save peaks..." writes the peak table and the hold / live traces to a CSV file.
+
+    def peak_build_ui(self, left_layout):
+        self.detector_peak = False                 # read by the worker thread (sweep_loop)
+        self.peak_hold_on = False
+        self.peak_mark_on = False
+        self._peak_f = None                        # peak-hold trace
+        self._peak_y = None
+        self._peak_key = None
+        self._peak_live = None                     # (f, y) of the last finished pass
+        self.peak_signals = PeakSignals()
+        self.peak_signals.update.connect(self.peak_on_pass)
+
+        self.peak_curve = pg.PlotDataItem(pen=pg.mkPen((255, 120, 0), width=1))
+        self.peak_curve.setZValue(3)
+        self.peak_curve.setVisible(False)
+        self.plot.addItem(self.peak_curve)
+        self.peak_scatter = pg.ScatterPlotItem(size=11, symbol="d", pen=pg.mkPen((0, 0, 0)), brush=pg.mkBrush(255, 235, 59))
+        self.peak_scatter.setZValue(6)
+        self.plot.addItem(self.peak_scatter)
+        self.peak_labels = []
+        for k in range(PEAK_MAX_MARKERS):
+            t = pg.TextItem(text="", color=(255, 235, 59) if k == 0 else (235, 235, 235), anchor=(0.5, 1.15))
+            t.setZValue(7)
+            t.setVisible(False)
+            self.plot.addItem(t)
+            self.peak_labels.append(t)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Peak:"))
+        self.cb_detector = QtWidgets.QComboBox()
+        self.cb_detector.addItems(["Average detector", "Peak detector"])
+        self.cb_detector.setToolTip("How the captures of one block are combined. Average: mean power (smooth). Peak: the largest power per bin,\n"
+                                    "so short bursts are not diluted. The number of captures is the Time Averaging count (tick it and set a number).\n"
+                                    "Surveys, the CAL and the stitch check always use the average detector.")
+        self.cb_detector.currentIndexChanged.connect(self.peak_on_detector)
+        row.addWidget(self.cb_detector)
+        self.chk_peak_hold = QtWidgets.QCheckBox("Peak hold")
+        self.chk_peak_hold.setToolTip("Keep the highest level seen at every frequency over successive sweeps (orange trace). Restarts when the band or the units\n"
+                                      "change; press Reset after changing the gain, attenuator or sample rate.")
+        self.chk_peak_hold.toggled.connect(self.peak_on_hold_toggled)
+        row.addWidget(self.chk_peak_hold)
+        btn_reset = QtWidgets.QPushButton("Reset peak")
+        btn_reset.setToolTip("Clear the peak-hold trace and start again.")
+        btn_reset.clicked.connect(self.peak_reset)
+        row.addWidget(btn_reset)
+        self.chk_peak_mark = QtWidgets.QCheckBox("Mark peaks")
+        self.chk_peak_mark.setToolTip("Mark the strongest peaks of the trace on screen (of the peak-hold trace if Peak hold is on) with their frequency and level.")
+        self.chk_peak_mark.toggled.connect(self.peak_on_mark_toggled)
+        row.addWidget(self.chk_peak_mark)
+        self.sp_peak_n = QtWidgets.QSpinBox()
+        self.sp_peak_n.setRange(1, PEAK_MAX_MARKERS)
+        self.sp_peak_n.setValue(5)
+        self.sp_peak_n.setPrefix("top ")
+        self.sp_peak_n.setToolTip("How many peaks to mark.")
+        self.sp_peak_n.valueChanged.connect(lambda _v: self.peak_update_markers())
+        row.addWidget(self.sp_peak_n)
+        btn_save = QtWidgets.QPushButton("Save peaks...")
+        btn_save.setToolTip("Save the peak table and the peak-hold / live traces to a CSV file.")
+        btn_save.clicked.connect(self.peak_save_csv)
+        row.addWidget(btn_save)
+        row.addStretch(1)
+        mk = self.find_layout_with(self.chk_markers)
+        idx = -1
+        for i in range(left_layout.count()):
+            if left_layout.itemAt(i).layout() is mk:
+                idx = i
+        if idx >= 0:
+            left_layout.insertLayout(idx + 1, row)
+        else:
+            left_layout.addLayout(row)
+        self._peak_vb_filter = None
+        try:
+            self.plot.getViewBox().sigXRangeChanged.connect(lambda *_: QtCore.QTimer.singleShot(120, self.peak_update_markers))
+        except Exception:
+            pass
+
+    # ---- switches ----
+    def peak_on_detector(self, idx):
+        self.detector_peak = (idx == 1)
+        self.log("Detector: " + ("PEAK (largest power per bin over the captures of a block; count = Time Averaging)" if self.detector_peak else "average"))
+
+    def peak_on_hold_toggled(self, on):
+        self.peak_hold_on = bool(on)
+        if not on:
+            self.peak_curve.setVisible(False)
+        else:
+            self.peak_curve.setVisible(self._peak_f is not None)
+        self.peak_update_markers()
+
+    def peak_on_mark_toggled(self, on):
+        self.peak_mark_on = bool(on)
+        self.peak_update_markers()
+
+    def peak_reset(self):
+        self._peak_f = None
+        self._peak_y = None
+        self._peak_key = None
+        try:
+            self.peak_curve.setData([], [])
+        except Exception:
+            pass
+        self.peak_update_markers()
+
+    def units_short(self):
+        """Short unit name for the labels."""
+        if getattr(self, "display_dbfs", False):
+            return "dBFS"
+        if abs(float(self.cispr_offset_db)) < 1e-9:
+            return "dBµV"
+        return "dBµV (LISN)" if self.cispr_mode == "conducted" else "dBµV/m"
+
+    # ---- data in ----
+    def peak_note_pass(self, lp):
+        """WORKER thread: a finished clean pass -> displayed levels, handed to the GUI for the hold trace and the markers."""
+        if lp is None or self._survey is not None or self._stitch is not None:
+            return
+        f = np.asarray(lp["f"], dtype=np.float64)
+        p = np.asarray(lp["p"], dtype=np.float64)
+        ok = np.isfinite(f) & np.isfinite(p)
+        f, p = f[ok], p[ok]
+        if f.size < 8:
+            return
+        order = np.argsort(f)
+        f, p = f[order], p[order]
+        y = p + self.display_offset_for(lp["rate"], lp["gain"])               # SDR dB -> the display's units
+        self.peak_signals.update.emit(f, y, f"{self.START_FREQ:.0f}-{self.STOP_FREQ:.0f}")
+
+    def peak_on_pass(self, f, y, key):
+        """GUI thread: a finished pass arrived."""
+        f = np.asarray(f, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        self._peak_live = (f, y)
+        if self.peak_hold_on:
+            if self._peak_f is None or self._peak_key != key:
+                self._peak_f, self._peak_y, self._peak_key = f.copy(), y.copy(), key          # first pass, or a new band: start afresh
+            else:
+                if f.size != self._peak_f.size or abs(f[0] - self._peak_f[0]) > 1e-3 or abs(f[-1] - self._peak_f[-1]) > 1e-3:
+                    y = self.wf_to_grid(f, y[None, :], self._peak_f)[0].astype(np.float64)       # the bins moved (sample rate): fit to the held grid
+                self._peak_y = np.fmax(self._peak_y, y)                                          # the highest level seen so far
+            self.peak_curve.setData(self._peak_f, self._peak_y)
+            self.peak_curve.setVisible(True)
+        self.peak_update_markers()
+
+    # ---- peak picking and markers ----
+    @staticmethod
+    def peak_find(f, y, n):
+        """The n strongest local maxima of y(f), at least 2 % of the span apart. The strongest is always returned; the others must
+        stand PEAK_MIN_ABOVE_MEDIAN_DB above the median level. Returns a list of (frequency, level), strongest first."""
+        f = np.asarray(f, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        ok = np.isfinite(y)
+        f, y = f[ok], y[ok]
+        if y.size < 3:
+            return []
+        inner = np.flatnonzero((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:])) + 1
+        cand = inner if inner.size else np.array([int(np.argmax(y))])
+        cand = cand[np.argsort(y[cand])[::-1]]
+        span = float(f[-1] - f[0]) or 1.0
+        sep = max(8.0 * span / y.size, 0.02 * span)
+        floor = float(np.median(y)) + PEAK_MIN_ABOVE_MEDIAN_DB
+        out = []
+        for i in cand:
+            if out and (y[i] < floor or any(abs(f[i] - fo) < sep for fo, _ in out)):
+                continue
+            out.append((float(f[i]), float(y[i])))
+            if len(out) >= n:
+                break
+        return out
+
+    def peak_source(self):
+        """The (f, y) the markers read: the peak-hold trace if it is on and exists, else the last finished pass."""
+        if self.peak_hold_on and self._peak_f is not None:
+            return self._peak_f, self._peak_y
+        return self._peak_live if self._peak_live is not None else (None, None)
+
+    def peak_update_markers(self):
+        """GUI thread: place the peak markers and labels (strongest N peaks of what is on screen)."""
+        try:
+            for t in self.peak_labels:
+                t.setVisible(False)
+            self.peak_scatter.setData([], [])
+            if not self.peak_mark_on:
+                return
+            f, y = self.peak_source()
+            if f is None:
+                return
+            x0, x1 = self.plot.getViewBox().viewRange()[0]
+            sel = (f >= x0) & (f <= x1)
+            if int(sel.sum()) < 3:
+                sel = np.ones(f.size, dtype=bool)
+            peaks = self.peak_find(f[sel], y[sel], int(self.sp_peak_n.value()))
+            if not peaks:
+                return
+            self.peak_scatter.setData([p[0] for p in peaks], [p[1] for p in peaks])
+            unit = self.units_short()
+            for k, (pf, pl) in enumerate(peaks):
+                t = self.peak_labels[k]
+                t.setText(f"{pf / 1e6:.4f} MHz\n{pl:.1f} {unit}")
+                t.setPos(pf, pl)
+                t.setVisible(True)
+        except Exception as e:
+            print("peak_update_markers:", e)
+
+    def peak_save_csv(self):
+        """Save the peak table (whole spectrum) and the peak-hold and live traces."""
+        f, y = self.peak_source()
+        if f is None:
+            self.log("Peaks: nothing to save yet - run a sweep first")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save peaks", "peaks.csv", "CSV (*.csv)")
+        if not path:
+            return
+        unit = self.units_short()
+        name = self.csv_level_name().replace("level_", "")
+        live = None
+        if self._peak_live is not None:
+            lf, ly = self._peak_live
+            live = ly if (lf.size == f.size and abs(lf[0] - f[0]) < 1e-3 and abs(lf[-1] - f[-1]) < 1e-3) else self.wf_to_grid(lf, ly[None, :], f)[0]
+        hold = self._peak_y if (self.peak_hold_on and self._peak_f is not None) else None
+        try:
+            with open(path, "w", newline="") as fh:
+                fh.write(f"# peaks of the {'peak-hold' if hold is not None else 'live'} trace, strongest first ({unit}); saved {time.strftime('%Y-%m-%d %H:%M')}\n")
+                fh.write(f"# rank, frequency_hz, level_{name}\n")
+                for k, (pf, pl) in enumerate(self.peak_find(f, y, int(self.sp_peak_n.value())), 1):
+                    fh.write(f"# {k}, {pf:.0f}, {pl:.2f}\n")
+                cols = ["freq_hz"] + ([f"hold_{name}"] if hold is not None else []) + ([f"live_{name}"] if live is not None else [])
+                fh.write(",".join(cols) + "\n")
+                for i in range(f.size):
+                    row = [f"{f[i]:.0f}"]
+                    if hold is not None:
+                        row.append(f"{hold[i]:.2f}")
+                    if live is not None:
+                        row.append(f"{live[i]:.2f}")
+                    fh.write(",".join(row) + "\n")
+            self.log(f"Peaks saved to {path}")
+        except Exception as e:
+            self.log(f"Peaks: could not save: {e}")
     # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
 #    def survey_connect_signals(self):
 #        self.survey_signals = SurveySignals()
@@ -6940,6 +7249,15 @@ class EmcScanner(QtWidgets.QMainWindow):
         finally:
             self.SAMPLE_RATE = s["orig_rate"]               # put the operator's settings back
             self.gain_db = s["orig_gain"]
+            # ...and the radio too (this thread is the only one allowed to touch the driver): it was left at the last survey rate and
+            # gain, so the display used that rate's dB->dBuV factor until something re-applied the user's rate
+            try:
+                if self.sdr is not None:
+                    self.sdr.sample_rate = self.SAMPLE_RATE
+                    self._applied_sample_rate = self.SAMPLE_RATE
+                    self.apply_gain_if_changed()
+            except Exception as e:
+                print(f"survey_loop: could not put the radio back: {e!r}")
             self.survey_signals.done.emit(bool(aborted))
 
     @staticmethod
