@@ -35,9 +35,6 @@ def _add_dll_dir(path):
             os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
     except Exception as e:
         print(f"warning: could not add DLL directory {path!r}: {e}")
-# add the Current directory as it contains the crucial dll and retry
-# os.add_dll_directory(target_dir)
-# print(f"Called os.add_dll_directory({target_dir!r})")
 
 #--------------------------------------------------------------
 # Notes for calibration. 
@@ -62,7 +59,6 @@ ENABLE_DRIVER_SELECTION=False
 # # ---- SWEEP PROFILE ( variables) ----
 START_FREQ = 95e6       # 150 kHz
 STOP_FREQ  = 102e6        # 30 MHz
-#STEP_HZ    = 2000       # 300 kHz per center
 SAMPLE_RATE = 2.4e6      # Hz
 NFFT        = 4096
 GAIN_DB        = 120     # Requested gain, in dB - NOT a raw device table index. The
@@ -91,9 +87,6 @@ STITCH_EDGE_MASK_FRACTION = 0.15   # 15% discarded off each edge (30% of each bl
 # 900,001-3,200,000 S/s (nothing between 0.3 and 0.9 MS/s works). This list covers both
 # ranges with the commonly used rates; add any other valid rate here if you need it.
 # NB: rates above ~2.56 MS/s can drop samples on some USB ports/PCs.
-# ---- previous sample-rate list (0.25 - 3.2 MS/s, 18 values), kept in case of problems ----
-# SAMPLE_RATE_CHOICES = [0.25e6, 0.3e6,
-#                        1.0e6, 1.024e6, 1.2e6, 1.4e6, 1.5e6, 1.6e6, 1.8e6, 1.92e6, 2.0e6, 2.048e6,
 #                        2.4e6, 2.56e6, 2.8e6, 2.88e6, 3.0e6, 3.2e6]
 
 # Only the sample rates the RTL2832U handles well are offered (the same short list SDR# and most SDR programs use).
@@ -171,137 +164,12 @@ def _parse_bool(text):
     raise ValueError(f"not a true/false value: {text!r}")
 
 
-# ---- previous load_settings() (no "setting" rows), kept in case of problems ----
-# def load_settings():
-#     """Read settings.csv. Returns (defaults_dict, presets_list, path_used).
-#     defaults_dict may hold start_freq, stop_freq, sample_rate, gain_db (any that were
-#     given). presets_list uses the same tuple layout as _FALLBACK_PRESETS. On any
-#     problem with the file as a whole, falls back to the built-in presets; a bad single
-#     row is reported and skipped."""
-#     path = next((p for p in _settings_search_paths() if os.path.isfile(p)), None)
-#     if path is None:
-#         print(f"settings: {SETTINGS_FILENAME} not found - using built-in presets")
-#         return {}, list(_FALLBACK_PRESETS), None
-#     defaults, presets = {}, []
-#     try:
-#         with open(path, newline="", encoding="utf-8-sig") as fh:
-#             lines = [ln for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
-#         reader = csv.DictReader(lines, skipinitialspace=True)
-#         reader.fieldnames = [(n or "").strip().lower() for n in (reader.fieldnames or [])]
-#         for rownum, row in enumerate(reader, start=2):
-#             kind = (row.get("type") or "").strip().lower()
-#             try:
-#                 start = _parse_hz(row["start"])
-#                 stop = _parse_hz(row["stop"])
-#                 rate = _parse_hz(row["sample_rate"])
-#                 gain = float(str(row["gain_db"]).strip())
-#                 if start <= 0 or stop < start or rate <= 0:
-#                     raise ValueError("need 0 < start <= stop and sample_rate > 0")
-#                 if not any(lo <= rate <= hi for lo, hi in RTL_VALID_RATE_RANGES):
-#                     print(f"settings: row {rownum}: sample_rate {rate:.0f} S/s is outside the "
-#                           f"RTL-SDR's valid ranges (225001-300000, 900001-3200000) - the "
-#                           f"driver will probably refuse it")
-#                 if kind == "default":
-#                     defaults = {"start_freq": start, "stop_freq": stop,
-#                                 "sample_rate": rate, "gain_db": gain}
-#                 elif kind == "preset":
-#                     label = (row.get("label") or "").strip()
-#                     if not label:
-#                         raise ValueError("preset needs a label (the button text)")
-#                     name = (row.get("name") or "").strip() or label
-#                     hf = _parse_bool(row.get("hf_mode") or "")
-#                     cal = float(str(row.get("dbuv_cal") or "0").strip() or 0)
-#                     presets.append((name, label, start, stop, rate, gain, hf, cal))
-#                 else:
-#                     raise ValueError(f"unknown type {kind!r} (use 'default' or 'preset')")
-#             except Exception as e:
-#                 print(f"settings: {os.path.basename(path)} row {rownum} skipped: {e}")
-#     except Exception as e:
-#         print(f"settings: could not read {path}: {e} - using built-in presets")
-#         return {}, list(_FALLBACK_PRESETS), None
-#     if not presets:
-#         print(f"settings: no valid presets in {path} - using built-in presets")
-#         presets = list(_FALLBACK_PRESETS)
-#     print(f"settings: loaded {len(presets)} presets from {path}")
-#     return defaults, presets, path
-
 # Program settings read from settings.csv rows of type "setting" (key in the name column, value in the
 # label column - or a "value" column if you add one). Filled in by load_settings().
 SETTINGS_EXTRA = {}
-# (previous: _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog"))
 _KNOWN_SETTINGS = ("dc_offset_removal", "iq_balance_correction", "driver", "driver_root", "driver_dialog",
                    "saturation_line", "saturation_margin_db", "waterfall", "waterfall_rows", "y_span_above_floor_db", "display_dbfs")   # (plus cal_<sample rate Hz> rows)
 
-
-# ---- previous load_settings() (warned about cal_ rows), kept in case of problems ----
-#def load_settings():
-#    """Read settings.csv. Returns (defaults_dict, presets_list, path_used).
-#    defaults_dict may hold start_freq, stop_freq, sample_rate, gain_db (any that were
-#    given). presets_list uses the same tuple layout as _FALLBACK_PRESETS. Rows of type
-#    "setting" (program options such as dc_offset_removal, iq_balance_correction, driver,
-#    driver_root, driver_dialog) go into the module-level SETTINGS_EXTRA dict. On any
-#    problem with the file as a whole, falls back to the built-in presets; a bad single
-#    row is reported and skipped."""
-#    SETTINGS_EXTRA.clear()
-#    path = next((p for p in _settings_search_paths() if os.path.isfile(p)), None)
-#    if path is None:
-#        print(f"settings: {SETTINGS_FILENAME} not found - using built-in presets")
-#        return {}, list(_FALLBACK_PRESETS), None
-
-#    defaults, presets = {}, []
-#    try:
-#        with open(path, newline="", encoding="utf-8-sig") as fh:
-#            lines = [ln for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
-#        reader = csv.DictReader(lines, skipinitialspace=True)
-#        reader.fieldnames = [(n or "").strip().lower() for n in (reader.fieldnames or [])]
-#        for rownum, row in enumerate(reader, start=2):
-#            kind = (row.get("type") or "").strip().lower()
-#            try:
-#                if kind == "setting":
-#                    key = (row.get("name") or "").strip().lower()
-#                    val = (row.get("value") or row.get("label") or "").strip()
-#                    if not key:
-#                        raise ValueError("a setting needs a name (the setting key)")
-#                    if key not in _KNOWN_SETTINGS:
-#                        print(f"settings: row {rownum}: unknown setting {key!r} (known: {', '.join(_KNOWN_SETTINGS)})")
-#                    SETTINGS_EXTRA[key] = val
-#                    continue
-#                start = _parse_hz(row["start"])
-#                stop = _parse_hz(row["stop"])
-#                rate = _parse_hz(row["sample_rate"])
-#                gain = float(str(row["gain_db"]).strip())
-#                if start <= 0 or stop < start or rate <= 0:
-#                    raise ValueError("need 0 < start <= stop and sample_rate > 0")
-#                if not any(lo <= rate <= hi for lo, hi in RTL_VALID_RATE_RANGES):
-#                    print(f"settings: row {rownum}: sample_rate {rate:.0f} S/s is outside the "
-#                          f"RTL-SDR's valid ranges (225001-300000, 900001-3200000) - the "
-#                          f"driver will probably refuse it")
-#                if kind == "default":
-#                    defaults = {"start_freq": start, "stop_freq": stop,
-#                                "sample_rate": rate, "gain_db": gain}
-#                elif kind == "preset":
-#                    label = (row.get("label") or "").strip()
-#                    if not label:
-#                        raise ValueError("preset needs a label (the button text)")
-#                    name = (row.get("name") or "").strip() or label
-#                    hf = _parse_bool(row.get("hf_mode") or "")
-#                    cal = float(str(row.get("dbuv_cal") or "0").strip() or 0)
-#                    presets.append((name, label, start, stop, rate, gain, hf, cal))
-#                else:
-#                    raise ValueError(f"unknown type {kind!r} (use 'default', 'preset' or 'setting')")
-#            except Exception as e:
-#                print(f"settings: {os.path.basename(path)} row {rownum} skipped: {e}")
-#    except Exception as e:
-#        print(f"settings: could not read {path}: {e} - using built-in presets")
-#        return {}, list(_FALLBACK_PRESETS), None
-
-#    if not presets:
-#        print(f"settings: no valid presets in {path} - using built-in presets")
-#        presets = list(_FALLBACK_PRESETS)
-#    print(f"settings: loaded {len(presets)} presets from {path}")
-#    if SETTINGS_EXTRA:
-#        print("settings: program settings: " + ", ".join(f"{k}={v}" for k, v in SETTINGS_EXTRA.items()))
-#    return defaults, presets, path
 
 def load_settings():
     """Read settings.csv. Returns (defaults_dict, presets_list, path_used).
@@ -609,7 +477,6 @@ SURVEY_REPEAT_LOCAL_DB = 3.0           # ... or more than SURVEY_REPEAT_LOCAL_FR
 SURVEY_REPEAT_LOCAL_FRAC = 0.01        #     (the limit is raised automatically when averaging is low and the noise scatter is larger)
 SURVEY_REPEAT_SPIKE_PROM_DB = 10.0     # ... or a spike this strong is in one scan and missing in the other
 import json
-# (previous report page, kept in case of problems - no longer used)
 _SURVEY_REPORT_TEMPLATE_V1 = r'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>RF gain / sample-rate survey</title>
 <style>
@@ -1630,45 +1497,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             QtCore.Q_ARG(str, msg)
         )
 
-    # ---- previous update_status_panel() (single Cal label), kept in case of problems ----
-#    def update_status_panel(self):
-#        """
-#        Rebuild the stable status panel text from the current live settings. Called
-#        whenever a setting actually changes (set_preset, averaging toggled/changed) -
-#        NOT once per sweep block - and safe to call from either thread since QLabel's
-#        setText is invoked via a queued call, matching the thread-safety pattern log() uses.
-#        """
-#        mode_label = getattr(self, "current_mode_label", "-")
-#        avg_text = (f"ON ({self.avg_count})" if getattr(self, "avg_enabled", False)
-#                    else "OFF")
-#        # Show the actual applied gain alongside the requested one - but ONLY when
-#        # actual_gain_db is known to have been measured against the CURRENTLY selected
-#        # gain_db. Right after a MODE switch, self.gain_db has changed but the hardware
-#        # hasn't been touched yet (that only happens when a sweep next starts), so
-#        # actual_gain_db/actual_gain_db_for_request still reflect the PREVIOUS mode -
-#        # comparing them against the new gain_db would report a false, stale mismatch.
-#        actual = getattr(self, "actual_gain_db", None)
-#        actual_for = getattr(self, "actual_gain_db_for_request", None)
-#        if actual is not None and actual_for == self.gain_db:
-#            if abs(actual - self.gain_db) > 0.5:
-#                gain_text = f"{self.gain_db:.1f} dB requested -> {actual:.1f} dB actual"
-#            else:
-#                gain_text = f"{self.gain_db:.1f} dB"
-#        else:
-#            gain_text = f"{self.gain_db:.1f} dB (not yet applied - press Start)"
-#        text = (
-#            f"Mode: {mode_label}\n"
-#            f"Start: {self.START_FREQ/1e6:.3f} MHz    Stop: {self.STOP_FREQ/1e6:.3f} MHz\n"
-#            f"Sample Rate: {self.SAMPLE_RATE/1e6:.3f} MS/s    Gain: {gain_text}\n"
-#            f"Averaging: {avg_text}"
-#        )
-#        QtCore.QMetaObject.invokeMethod(
-#            self.status_panel,
-#            "setText",
-#            QtCore.Qt.QueuedConnection,
-#            QtCore.Q_ARG(str, text)
-#        )
-
     def update_status_panel(self):
         """
         Rebuild the stable status panel text from the current live settings. Called
@@ -1714,35 +1542,6 @@ class EmcScanner(QtWidgets.QMainWindow):
 
     # Use this to build centers across the sweep band
     # start_hz, stop_hz, sample_rate are floats
-    # ---- previous build_centers() (no layout shift), kept in case of problems ----
-#     def build_centers(self, start_hz, stop_hz, sample_rate):
-#         """
-#         Build sweep centers so that, once each block's masked edges are discarded (see
-#         STITCH_EDGE_MASK_FRACTION / self.stitch_edge_mask_fraction), the remaining "kept"
-#         slices tile the sweep range with no gaps and no overlap.
-#         Each block still captures the FULL sample_rate of bandwidth - the FFT size,
-#         window, and sample rate are unchanged. Only the displayed/stored portion of each
-#         block is narrower (the middle (1 - 2*mask_frac) of it), so centers hop by that
-#         narrower "display" width instead of by the full sample_rate.
-#         """
-#         mask_frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
-#         display_width = sample_rate * (1.0 - 2.0 * mask_frac)
-#         if display_width <= 0:
-#             # Degenerate configuration (mask_frac >= 0.5) - fall back to no masking
-#             # rather than dividing by ~0 or producing a reversed/empty sweep.
-#             display_width = sample_rate
-#             mask_frac = 0.0
-#         # first center is positioned so the first block's KEPT (displayed) slice starts
-#         # exactly at start_hz, not the first block's raw captured edge.
-#         first = start_hz + sample_rate * (0.5 - mask_frac)
-#         # Number of blocks needed so the kept slices cover [start_hz, stop_hz] completely.
-#         # (The old np.arange(first, stop_hz, ...) form dropped any centre at or above stop_hz,
-#         # which both left the top of a band unswept - e.g. the trace ending at 1.55 MHz in a
-#         # 150k-2M mode at 2.0 MS/s - and returned NO centres at all when one block covers
-#         # the whole band but its centre falls above stop_hz, e.g. 150k-1.2M at 3.2 MS/s.)
-#         span = stop_hz - start_hz
-#         n_blocks = max(1, int(math.ceil(span / display_width - 1e-9)))
-#         return first + display_width * np.arange(n_blocks, dtype=np.float64)
 
     def build_centers(self, start_hz, stop_hz, sample_rate):
         """
@@ -1770,10 +1569,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         start_hz = start_hz - shift * display_width
         first = start_hz + sample_rate * (0.5 - mask_frac)
         # Number of blocks needed so the kept slices cover [start_hz, stop_hz] completely.
-        # (The old np.arange(first, stop_hz, ...) form dropped any centre at or above stop_hz,
-        # which both left the top of a band unswept - e.g. the trace ending at 1.55 MHz in a
-        # 150k-2M mode at 2.0 MS/s - and returned NO centres at all when one block covers
-        # the whole band but its centre falls above stop_hz, e.g. 150k-1.2M at 3.2 MS/s.)
         span = stop_hz - start_hz
         n_blocks = max(1, int(math.ceil(span / display_width - 1e-9)))
         return first + display_width * np.arange(n_blocks, dtype=np.float64)
@@ -1862,11 +1657,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Both target known direct-conversion-receiver artefacts that track center
         # frequency and sample rate rather than being real signals - see
         # _remove_dc_offset() / _correct_iq_imbalance() for what each one does and why.
-        # DC Offset Removal defaults ON - it was found to be the far larger of the two
-        # effects on this hardware. IQ Balance Correction still defaults off.
-        # (previous: self.dc_removal_enabled = True / self.iq_balance_enabled = False)
-        # Both now come from settings.csv (dc_offset_removal / iq_balance_correction) and default to ON;
-        # there are no tick boxes for them on the front panel any more.
+        # Both come from settings.csv (dc_offset_removal / iq_balance_correction) and default to ON;
+        # there are no tick boxes for them on the front panel.
         self.dc_removal_enabled = DC_OFFSET_REMOVAL
         self.iq_balance_enabled = IQ_BALANCE_CORRECTION
 
@@ -1874,32 +1666,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # panel (see update_status_panel()). "-" until a MODE button has been pressed.
         self.current_mode_label = "-"
 
-
-        # ---- previous driver selection block (hard-coded), kept in case of problems ----
-#         # ---- Driver selection at startup ----
-#         driver_dirs = {
-#             "Default (MSVC RTL-SDR Blog V4)": DRIVER_ROOT + "/default",
-#             "MS64 (libusb alt)": DRIVER_ROOT + "/ms64",
-#             "SDRSharp drivers Copy": DRIVER_ROOT + "/sdrsharp",
-#             "Experimental": DRIVER_ROOT + "/experimental"
-#         }
-#         if ENABLE_DRIVER_SELECTION:
-#             items = list(driver_dirs.keys())
-#             choice, ok = QtWidgets.QInputDialog.getItem(
-#                 self,
-#                 "Select RTL-SDR Driver",
-#                 "Choose driver set:",
-#                 items,
-#                 0,
-#                 False
-#             )
-#             if ok:
-#                 self.driver_path = driver_dirs[choice]
-#             else:
-#                 self.driver_path = driver_dirs["Default (MSVC RTL-SDR Blog V4)"]
-#         else:
-#             # Deterministic default path when selection is disabled
-#             self.driver_path = driver_dirs["Default (MSVC RTL-SDR Blog V4)"]
 
         # ---- Driver selection (settings.csv: driver / driver_root / driver_dialog) ----
         driver_dirs = {
@@ -2026,7 +1792,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # ---- Plot ----
         self.plot = pg.PlotWidget()
         self.plot.setLabel('bottom', 'Frequency', units='Hz')
-        # self.plot.setLabel('left', 'Level', units='dB')
         self.plot.setLabel('left', 'Level at input (dBµV)')
 
         # main FFT curve (left axis)
@@ -2046,7 +1811,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # This creates an independent right ViewBox so the right axis can show CISPR units
         # while the main (left) axis remains the FFT dB scale.
         self.plot.showAxis('right')
-        # self.plot.getAxis('right').setLabel('CISPR (dBµV)')
         self.plot.getAxis('right').setLabel(self.cispr_axis_label())
         self.plot.getAxis('right').setPen(pg.mkPen(color='red', width=2))
 
@@ -2076,12 +1840,8 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         # Keep the right VB's screen geometry glued to the main viewbox (runs on resize),
         # and keep the CISPR mapping/ticks following the left axis (runs on pan/zoom).
-        # NOTE: previously this connected self._on_view_range_changed to sigRangeChanged
-        # TWICE (once here, once again further down in __init__), so every pan/zoom
-        # redrew the CISPR line and ticks twice in a row. That double-fire, combined with
-        # update_cispr_curve() also being invoked from the worker thread (see update_plot()),
-        # is what made the line "jump" relative to its own axis. Both are fixed by routing
-        # everything through the cispr_* methods below and connecting each signal exactly once.
+        # Everything is routed through the cispr_* methods below, and each signal is connected
+        # exactly once, so a pan/zoom redraws the CISPR line and ticks only once.
         try:
             self.plot.getViewBox().sigResized.connect(self.cispr_sync_viewbox_geometry)
         except Exception:
@@ -2098,8 +1858,6 @@ class EmcScanner(QtWidgets.QMainWindow):
 
 
         # ---- Fixed Y-axis (no autoscale) ----
-        # self._left_ymin = -120.0
-        # self._left_ymax = 20.0
         self._left_ymin = -20.0
         self._left_ymax = 120.0
         self.plot.setYRange(self._left_ymin, self._left_ymax)
@@ -2169,7 +1927,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sample_rate_label = QtWidgets.QLabel("Sample Rate")
         self.sample_rate_combo = QtWidgets.QComboBox()
         for rate_hz in SAMPLE_RATE_CHOICES:
-            # (previous: addItem(f"{rate_hz/1e6:.3f} MS/s", rate_hz))
             rec_ = any(abs(rate_hz - r) < 1.0 for r in SAMPLE_RATE_RECOMMENDED)
             self.sample_rate_combo.addItem(f"{rate_hz/1e6:.3f} MS/s" + ("" if rec_ else " (not recommended)"), rate_hz)
         self.sample_rate_combo.setToolTip(
@@ -2237,19 +1994,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_offset_spin.setDecimals(1)
         self.cispr_offset_spin.setValue(self.cispr_offset_db)   # initial value from __init__
         self.cispr_offset_spin.setSuffix(" dB")
-        # self.cispr_offset_spin.setToolTip("Visual offset to align CISPR (accounts for antenna/attenuation). "
-        #                                    "Persists across MODE changes.")
-        # self.cispr_offset_spin.setToolTip("Offset of the CISPR (right) axis relative to the left dBuV axis "
-        #                                    "(e.g. antenna factor). Persists across MODE changes.")
-        # (label and tooltip are now set per limit type by cispr_refresh_corr_ui())
+        # label and tooltip are set per limit type by cispr_refresh_corr_ui()
 
         # Read-only display of the current mode's dBuV_Calibration, kept in sync by
         # cispr_refresh_offset_ui() whenever set_preset() changes mode.
-
-        # # place the controls in the same control row
-        # ctrl_layout.addWidget(self.cispr_offset_label)
-        # ctrl_layout.addWidget(self.cispr_offset_spin)
-        # ctrl_layout.addWidget(self.cispr_calibration_label)
 
         self.cispr_calibration_label = QtWidgets.QLabel(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
         self.cispr_calibration_label.setToolTip("CAL_SDR_DB_TO_DBUV - set in the code (top of the file).")
@@ -2324,37 +2072,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.btn_capture_ref.clicked.connect(self.reference_capture)
         self.chk_show_ref.toggled.connect(self.reference_toggle_visibility)
 
-        # ---- DC Offset Removal / IQ Balance Correction: no front-panel tick boxes any more ----
-        # Both default ON and are set from settings.csv (dc_offset_removal / iq_balance_correction); the
-        # old tick boxes are kept below, commented out, in case of problems.
-
-#         # ---- Signal-processing toggle row (artefact correction) ----
-#         # DC Offset Removal and IQ Balance Correction each target a specific
-#         # direct-conversion-receiver artefact that tracks center frequency / sample rate
-#         # rather than being a real signal - see _remove_dc_offset() / _correct_iq_imbalance().
-#         # DC Offset Removal defaults ON (confirmed to be the larger effect on this
-#         # hardware); IQ Balance Correction still defaults off - switch it on to see
-#         # whether it accounts for any remaining spike once DC removal is active.
-#         ctrl_layout3 = QtWidgets.QHBoxLayout()
-#         left_layout.addLayout(ctrl_layout3)
-#         self.chk_dc_removal = QtWidgets.QCheckBox("DC Offset Removal")
-#         self.chk_dc_removal.setChecked(self.dc_removal_enabled)
-#         self.chk_dc_removal.setToolTip(
-#             "Subtract each block's own mean IQ value before windowing/FFT. Targets the "
-#             "repeated spike at each block's center frequency caused by LO leakage / ADC "
-#             "DC bias - not a real signal if it moves when you change range or sample rate."
-#         )
-#         ctrl_layout3.addWidget(self.chk_dc_removal)
-#         self.chk_dc_removal.toggled.connect(self.dc_removal_on_toggle)
-#         self.chk_iq_balance = QtWidgets.QCheckBox("IQ Balance Correction")
-#         self.chk_iq_balance.setChecked(self.iq_balance_enabled)
-#         self.chk_iq_balance.setToolTip(
-#             "Blind per-block correction of I/Q gain and phase mismatch. Targets a mirrored "
-#             "spike reflected around each block's center frequency, caused by receiver I/Q "
-#             "imbalance rather than a real signal."
-#         )
-#         ctrl_layout3.addWidget(self.chk_iq_balance)
-#         self.chk_iq_balance.toggled.connect(self.iq_balance_on_toggle)
+        # ---- DC Offset Removal / IQ Balance Correction: no front-panel tick boxes ----
+        # Both default ON and are set from settings.csv (dc_offset_removal / iq_balance_correction).
 
         # ---- Sweep state ----
         self.stop_flag = threading.Event()
@@ -2384,8 +2103,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         # e.g. 402 -> 40.2 dB). gain_db values below are requested dB; init_sdr() reads back
         # and logs/warns if the device actually applied something different - see gain_db.
         # generally avoid HF mode as it has no gain.
-        # Presets now come from settings.csv (see load_settings() near the top of this file;
-        # the original hard-coded list is kept there as _FALLBACK_PRESETS).
+        # Presets come from settings.csv (see load_settings() near the top of this file;
+        # the built-in list is kept there as _FALLBACK_PRESETS).
         self.presets = list(PRESETS)
 
         # Create buttons in a loop so adding presets is trivial
@@ -2395,7 +2114,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.mode_buttons.append(btn)
             preset_panel.addWidget(btn)
             # bind the index into the lambda to avoid late-binding trap
-            # previous: btn.clicked.connect(lambda _, i=idx: self.set_preset(i))
             btn.clicked.connect(lambda _, i=idx: self.set_preset_and_run(i))   # set the preset, then start CONTINUOUS
 
         preset_panel.addStretch()
@@ -2410,9 +2128,9 @@ class EmcScanner(QtWidgets.QMainWindow):
         # sweep_loop() (and friends) print a LOT of routine per-block diagnostics (tuning,
         # checksums, peaks, etc.) - useful in the real console, but appending every one of
         # them to the GUI debug window is exactly what made it feel "jittery"/constantly
-        # scrolling. So: everything still goes to the real console as before, but only
+        # scrolling. So: everything goes to the real console, but only
         # messages that look like an error or warning are also forwarded to the GUI window.
-        # Routine diagnostics stay console-only; the debug window now only ever gets
+        # Routine diagnostics stay console-only; the debug window only gets
         # discrete lifecycle events (logged directly via self.log(), e.g. sweep started/
         # stopped, mode changed) plus genuine errors/warnings - exactly the "stable unless
         # something goes wrong" behaviour asked for.
@@ -2501,16 +2219,11 @@ class EmcScanner(QtWidgets.QMainWindow):
         print("Tuner type:", self.sdr.get_tuner_type())
         print("Supported gains:", self.sdr.get_gains())
 
-       # self.sdr.center_freq = 100e6
-       # self.sdr.sample_rate = 2.4e6
-       # self.sdr.gain = 0
-
         print("Reading samples…")
         samples = self.sdr.read_samples(256)
         print("Sample[0:10]:", samples[:10])
 
         # DO NOT close here — this is your main SDR handle
-        # self.sdr.close()
         # Always reapply parameters - use the LIVE preset values (self.SAMPLE_RATE /
         # self.gain_db), which set_preset() updates when a MODE button is pressed.
         # Using the module-level SAMPLE_RATE/GAIN_DB constants here would silently ignore
@@ -2680,15 +2393,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_update_axis_ticks()
 
  
-    # ---- previous cal_total_offset_db() (one factor for all rates), kept in case of problems ----
-#    def cal_total_offset_db(self):
-#        """dB to ADD to a stored 'SDR dB' value to get dBuV at the INPUT of the external attenuator."""
-#        applied = getattr(self, "_applied_gain_db", None)
-#        gain = float(applied if applied is not None else self.gain_db)
-#        if self.hf_mode:
-#            gain = 0.0   # direct-sampling path has no tuner gain (and is NOT calibrated by CAL_SDR_DB_TO_DBUV)
-#        return CAL_SDR_DB_TO_DBUV - gain + float(self.input_atten_db)
-
     def cal_total_offset_db(self):
         """dB to ADD to a stored 'SDR dB' value to get the displayed level: in dBuV mode dBuV at the INPUT of the external attenuator
         (the dB -> dBuV factor of the sample rate in use, minus the RF gain, plus the attenuator); in dBFS mode simply dB relative to
@@ -2703,21 +2407,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.input_atten_db = float(val)
         self.update_plot()
 
-    # ---- previous cispr_get_effective_offset(), kept in case of problems ----
-    # def cispr_get_effective_offset(self):
-    #     """Offset of the right (CISPR) axis relative to the left axis. The left axis is already dBuV."""
-    #     return float(getattr(self, "cispr_offset_db", 0.0))
-
-    # ---- previous cispr_get_effective_offset() (right axis shifted by the correction instead), kept in case of problems ----
-#    def cispr_get_effective_offset(self):
-#        """
-#        Offset of the right (CISPR) axis relative to the left axis. The spinbox value is a
-#        CORRECTION added to the displayed level to get the quantity the limit is written in
-#        (antenna factor for Radiated, LISN / coupling-network loss for Conducted), so the
-#        right axis reads (left axis + correction): effective offset = -correction.
-#        """
-#        return -float(getattr(self, "cispr_offset_db", 0.0))
-
     def cispr_get_effective_offset(self):
         """
         Offset of the right (CISPR) axis relative to the left axis. The antenna factor (Radiated) / LISN correction (Conducted) is now
@@ -2730,23 +2419,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         if getattr(self, "cispr_mode", "radiated") == "conducted":
             return "CISPR conducted (dBµV)"
         return "CISPR radiated (dBµV/m @10 m)"
-
-    # ---- previous cispr_refresh_corr_ui() (tooltip said the right axis was shifted), kept in case of problems ----
-#    def cispr_refresh_corr_ui(self):
-#        """Set the correction spinbox's label/tooltip for the current limit type."""
-#        try:
-#            if self.cispr_mode == "conducted":
-#                self.cispr_offset_label.setText("LISN corr.")
-#                self.cispr_offset_spin.setToolTip(
-#                    "Correction ADDED to the displayed level to get the level at the LISN measuring port "
-#                    "(e.g. the loss of a coupling network). The right axis reads left axis + this value.")
-#            else:
-#                self.cispr_offset_label.setText("Antenna factor")
-#                self.cispr_offset_spin.setToolTip(
-#                    "Antenna factor (plus cable loss), dB(1/m), ADDED to the displayed level to give field "
-#                    "strength in dBuV/m. The right axis reads left axis + this value.")
-#        except Exception:
-#            pass
 
     def cispr_refresh_corr_ui(self):
         """Set the correction spinbox's label/tooltip for the current limit type."""
@@ -2792,22 +2464,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.cispr_effective_offset = self.cispr_get_effective_offset()
         self.cispr_update_curve()
         self.cispr_update_axis_ticks()
-
-    # ---- previous cispr_refresh_offset_ui() (one factor for all rates), kept in case of problems ----
-#    def cispr_refresh_offset_ui(self):
-#        """
-#        Call this whenever the active mode changes (set_preset()). The CISPR Offset
-#        spinbox is NOT touched here - it is the operator's persistent value and must
-#        survive mode changes unchanged. Only the mode-dependent calibration display and
-#        the resulting curve/ticks are refreshed.
-#        """
-#        try:
-#            self.cispr_calibration_label.setText(f"Cal: {CAL_SDR_DB_TO_DBUV:+.1f} dB")
-#        except Exception:
-#            pass
-#        self.cispr_effective_offset = self.cispr_get_effective_offset()
-#        self.cispr_update_curve()
-#        self.cispr_update_axis_ticks()
 
     def cispr_refresh_offset_ui(self):
         """
@@ -2855,7 +2511,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         try:
             freqs = np.asarray(self.cispr_freqs, dtype=np.float64)
             limits = np.asarray(self.cispr_limits, dtype=np.float64)
-            # L_interp = np.interp(fa, freqs, limits)
             L_interp = np.interp(fa, freqs, limits, left=np.nan, right=np.nan)   # no line outside the table's range
         except Exception:
             return
@@ -2867,7 +2522,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         # Plot the CISPR curve in CISPR units (no offset applied to the data itself -
         # the offset is expressed entirely as a shift of the right ViewBox's range below).
         try:
-            # self.cispr_curve.setData(fa, L_interp)
             if np.all(np.isnan(L_interp)):
                 self.cispr_curve.setData([], [])          # scan range is outside the limit table
             else:
@@ -2906,13 +2560,9 @@ class EmcScanner(QtWidgets.QMainWindow):
         (see cispr_update_curve). cispr_update_curve() is the ONLY place the offset is
         applied, by shifting _vb_right's Y range relative to the left axis's Y range.
         That means tick VALUES here must already be plain CISPR units (dBuV) - no
-        further offset subtraction. Previously this method built tick positions from the
-        LEFT axis's range and then subtracted the offset from the labels, which applied
-        the offset a second time on top of the ViewBox shift; the two disagreed as soon
-        as the offset was non-zero, which is what made the CISPR line appear to move
-        relative to its own axis whenever the offset was changed. With this fix, changing
-        the offset only ever moves the CISPR axis relative to the FFT axis - the line
-        always reads correctly against the CISPR axis's own values.
+        further offset subtraction. Changing the offset only ever moves the CISPR axis
+        relative to the FFT axis - the line always reads correctly against the CISPR axis's
+        own values.
         """
         try:
             axis = self.plot.getAxis('right')
@@ -2945,41 +2595,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         except Exception:
             # defensive: don't crash GUI
             pass
-
-    # def cispr_build_reference_curve(self):
-        # # CISPR 16-1-1 style placeholder curve (dBµV)
-        # f = np.array([9e3, 150e3, 500e3, 1e6, 30e6, 100e6, 200e6, 300e6, 600e6, 1e9
-        # ], dtype=np.float64)
-
-        # L= np.array([70, 66, 56, 56, 50, 40, 37, 33, 30, 28
-        # ], dtype=np.float64)
-         # ## very roughly with Tiny point antenna psd_dBuV = psd + 158.0
-
-        # return f, L
-        
-    # ---- previous cispr_build_reference_curve() (radiated only), kept in case of problems ----
-    # def cispr_build_reference_curve(self):
-    # # EN 55032 / CISPR 32 Class B radiated limits (simplified)
-    # # 10 m below 1 GHz, 3 m above 1 GHz – all in dBµV/m
-
-    #     f = np.array([
-    #         30e6,   # 30 MHz
-    #         230e6,  # 230 MHz
-    #         1000e6, # 1 GHz
-    #         3e9,    # 3 GHz
-    #         6e9     # 6 GHz
-    #     ], dtype=np.float64)
-    #     delta_3m_to_10m = -10.46  # 20*log10(3/10)
-    # # Use quasi-peak limits below 1 GHz, average limits above 1 GHz
-    #     L = np.array([
-    #         30.0,  # 30–230 MHz  (QP, 10 m)
-    #         30.0,  # 30–230 MHz  (flat segment)
-    #         37.0,  # 230–1000 MHz (QP, 10 m)
-    #         50.0 + delta_3m_to_10m,            # 1–3 GHz scaled to 10 m
-    #         54.0 + delta_3m_to_10m             # 3–6 GHz scaled to 10 m
-    #     ], dtype=np.float64)
-
-    #     return f, L
 
     def cispr_build_reference_curve(self, mode=None):
         """
@@ -3053,13 +2668,6 @@ class EmcScanner(QtWidgets.QMainWindow):
     # cispr_* block above there is no GUI-thread restriction on these.
     # =====================================================================
 
-    # ---- previous stitch_get_edge_bins() (always masked the edges), kept in case of problems ----
-#     def stitch_get_edge_bins(self):
-#         """Number of FFT bins discarded from EACH edge of a block before stitching."""
-#         frac = float(getattr(self, "stitch_edge_mask_fraction", 0.0))
-#         frac = max(0.0, min(0.49, frac))  # guard against masking away the whole block
-#         return int(round(NFFT * frac))
-
     def stitch_get_edge_bins(self):
         """Number of FFT bins discarded from EACH edge of a block before stitching. None in single-frequency mode:
         there is only one block and nothing to stitch, so the whole captured bandwidth is shown."""
@@ -3090,7 +2698,7 @@ class EmcScanner(QtWidgets.QMainWindow):
     def _read_normalized_iq(self, n):
         """
         Read n IQ samples from the SDR and return them as normalized complex64, using the
-        same real-vs-complex / uint8-vs-float handling the sweep previously did inline.
+        same real-vs-complex / uint8-vs-float handling as the sweep itself.
         Factored out so sweep_loop() can call it once per averaging capture without
         duplicating this logic K times.
         """
@@ -3443,8 +3051,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.sweep_thread = threading.Thread(target=self.continuous_loop, daemon=True)
         self.sweep_thread.start()
 
-    # ---- sweep_loop() is wrapped: the original body is now _sweep_loop_orig(); this wrapper runs it, then hands a finished
-    # ---- clean pass to the waterfall (when it is switched on). Everything that called sweep_loop() still does.
+    # ---- sweep_loop() is a wrapper: it runs the sweep body (_sweep_loop_orig()), then hands a finished
+    # ---- clean pass to the waterfall (when it is switched on).
     def sweep_loop(self):
         seq0 = self._pass_seq
         key0 = self.view_band_key() if hasattr(self, "view_signals") else None     # band as it was when this pass started
@@ -3466,7 +3074,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                 except Exception as e:
                     print(f"waterfall: could not add a row: {e!r}")
 
-    def _sweep_loop_orig(self):    # (was: def sweep_loop(self):)
+    def _sweep_loop_orig(self):
         # Clear the restart request BEFORE reading the live settings below: a change made
         # after this point sets it again and is caught at the next block boundary.
         self._restart_pass = False
@@ -3624,7 +3232,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                 spec = np.fft.fftshift(np.fft.fft(samples * window))
                 spec = spec / NFFT
                 power = np.abs(spec) ** 2
-                # (previous: power_acc = power if power_acc is None else power_acc + power)
                 if peak_det:
                     power_acc = power if power_acc is None else np.maximum(power_acc, power)
                 else:
@@ -3647,7 +3254,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                 # Stopped before a single capture completed - nothing to store this block.
                 continue
 
-            # (previous: mean_power = power_acc / float(captures_done))
             mean_power = power_acc if peak_det else power_acc / float(captures_done)   # peak detector: the maximum itself, not a mean
             psd_full = 10.0 * np.log10(mean_power + 1e-12) + self._psd_to_dbuv_const
 
@@ -3671,16 +3277,12 @@ class EmcScanner(QtWidgets.QMainWindow):
             peak_freq = freqs[peak_idx]
             peak_level = psd[peak_idx]
             psd_checksum = np.sum(np.round(psd, 3))
-            #print(f"DIAG block {i}: peak {peak_freq/1e6:.6f} MHz @ {peak_level:.1f} dB, checksum {psd_checksum:.3f}")
-            #print("DIAG block sample freqs[0:6] (MHz):", (freqs[:6]/1e6).tolist())
-            #print("DIAG block sample psd[0:6]:", psd[:6].tolist())
 
             # Diagnostic: show block frequency span and planned storage indices
             fmin = freqs.min()
             fmax = freqs.max()
             start = i * kept_bins
             stop = start + kept_bins
-            #print(f"sweep_loop: block {i} freq span {fmin/1e6:.6f}-{fmax/1e6:.6f} MHz planned store [{start}:{stop}]")
 
             # Safety checks before writing into stitched arrays
             if self.freq_axis is None or self.power_axis is None:
@@ -3693,8 +3295,6 @@ class EmcScanner(QtWidgets.QMainWindow):
 
             # Detect accidental overwrite (indicates logic bug)
             existing_mask = ~np.isnan(self.freq_axis[start:stop])
-            #if existing_mask.any():
-            #    print(f"sweep_loop: WARNING - block {i} would overwrite existing data at indices {start}:{stop}")
 
             # Diagnostic: compute checksums and peaks for comparison
             peak_idx = np.nanargmax(psd)
@@ -3806,18 +3406,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         kept_width = rate * (1.0 - 2.0 * float(self.stitch_edge_mask_fraction))
         return kept_width >= (self.STOP_FREQ - self.START_FREQ) - 1e-6
 
-    # ---- previous survey_band_ok(), kept in case of problems ----
-#     def survey_band_ok(self):
-#         """Check the current band is allowed for a survey; returns an error text or ''."""
-#         if self.START_FREQ == self.STOP_FREQ:
-#             return "pick a MODE with a frequency range first (not a single frequency)"
-#         if self.STOP_FREQ > SURVEY_MAX_STOP_HZ:
-#             return (f"the survey only runs on bands that end at or below "
-#                     f"{SURVEY_MAX_STOP_HZ/1e6:g} MHz (this band ends at {self.STOP_FREQ/1e6:g} MHz)")
-#         if not any(self.survey_rate_fits(r) for r in SAMPLE_RATE_CHOICES):
-#             return "no sample rate covers this band in a single block - choose a narrower band"
-#         return ""
-
     def survey_band_ok(self):
         """Check the current band can be surveyed; returns an error text or ''. Any range works now:
         a band wider than one block is swept in several blocks and stitched, as in normal use."""
@@ -3830,137 +3418,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         for wdg in ([self.sample_rate_combo, self.gain_slider, self.btn_survey,
                      self.btn_cont, self.btn_start] + list(self.mode_buttons)):
             wdg.setEnabled(not locked)
-
-    # ---- previous survey_open_dialog() / survey_start(), kept in case of problems ----
-#     def survey_open_dialog(self):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             QtWidgets.QMessageBox.information(self, "Gain / sample-rate survey", f"Survey not available: {problem}.")
-#             return
-#         dlg = QtWidgets.QDialog(self)
-#         dlg.setWindowTitle("Gain / sample-rate survey")
-#         lay = QtWidgets.QVBoxLayout(dlg)
-#         lay.addWidget(QtWidgets.QLabel(
-#             f"Band: {self.START_FREQ/1e6:.3f} - {self.STOP_FREQ/1e6:.3f} MHz "
-#             f"(the current MODE). Averaging setting is used as-is.\n"
-#             f"Only sample rates that cover the whole band in one block can be selected."))
-#         form = QtWidgets.QFormLayout()
-#         gain_texts = [f"{g:.1f} dB" for g in RTL_GAIN_STEPS_DB]
-#         cb_lo, cb_hi = QtWidgets.QComboBox(), QtWidgets.QComboBox()
-#         cb_lo.addItems(gain_texts)
-#         cb_hi.addItems(gain_texts)
-#         cb_lo.setCurrentIndex(RTL_GAIN_STEPS_DB.index(12.5))
-#         cb_hi.setCurrentIndex(RTL_GAIN_STEPS_DB.index(33.8))
-#         sp_stride = QtWidgets.QSpinBox()
-#         sp_stride.setRange(1, 10)
-#         sp_stride.setValue(1)
-#         sp_rep = QtWidgets.QSpinBox()
-#         sp_rep.setRange(1, 5)
-#         sp_rep.setValue(1)
-#         form.addRow("Gain from", cb_lo)
-#         form.addRow("Gain to", cb_hi)
-#         form.addRow("Use every Nth gain step", sp_stride)
-#         form.addRow("Repeats per combination", sp_rep)
-#         lay.addLayout(form)
-#         lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
-#         lst = QtWidgets.QListWidget()
-#         for r in SAMPLE_RATE_CHOICES:
-#             fits = self.survey_rate_fits(r)
-#             it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s" + ("" if fits else "   (band too wide for one block)"))
-#             it.setData(QtCore.Qt.UserRole, float(r))
-#             if fits:
-#                 it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-#                 it.setCheckState(QtCore.Qt.Checked)
-#             else:
-#                 it.setFlags(it.flags() & ~(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable))
-#             lst.addItem(it)
-#         lst.setMinimumHeight(180)
-#         lay.addWidget(lst)
-#         info = QtWidgets.QLabel("")
-#         lay.addWidget(info)
-#         def chosen():
-#             lo, hi = sorted((cb_lo.currentIndex(), cb_hi.currentIndex()))
-#             gains = [float(g) for g in RTL_GAIN_STEPS_DB[lo:hi + 1:sp_stride.value()]]
-#             rates = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
-#                      if (lst.item(i).flags() & QtCore.Qt.ItemIsUserCheckable)
-#                      and lst.item(i).checkState() == QtCore.Qt.Checked]
-#             return rates, gains, sp_rep.value()
-#         def refresh_info(*_):
-#             rates, gains, reps = chosen()
-#             info.setText(f"{len(rates)} rates x {len(gains)} gains x {reps} repeat(s) = "
-#                          f"{len(rates) * len(gains) * reps} passes")
-#         for wdg in (cb_lo, cb_hi):
-#             wdg.currentIndexChanged.connect(refresh_info)
-#         sp_stride.valueChanged.connect(refresh_info)
-#         sp_rep.valueChanged.connect(refresh_info)
-#         lst.itemChanged.connect(refresh_info)
-#         refresh_info()
-#         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-#         bb.accepted.connect(dlg.accept)
-#         bb.rejected.connect(dlg.reject)
-#         lay.addWidget(bb)
-#         if dlg.exec_() != QtWidgets.QDialog.Accepted:
-#             return
-#         rates, gains, reps = chosen()
-#         if not rates or not gains:
-#             self.log("Survey: nothing selected")
-#             return
-#         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-#             self, "Survey results - base file name", "rf_survey.csv", "CSV Files (*.csv)")
-#         if not path:
-#             return
-#         self.survey_start(rates, gains, reps, path)
-#     def survey_start(self, rates, gains, repeats, path):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             return
-#         rates = [r for r in rates if self.survey_rate_fits(r)]
-#         if not rates:
-#             self.log("Survey not started: none of the chosen sample rates covers the band in one block")
-#             return
-#         base = os.path.splitext(path)[0]
-#         try:
-#             spikes_fh = open(base + "_spikes.csv", "w", newline="")
-#             summary_fh = open(base + "_summary.csv", "w", newline="")
-#         except Exception as e:
-#             self.log(f"Survey: cannot create result files: {e}")
-#             return
-#         spikes_w, summary_w = csv.writer(spikes_fh), csv.writer(summary_fh)
-#         spikes_w.writerow(["repeat", "sample_rate_hz", "gain_db", "freq_hz", "level_db",
-#                            "prominence_db", "baseline_db"])
-#         summary_w.writerow(["repeat", "sample_rate_hz", "gain_db", "n_avg", "bins",
-#                             "floor_db_median", f"spikes_over_{SURVEY_SPIKE_THRESH_DB:g}dB",
-#                             "max_prominence_db", "max_spike_freq_hz", "pass_seconds"])
-#         alive = bool(self.sweep_thread and self.sweep_thread.is_alive())
-#         self._survey = {
-#             "combos": [(r, g, k) for r in rates for g in gains for k in range(repeats)],
-#             "idx": -1, "base": base, "spikes_fh": spikes_fh, "summary_fh": summary_fh,
-#             "spikes_w": spikes_w, "summary_w": summary_w, "spectra": [],
-#             "t_start": time.time(), "orig_rate": self.SAMPLE_RATE, "orig_gain": self.gain_db,
-#             "was_running": alive, "pass_dur": 10.0, "seq_floor": 0, "t_set": time.time(),
-#             "timeout": 90.0, "skipped": 0,
-#         }
-#         self.log(f"=== SURVEY STARTED: {len(self._survey['combos'])} passes -> {base}_*.csv/.npz ===")
-#         self.survey_set_lock(True)
-#         self.survey_next_combo()           # sets rate/gain for the first combination
-#         if not alive:
-#             self.start_continuous()
-#         self._survey_timer.start()
-
-    # ---- previous survey_connect_signals(), kept in case of problems ----
-#     def survey_connect_signals(self):
-#         self.survey_signals = SurveySignals()
-#         self.survey_signals.done.connect(self.survey_finish)
-#         self.btn_survey.setToolTip(
-#             "Automatically step through sample rates and RF gains on the current band (any width - wide "
-#             "bands are swept in several blocks) and save the results: spikes and summary CSVs, plus one "
-#             "surface-chart CSV per sample rate for Excel. Press STOP to end early (partial results are saved).")
 
     # ------------------------------------------------------------------------------------
     # STITCH CHECK: is a feature in the stitched spectrum real, or made by the block layout?
@@ -6278,16 +5735,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.log(f"Peaks saved to {path}")
         except Exception as e:
             self.log(f"Peaks: could not save: {e}")
-    # ---- previous survey_connect_signals() (no CAL buttons / saturation line), kept in case of problems ----
-#    def survey_connect_signals(self):
-#        self.survey_signals = SurveySignals()
-#        self.survey_signals.done.connect(self.survey_finish)
-#        self.survey_signals.progress.connect(self.survey_sync_controls)
-#        self.btn_survey.setToolTip(
-#            "Automatically step through sample rates and RF gains on the current band (any width - wide "
-#            "bands are swept in several blocks) and write ONE HTML report: findings on sample-rate effects and "
-#            "gain-stage artefacts, charts and exportable data. The Sample Rate box and RF Gain slider follow the "
-#            "test being run. Press STOP to end early (a partial report is saved).")
 
     def survey_connect_signals(self):
         self.survey_signals = SurveySignals()
@@ -6325,464 +5772,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         if sec >= 3600:
             return f"{sec // 3600} h {(sec % 3600) // 60:02d} min"
         return f"{sec // 60} min {sec % 60:02d} s"
-
-    # ---- previous survey_open_dialog() / survey_start() (CSV outputs), kept in case of problems ----
-#     def survey_open_dialog(self):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             QtWidgets.QMessageBox.information(self, "Gain / sample-rate survey", f"Survey not available: {problem}.")
-#             return
-#         dlg = QtWidgets.QDialog(self)
-#         dlg.setWindowTitle("Gain / sample-rate survey")
-#         lay = QtWidgets.QVBoxLayout(dlg)
-#         lay.addWidget(QtWidgets.QLabel(
-#             f"Band: {self.START_FREQ/1e6:.3f} - {self.STOP_FREQ/1e6:.3f} MHz (the current MODE), any width.\n"
-#             f"Wide bands are swept in several blocks and stitched: one complete pass per rate/gain combination.\n"
-#             f"The Averaging setting is used as-is."))
-#         form = QtWidgets.QFormLayout()
-#         gain_texts = [f"{g:.1f} dB" for g in RTL_GAIN_STEPS_DB]
-#         cb_lo, cb_hi = QtWidgets.QComboBox(), QtWidgets.QComboBox()
-#         cb_lo.addItems(gain_texts)
-#         cb_hi.addItems(gain_texts)
-#         cb_lo.setCurrentIndex(RTL_GAIN_STEPS_DB.index(12.5))
-#         cb_hi.setCurrentIndex(RTL_GAIN_STEPS_DB.index(33.8))
-#         sp_stride = QtWidgets.QSpinBox()
-#         sp_stride.setRange(1, 10)
-#         sp_stride.setValue(1)
-#         sp_rep = QtWidgets.QSpinBox()
-#         sp_rep.setRange(1, 5)
-#         sp_rep.setValue(1)
-#         sp_pts = QtWidgets.QSpinBox()
-#         sp_pts.setLocale(SCOPE_LOCALE)
-#         sp_pts.setRange(50, 5000)
-#         sp_pts.setValue(SURVEY_SURFACE_POINTS)
-#         sp_pts.setToolTip("Frequency points in each surface-chart CSV (the full-resolution data stays in the spikes "
-#                            "CSV and the .npz). Excel's surface chart is happiest with a few hundred to a few thousand.")
-#         cb_red = QtWidgets.QComboBox()
-#         cb_red.addItem("Peak (keeps spikes)")
-#         cb_red.addItem("Average power")
-#         form.addRow("Gain from", cb_lo)
-#         form.addRow("Gain to", cb_hi)
-#         form.addRow("Use every Nth gain step", sp_stride)
-#         form.addRow("Repeats per combination", sp_rep)
-#         form.addRow("Surface chart frequency points", sp_pts)
-#         form.addRow("Combine bins by", cb_red)
-#         lay.addLayout(form)
-#         lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
-#         lst = QtWidgets.QListWidget()
-#         for r in SAMPLE_RATE_CHOICES:
-#             it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s")
-#             it.setData(QtCore.Qt.UserRole, float(r))
-#             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-#             it.setCheckState(QtCore.Qt.Checked)
-#             lst.addItem(it)
-#         lst.setMinimumHeight(180)
-#         lay.addWidget(lst)
-#         info = QtWidgets.QLabel("")
-#         lay.addWidget(info)
-#         def chosen():
-#             lo, hi = sorted((cb_lo.currentIndex(), cb_hi.currentIndex()))
-#             gains = [float(g) for g in RTL_GAIN_STEPS_DB[lo:hi + 1:sp_stride.value()]]
-#             rates = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
-#                      if lst.item(i).checkState() == QtCore.Qt.Checked]
-#             return rates, gains, sp_rep.value()
-#         def total_seconds():
-#             rates, gains, reps = chosen()
-#             return sum(self.survey_estimate_pass_seconds(r) for r in rates) * len(gains) * reps
-#         def refresh_info(*_):
-#             rates, gains, reps = chosen()
-#             info.setText(f"{len(rates)} rates x {len(gains)} gains x {reps} repeat(s) = "
-#                          f"{len(rates) * len(gains) * reps} passes, roughly {self.survey_fmt_seconds(total_seconds())}")
-#         for wdg in (cb_lo, cb_hi):
-#             wdg.currentIndexChanged.connect(refresh_info)
-#         sp_stride.valueChanged.connect(refresh_info)
-#         sp_rep.valueChanged.connect(refresh_info)
-#         lst.itemChanged.connect(refresh_info)
-#         refresh_info()
-#         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-#         bb.accepted.connect(dlg.accept)
-#         bb.rejected.connect(dlg.reject)
-#         lay.addWidget(bb)
-#         if dlg.exec_() != QtWidgets.QDialog.Accepted:
-#             return
-#         rates, gains, reps = chosen()
-#         if not rates or not gains:
-#             self.log("Survey: nothing selected")
-#             return
-#         secs = total_seconds()
-#         if secs > 1800:
-#             ans = QtWidgets.QMessageBox.question(
-#                 self, "Gain / sample-rate survey",
-#                 f"This survey will take roughly {self.survey_fmt_seconds(secs)}. Continue?\n"
-#                 f"(Press STOP at any time - partial results are saved.)")
-#             if ans != QtWidgets.QMessageBox.Yes:
-#                 return
-#         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-#             self, "Survey results - base file name", "rf_survey.csv", "CSV Files (*.csv)")
-#         if not path:
-#             return
-#         self.survey_start(rates, gains, reps, path, sp_pts.value(), cb_red.currentIndex() == 0)
-#     def survey_start(self, rates, gains, repeats, path, npts=SURVEY_SURFACE_POINTS, peak=True):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             return
-#         if not rates or not gains:
-#             self.log("Survey not started: nothing selected")
-#             return
-#         base = os.path.splitext(path)[0]
-#         try:
-#             spikes_fh = open(base + "_spikes.csv", "w", newline="")
-#             summary_fh = open(base + "_summary.csv", "w", newline="")
-#         except Exception as e:
-#             self.log(f"Survey: cannot create result files: {e}")
-#             return
-#         # The survey owns the SDR on its own worker thread: stop whatever is running first.
-#         was_running = bool(self.sweep_thread and self.sweep_thread.is_alive())
-#         if was_running:
-#             self.stop_flag.set()
-#             self.sweep_thread.join(timeout=3.0)
-#             if self.sweep_thread.is_alive():
-#                 self.log("Survey: ERROR - the running sweep did not stop; try again")
-#                 spikes_fh.close()
-#                 summary_fh.close()
-#                 return
-#         self.stop_flag.clear()
-#         try:
-#             self.init_sdr()
-#         except Exception as e:
-#             self.log(f"Survey: error opening the SDR: {e}")
-#             spikes_fh.close()
-#             summary_fh.close()
-#             return
-#         spikes_w, summary_w = csv.writer(spikes_fh), csv.writer(summary_fh)
-#         spikes_w.writerow(["repeat", "sample_rate_hz", "gain_db", "freq_hz", "level_db",
-#                            "prominence_db", "baseline_db"])
-#         summary_w.writerow(["repeat", "sample_rate_hz", "gain_db", "n_avg", "bins",
-#                             "floor_db_median", f"spikes_over_{SURVEY_SPIKE_THRESH_DB:g}dB",
-#                             "max_prominence_db", "max_spike_freq_hz", "pass_seconds"])
-#         self._survey = {
-#             "combos": [(r, g, k) for r in rates for g in gains for k in range(repeats)],
-#             "idx": -1, "base": base, "spikes_fh": spikes_fh, "summary_fh": summary_fh,
-#             "spikes_w": spikes_w, "summary_w": summary_w,
-#             "surface": {}, "spectra": [], "freq_by_rate": {}, "full_bytes": 0.0, "full_warned": False,
-#             "npts": int(npts), "peak": bool(peak), "f0": float(self.START_FREQ), "f1": float(self.STOP_FREQ),
-#             "t_start": time.time(), "orig_rate": self.SAMPLE_RATE, "orig_gain": self.gain_db,
-#             "was_running": was_running, "last_rate": None, "skipped": 0,
-#         }
-#         self.log(f"=== SURVEY STARTED: {len(self._survey['combos'])} passes -> {base}_*.csv/.npz ===")
-#         self.survey_set_lock(True)
-#         self.sweep_thread = threading.Thread(target=self.survey_loop, daemon=True)
-#         self.sweep_thread.start()
-
-    # ---- previous survey_open_dialog() (12.5 dB default, manual repeats), kept in case of problems ----
-#     def survey_open_dialog(self):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             QtWidgets.QMessageBox.information(self, "Gain / sample-rate survey", f"Survey not available: {problem}.")
-#             return
-#         dlg = QtWidgets.QDialog(self)
-#         dlg.setWindowTitle("Gain / sample-rate survey")
-#         lay = QtWidgets.QVBoxLayout(dlg)
-#         lay.addWidget(QtWidgets.QLabel(
-#             f"Band: {self.START_FREQ/1e6:.3f} - {self.STOP_FREQ/1e6:.3f} MHz (the current MODE), any width.\n"
-#             f"Wide bands are swept in several blocks and stitched: one complete pass per rate/gain combination.\n"
-#             f"The Averaging setting is used as-is."))
-#         form = QtWidgets.QFormLayout()
-#         gain_texts = [f"{g:.1f} dB" for g in RTL_GAIN_STEPS_DB]
-#         cb_lo, cb_hi = QtWidgets.QComboBox(), QtWidgets.QComboBox()
-#         cb_lo.addItems(gain_texts)
-#         cb_hi.addItems(gain_texts)
-#         cb_lo.setCurrentIndex(RTL_GAIN_STEPS_DB.index(12.5))
-#         cb_hi.setCurrentIndex(RTL_GAIN_STEPS_DB.index(33.8))
-#         sp_stride = QtWidgets.QSpinBox()
-#         sp_stride.setRange(1, 10)
-#         sp_stride.setValue(1)
-#         sp_rep = QtWidgets.QSpinBox()
-#         sp_rep.setRange(1, 5)
-#         sp_rep.setValue(1)
-#         sp_pts = QtWidgets.QSpinBox()
-#         sp_pts.setLocale(SCOPE_LOCALE)
-#         sp_pts.setRange(50, 5000)
-#         sp_pts.setValue(SURVEY_SURFACE_POINTS)
-#         sp_pts.setToolTip("Frequency points per spectrum in the report's charts and surface-chart export (the list of "
-#                            "spikes in the report keeps full resolution). A few hundred to a few thousand is plenty.")
-#         cb_red = QtWidgets.QComboBox()
-#         cb_red.addItem("Peak (keeps spikes)")
-#         cb_red.addItem("Average power")
-#         form.addRow("Gain from", cb_lo)
-#         form.addRow("Gain to", cb_hi)
-#         form.addRow("Use every Nth gain step", sp_stride)
-#         form.addRow("Repeats per combination", sp_rep)
-#         form.addRow("Chart frequency points", sp_pts)
-#         form.addRow("Combine bins by", cb_red)
-#         lay.addLayout(form)
-#         lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
-#         lst = QtWidgets.QListWidget()
-#         for r in SAMPLE_RATE_CHOICES:
-#             it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s")
-#             it.setData(QtCore.Qt.UserRole, float(r))
-#             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-#             it.setCheckState(QtCore.Qt.Checked)
-#             lst.addItem(it)
-#         lst.setMinimumHeight(180)
-#         lay.addWidget(lst)
-#         info = QtWidgets.QLabel("")
-#         lay.addWidget(info)
-#         def chosen():
-#             lo, hi = sorted((cb_lo.currentIndex(), cb_hi.currentIndex()))
-#             gains = [float(g) for g in RTL_GAIN_STEPS_DB[lo:hi + 1:sp_stride.value()]]
-#             rates = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
-#                      if lst.item(i).checkState() == QtCore.Qt.Checked]
-#             return rates, gains, sp_rep.value()
-#         def total_seconds():
-#             rates, gains, reps = chosen()
-#             return sum(self.survey_estimate_pass_seconds(r) for r in rates) * len(gains) * reps
-#         def refresh_info(*_):
-#             rates, gains, reps = chosen()
-#             info.setText(f"{len(rates)} rates x {len(gains)} gains x {reps} repeat(s) = "
-#                          f"{len(rates) * len(gains) * reps} passes, roughly {self.survey_fmt_seconds(total_seconds())}")
-#         for wdg in (cb_lo, cb_hi):
-#             wdg.currentIndexChanged.connect(refresh_info)
-#         sp_stride.valueChanged.connect(refresh_info)
-#         sp_rep.valueChanged.connect(refresh_info)
-#         lst.itemChanged.connect(refresh_info)
-#         refresh_info()
-#         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-#         bb.accepted.connect(dlg.accept)
-#         bb.rejected.connect(dlg.reject)
-#         lay.addWidget(bb)
-#         if dlg.exec_() != QtWidgets.QDialog.Accepted:
-#             return
-#         rates, gains, reps = chosen()
-#         if not rates or not gains:
-#             self.log("Survey: nothing selected")
-#             return
-#         secs = total_seconds()
-#         if secs > 1800:
-#             ans = QtWidgets.QMessageBox.question(
-#                 self, "Gain / sample-rate survey",
-#                 f"This survey will take roughly {self.survey_fmt_seconds(secs)}. Continue?\n"
-#                 f"(Press STOP at any time - partial results are saved.)")
-#             if ans != QtWidgets.QMessageBox.Yes:
-#                 return
-#         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-#             self, "Save survey report (one HTML file)", "rf_survey_report.html", "HTML report (*.html)")
-#         if not path:
-#             return
-#         self.survey_start(rates, gains, reps, path, sp_pts.value(), cb_red.currentIndex() == 0)
-
-    # ---- previous survey_open_dialog() (offered every rate in SAMPLE_RATE_CHOICES), kept in case of problems ----
-#     def survey_open_dialog(self):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             QtWidgets.QMessageBox.information(self, "Gain / sample-rate survey", f"Survey not available: {problem}.")
-#             return
-#         dlg = QtWidgets.QDialog(self)
-#         dlg.setWindowTitle("Gain / sample-rate survey")
-#         lay = QtWidgets.QVBoxLayout(dlg)
-#         lay.addWidget(QtWidgets.QLabel(
-#             f"Band: {self.START_FREQ/1e6:.3f} - {self.STOP_FREQ/1e6:.3f} MHz (the current MODE), any width.\n"
-#             f"Wide bands are swept in several blocks and stitched. Every rate/gain setting is scanned at least twice;\n"
-#             f"if the two scans differ noticeably it is scanned again until two in a row agree.\n"
-#             f"The Averaging setting is used as-is."))
-#         form = QtWidgets.QFormLayout()
-#         gain_texts = [f"{g:.1f} dB" for g in RTL_GAIN_STEPS_DB]
-#         cb_lo, cb_hi = QtWidgets.QComboBox(), QtWidgets.QComboBox()
-#         cb_lo.addItems(gain_texts)
-#         cb_hi.addItems(gain_texts)
-#         cb_lo.setCurrentIndex(RTL_GAIN_STEPS_DB.index(0.0))      # default lowest gain: 0 dB
-#         cb_hi.setCurrentIndex(RTL_GAIN_STEPS_DB.index(33.8))
-#         sp_stride = QtWidgets.QSpinBox()
-#         sp_stride.setRange(1, 10)
-#         sp_stride.setValue(1)
-#         sp_pts = QtWidgets.QSpinBox()
-#         sp_pts.setLocale(SCOPE_LOCALE)
-#         sp_pts.setRange(50, 5000)
-#         sp_pts.setValue(SURVEY_SURFACE_POINTS)
-#         sp_pts.setToolTip("Frequency points per spectrum in the report's charts and surface-chart export (the list of "
-#                            "spikes in the report keeps full resolution). A few hundred to a few thousand is plenty.")
-#         cb_red = QtWidgets.QComboBox()
-#         cb_red.addItem("Peak (keeps spikes)")
-#         cb_red.addItem("Average power")
-#         form.addRow("Gain from", cb_lo)
-#         form.addRow("Gain to", cb_hi)
-#         form.addRow("Use every Nth gain step", sp_stride)
-#         form.addRow("Chart frequency points", sp_pts)
-#         form.addRow("Combine bins by", cb_red)
-#         lay.addLayout(form)
-#         lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
-#         lst = QtWidgets.QListWidget()
-#         for r in SAMPLE_RATE_CHOICES:
-#             it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s")
-#             it.setData(QtCore.Qt.UserRole, float(r))
-#             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-#             it.setCheckState(QtCore.Qt.Checked)
-#             lst.addItem(it)
-#         lst.setMinimumHeight(180)
-#         lay.addWidget(lst)
-#         info = QtWidgets.QLabel("")
-#         lay.addWidget(info)
-#         def chosen():
-#             lo, hi = sorted((cb_lo.currentIndex(), cb_hi.currentIndex()))
-#             gains = [float(g) for g in RTL_GAIN_STEPS_DB[lo:hi + 1:sp_stride.value()]]
-#             rates = [lst.item(i).data(QtCore.Qt.UserRole) for i in range(lst.count())
-#                      if lst.item(i).checkState() == QtCore.Qt.Checked]
-#             return rates, gains, 1
-#         def total_seconds():
-#             rates, gains, reps = chosen()
-#             return sum(self.survey_estimate_pass_seconds(r) for r in rates) * len(gains) * SURVEY_SCANS_ESTIMATE
-#         def refresh_info(*_):
-#             rates, gains, reps = chosen()
-#             info.setText(f"{len(rates)} rates x {len(gains)} gains = {len(rates) * len(gains)} settings, each scanned at least twice "
-#                          f"- roughly {self.survey_fmt_seconds(total_seconds())}")
-#         for wdg in (cb_lo, cb_hi):
-#             wdg.currentIndexChanged.connect(refresh_info)
-#         sp_stride.valueChanged.connect(refresh_info)
-#         lst.itemChanged.connect(refresh_info)
-#         refresh_info()
-#         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-#         bb.accepted.connect(dlg.accept)
-#         bb.rejected.connect(dlg.reject)
-#         lay.addWidget(bb)
-#         if dlg.exec_() != QtWidgets.QDialog.Accepted:
-#             return
-#         rates, gains, reps = chosen()
-#         if not rates or not gains:
-#             self.log("Survey: nothing selected")
-#             return
-#         secs = total_seconds()
-#         if secs > 1800:
-#             ans = QtWidgets.QMessageBox.question(
-#                 self, "Gain / sample-rate survey",
-#                 f"This survey will take roughly {self.survey_fmt_seconds(secs)}. Continue?\n"
-#                 f"(Press STOP at any time - partial results are saved.)")
-#             if ans != QtWidgets.QMessageBox.Yes:
-#                 return
-#         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-#             self, "Save survey report (one HTML file)", "rf_survey_report.html", "HTML report (*.html)")
-#         if not path:
-#             return
-#         self.survey_start(rates, gains, reps, path, sp_pts.value(), cb_red.currentIndex() == 0)
-#     # ---- previous survey_start(), kept in case of problems ----
-# #     def survey_start(self, rates, gains, repeats, path, npts=SURVEY_SURFACE_POINTS, peak=True):
-# #         if self._survey is not None:
-# #             return
-# #         problem = self.survey_band_ok()
-# #         if problem:
-# #             self.log(f"Survey not started: {problem}")
-# #             return
-# #         if not rates or not gains:
-# #             self.log("Survey not started: nothing selected")
-# #             return
-# #         if not path.lower().endswith(".html"):
-# #             path = os.path.splitext(path)[0] + ".html"
-# #         try:
-# #             with open(path, "w", encoding="utf-8") as fh:
-# #                 fh.write("<html><body style='font-family:sans-serif'>Survey in progress - this file is replaced by "
-# #                          "the report while the survey runs.</body></html>")
-# #         except Exception as e:
-# #             self.log(f"Survey: cannot create the report file: {e}")
-# #             return
-# #         # The survey owns the SDR on its own worker thread: stop whatever is running first.
-# #         was_running = bool(self.sweep_thread and self.sweep_thread.is_alive())
-# #         if was_running:
-# #             self.stop_flag.set()
-# #             self.sweep_thread.join(timeout=3.0)
-# #             if self.sweep_thread.is_alive():
-# #                 self.log("Survey: ERROR - the running sweep did not stop; try again")
-# #                 return
-# #         self.stop_flag.clear()
-# #         try:
-# #             self.init_sdr()
-# #         except Exception as e:
-# #             self.log(f"Survey: error opening the SDR: {e}")
-# #             return
-# #         self._survey = {
-# #             "combos": [(r, g, k) for r in rates for g in gains for k in range(repeats)],
-# #             "idx": -1, "report_path": path, "passes": [], "last_report": time.time(),
-# #             "freq_by_rate": {}, "full_bytes": 0.0, "full_warned": False,
-# #             "npts": int(npts), "peak": bool(peak), "f0": float(self.START_FREQ), "f1": float(self.STOP_FREQ),
-# #             "t_start": time.time(), "orig_rate": self.SAMPLE_RATE, "orig_gain": self.gain_db,
-# #             "was_running": was_running, "last_rate": None, "skipped": 0,
-# #         }
-# #         self.log(f"=== SURVEY STARTED: {len(self._survey['combos'])} passes -> {path} ===")
-# #         self.survey_set_lock(True)
-# #         self.sweep_thread = threading.Thread(target=self.survey_loop, daemon=True)
-# #         self.sweep_thread.start()
-# #     # ---- previous survey_loop(), kept in case of problems ----
-# # #     def survey_loop(self):
-# # #         """
-# # #         Survey worker thread. For every rate/gain combination: set the live settings (plain
-# # #         attributes - this thread owns the SDR), run ONE complete pass with the normal sweep_loop()
-# # #         and record it. Because the settings change only between passes, every pass is clean - no
-# # #         pass is wasted on a half-old/half-new setting, which matters on wide bands where a pass
-# # #         takes tens of seconds. Reports back to the GUI thread with survey_signals.done.
-# # #         """
-# # #         s = self._survey
-# # #         aborted = False
-# # #         try:
-# # #             rate0, gain0, _rep0 = s["combos"][0]
-# # #             self.SAMPLE_RATE = rate0
-# # #             self.gain_db = gain0
-# # #             c0 = self.build_centers(self.START_FREQ, self.STOP_FREQ, rate0)
-# # #             self.sdr.sample_rate = rate0
-# # #             self._applied_sample_rate = rate0
-# # #             self.settle_radio(float(c0[0]))
-# # #             for idx, (rate, gain, rep) in enumerate(s["combos"]):
-# # #                 if self.stop_flag.is_set():
-# # #                     aborted = True
-# # #                     break
-# # #                 s["idx"] = idx
-# # #                 self.SAMPLE_RATE = rate
-# # #                 self.gain_db = gain
-# # #                 n_blocks = len(self.build_centers(self.START_FREQ, self.STOP_FREQ, rate))
-# # #                 # A very short pass right after a rate change can still be a start-up transient: throw one
-# # #                 # away. On wide bands every block already has its own settling time, so don't waste a pass.
-# # #                 discard = 1 if (rate != s["last_rate"] and n_blocks <= 3) else 0
-# # #                 s["last_rate"] = rate
-# # #                 recorded = False
-# # #                 for _attempt in range(discard + 3):
-# # #                     if self.stop_flag.is_set():
-# # #                         aborted = True
-# # #                         break
-# # #                     seq0 = self._pass_seq
-# # #                     self._restart_pass = False
-# # #                     self.sweep_loop()                       # one complete pass at these settings
-# # #                     lp = self._last_pass
-# # #                     if lp is None or lp["seq"] <= seq0 or lp["rate"] != rate or lp["gain"] != gain:
-# # #                         continue                            # not a clean pass: try again
-# # #                     if discard > 0:
-# # #                         discard -= 1
-# # #                         continue
-# # #                     self.survey_record(lp)
-# # #                     recorded = True
-# # #                     break
-# # #                 if aborted:
-# # #                     break
-# # #                 if not recorded:
-# # #                     s["skipped"] += 1
-# # #                     self.log(f"Survey: no clean pass at {rate/1e6:.3f} MS/s / {gain:.1f} dB - skipped")
-# # #         except Exception as e:
-# # #             import traceback
-# # #             print(f"survey_loop: error {e!r}")
-# # #             traceback.print_exc()
-# # #             aborted = True
-# # #         finally:
-# # #             self.SAMPLE_RATE = s["orig_rate"]               # put the operator's settings back
-# # #             self.gain_db = s["orig_gain"]
-# # #             self.survey_signals.done.emit(bool(aborted))
 
     def survey_open_dialog(self):
         if self._survey is not None:
@@ -6829,7 +5818,7 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         lay.addWidget(QtWidgets.QLabel("Sample rates to test:"))
         lst = QtWidgets.QListWidget()
-        for r in SAMPLE_RATE_RECOMMENDED:                 # (previous: SAMPLE_RATE_CHOICES)
+        for r in SAMPLE_RATE_RECOMMENDED:
             it = QtWidgets.QListWidgetItem(f"{r/1e6:.3f} MS/s")
             it.setData(QtCore.Qt.UserRole, float(r))
             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -6888,115 +5877,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         self.survey_start(rates, gains, reps, path, sp_pts.value(), cb_red.currentIndex() == 0)
 
-    # ---- previous survey_start(), kept in case of problems ----
-#     def survey_start(self, rates, gains, repeats, path, npts=SURVEY_SURFACE_POINTS, peak=True):
-#         if self._survey is not None:
-#             return
-#         problem = self.survey_band_ok()
-#         if problem:
-#             self.log(f"Survey not started: {problem}")
-#             return
-#         if not rates or not gains:
-#             self.log("Survey not started: nothing selected")
-#             return
-#         if not path.lower().endswith(".html"):
-#             path = os.path.splitext(path)[0] + ".html"
-#         try:
-#             with open(path, "w", encoding="utf-8") as fh:
-#                 fh.write("<html><body style='font-family:sans-serif'>Survey in progress - this file is replaced by "
-#                          "the report while the survey runs.</body></html>")
-#         except Exception as e:
-#             self.log(f"Survey: cannot create the report file: {e}")
-#             return
-#         # The survey owns the SDR on its own worker thread: stop whatever is running first.
-#         was_running = bool(self.sweep_thread and self.sweep_thread.is_alive())
-#         if was_running:
-#             self.stop_flag.set()
-#             self.sweep_thread.join(timeout=3.0)
-#             if self.sweep_thread.is_alive():
-#                 self.log("Survey: ERROR - the running sweep did not stop; try again")
-#                 return
-#         self.stop_flag.clear()
-#         try:
-#             self.init_sdr()
-#         except Exception as e:
-#             self.log(f"Survey: error opening the SDR: {e}")
-#             return
-#         self._survey = {
-#             "combos": [(r, g, k) for r in rates for g in gains for k in range(repeats)],
-#             "idx": -1, "report_path": path, "passes": [], "last_report": time.time(),
-#             "freq_by_rate": {}, "full_bytes": 0.0, "full_warned": False,
-#             "npts": int(npts), "peak": bool(peak), "f0": float(self.START_FREQ), "f1": float(self.STOP_FREQ),
-#             "t_start": time.time(), "orig_rate": self.SAMPLE_RATE, "orig_gain": self.gain_db,
-#             "was_running": was_running, "last_rate": None, "skipped": 0,
-#         }
-#         self.log(f"=== SURVEY STARTED: {len(self._survey['combos'])} passes -> {path} ===")
-#         self.survey_set_lock(True)
-#         self.sweep_thread = threading.Thread(target=self.survey_loop, daemon=True)
-#         self.sweep_thread.start()
-#     # ---- previous survey_loop(), kept in case of problems ----
-# #     def survey_loop(self):
-# #         """
-# #         Survey worker thread. For every rate/gain combination: set the live settings (plain
-# #         attributes - this thread owns the SDR), run ONE complete pass with the normal sweep_loop()
-# #         and record it. Because the settings change only between passes, every pass is clean - no
-# #         pass is wasted on a half-old/half-new setting, which matters on wide bands where a pass
-# #         takes tens of seconds. Reports back to the GUI thread with survey_signals.done.
-# #         """
-# #         s = self._survey
-# #         aborted = False
-# #         try:
-# #             rate0, gain0, _rep0 = s["combos"][0]
-# #             self.SAMPLE_RATE = rate0
-# #             self.gain_db = gain0
-# #             c0 = self.build_centers(self.START_FREQ, self.STOP_FREQ, rate0)
-# #             self.sdr.sample_rate = rate0
-# #             self._applied_sample_rate = rate0
-# #             self.settle_radio(float(c0[0]))
-# #             for idx, (rate, gain, rep) in enumerate(s["combos"]):
-# #                 if self.stop_flag.is_set():
-# #                     aborted = True
-# #                     break
-# #                 s["idx"] = idx
-# #                 self.SAMPLE_RATE = rate
-# #                 self.gain_db = gain
-# #                 n_blocks = len(self.build_centers(self.START_FREQ, self.STOP_FREQ, rate))
-# #                 # A very short pass right after a rate change can still be a start-up transient: throw one
-# #                 # away. On wide bands every block already has its own settling time, so don't waste a pass.
-# #                 discard = 1 if (rate != s["last_rate"] and n_blocks <= 3) else 0
-# #                 s["last_rate"] = rate
-# #                 recorded = False
-# #                 for _attempt in range(discard + 3):
-# #                     if self.stop_flag.is_set():
-# #                         aborted = True
-# #                         break
-# #                     seq0 = self._pass_seq
-# #                     self._restart_pass = False
-# #                     self.sweep_loop()                       # one complete pass at these settings
-# #                     lp = self._last_pass
-# #                     if lp is None or lp["seq"] <= seq0 or lp["rate"] != rate or lp["gain"] != gain:
-# #                         continue                            # not a clean pass: try again
-# #                     if discard > 0:
-# #                         discard -= 1
-# #                         continue
-# #                     self.survey_record(lp)
-# #                     recorded = True
-# #                     break
-# #                 if aborted:
-# #                     break
-# #                 if not recorded:
-# #                     s["skipped"] += 1
-# #                     self.log(f"Survey: no clean pass at {rate/1e6:.3f} MS/s / {gain:.1f} dB - skipped")
-# #         except Exception as e:
-# #             import traceback
-# #             print(f"survey_loop: error {e!r}")
-# #             traceback.print_exc()
-# #             aborted = True
-# #         finally:
-# #             self.SAMPLE_RATE = s["orig_rate"]               # put the operator's settings back
-# #             self.gain_db = s["orig_gain"]
-# #             self.survey_signals.done.emit(bool(aborted))
-
     def survey_start(self, rates, gains, repeats, path, npts=SURVEY_SURFACE_POINTS, peak=True):
         if self._survey is not None:
             return
@@ -7042,134 +5922,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.survey_set_lock(True)
         self.sweep_thread = threading.Thread(target=self.survey_loop, daemon=True)
         self.sweep_thread.start()
-
-    # ---- previous survey_loop(), kept in case of problems ----
-#     def survey_loop(self):
-#         """
-#         Survey worker thread. For every rate/gain combination: set the live settings (plain
-#         attributes - this thread owns the SDR), run ONE complete pass with the normal sweep_loop()
-#         and record it. Because the settings change only between passes, every pass is clean - no
-#         pass is wasted on a half-old/half-new setting, which matters on wide bands where a pass
-#         takes tens of seconds. Reports back to the GUI thread with survey_signals.done.
-#         """
-#         s = self._survey
-#         aborted = False
-#         try:
-#             rate0, gain0, _rep0 = s["combos"][0]
-#             self.SAMPLE_RATE = rate0
-#             self.gain_db = gain0
-#             c0 = self.build_centers(self.START_FREQ, self.STOP_FREQ, rate0)
-#             self.sdr.sample_rate = rate0
-#             self._applied_sample_rate = rate0
-#             self.settle_radio(float(c0[0]))
-#             for idx, (rate, gain, rep) in enumerate(s["combos"]):
-#                 if self.stop_flag.is_set():
-#                     aborted = True
-#                     break
-#                 s["idx"] = idx
-#                 self.SAMPLE_RATE = rate
-#                 self.gain_db = gain
-#                 n_blocks = len(self.build_centers(self.START_FREQ, self.STOP_FREQ, rate))
-#                 # A very short pass right after a rate change can still be a start-up transient: throw one
-#                 # away. On wide bands every block already has its own settling time, so don't waste a pass.
-#                 discard = 1 if (rate != s["last_rate"] and n_blocks <= 3) else 0
-#                 s["last_rate"] = rate
-#                 recorded = False
-#                 for _attempt in range(discard + 3):
-#                     if self.stop_flag.is_set():
-#                         aborted = True
-#                         break
-#                     seq0 = self._pass_seq
-#                     self._restart_pass = False
-#                     self.sweep_loop()                       # one complete pass at these settings
-#                     lp = self._last_pass
-#                     if lp is None or lp["seq"] <= seq0 or lp["rate"] != rate or lp["gain"] != gain:
-#                         continue                            # not a clean pass: try again
-#                     if discard > 0:
-#                         discard -= 1
-#                         continue
-#                     self.survey_record(lp)
-#                     recorded = True
-#                     break
-#                 if aborted:
-#                     break
-#                 if not recorded:
-#                     s["skipped"] += 1
-#                     self.log(f"Survey: no clean pass at {rate/1e6:.3f} MS/s / {gain:.1f} dB - skipped")
-#         except Exception as e:
-#             import traceback
-#             print(f"survey_loop: error {e!r}")
-#             traceback.print_exc()
-#             aborted = True
-#         finally:
-#             self.SAMPLE_RATE = s["orig_rate"]               # put the operator's settings back
-#             self.gain_db = s["orig_gain"]
-#             self.survey_signals.done.emit(bool(aborted))
-
-    # ---- previous survey_loop() (one scan per setting), kept in case of problems ----
-#     def survey_loop(self):
-#         """
-#         Survey worker thread. For every rate/gain combination: set the live settings (plain
-#         attributes - this thread owns the SDR), run ONE complete pass with the normal sweep_loop()
-#         and record it. Because the settings change only between passes, every pass is clean - no
-#         pass is wasted on a half-old/half-new setting, which matters on wide bands where a pass
-#         takes tens of seconds. Reports back to the GUI thread with survey_signals.done.
-#         """
-#         s = self._survey
-#         aborted = False
-#         try:
-#             rate0, gain0, _rep0 = s["combos"][0]
-#             self.SAMPLE_RATE = rate0
-#             self.gain_db = gain0
-#             self.survey_signals.progress.emit()             # controls show the first test
-#             c0 = self.build_centers(self.START_FREQ, self.STOP_FREQ, rate0)
-#             self.sdr.sample_rate = rate0
-#             self._applied_sample_rate = rate0
-#             self.settle_radio(float(c0[0]))
-#             for idx, (rate, gain, rep) in enumerate(s["combos"]):
-#                 if self.stop_flag.is_set():
-#                     aborted = True
-#                     break
-#                 s["idx"] = idx
-#                 self.SAMPLE_RATE = rate
-#                 self.gain_db = gain
-#                 self.survey_signals.progress.emit()         # Sample Rate box + RF Gain slider follow the test
-#                 n_blocks = len(self.build_centers(self.START_FREQ, self.STOP_FREQ, rate))
-#                 # A very short pass right after a rate change can still be a start-up transient: throw one
-#                 # away. On wide bands every block already has its own settling time, so don't waste a pass.
-#                 discard = 1 if (rate != s["last_rate"] and n_blocks <= 3) else 0
-#                 s["last_rate"] = rate
-#                 recorded = False
-#                 for _attempt in range(discard + 3):
-#                     if self.stop_flag.is_set():
-#                         aborted = True
-#                         break
-#                     seq0 = self._pass_seq
-#                     self._restart_pass = False
-#                     self.sweep_loop()                       # one complete pass at these settings
-#                     lp = self._last_pass
-#                     if lp is None or lp["seq"] <= seq0 or lp["rate"] != rate or lp["gain"] != gain:
-#                         continue                            # not a clean pass: try again
-#                     if discard > 0:
-#                         discard -= 1
-#                         continue
-#                     self.survey_record(lp)
-#                     recorded = True
-#                     break
-#                 if aborted:
-#                     break
-#                 if not recorded:
-#                     s["skipped"] += 1
-#                     self.log(f"Survey: no clean pass at {rate/1e6:.3f} MS/s / {gain:.1f} dB - skipped")
-#         except Exception as e:
-#             import traceback
-#             print(f"survey_loop: error {e!r}")
-#             traceback.print_exc()
-#             aborted = True
-#         finally:
-#             self.SAMPLE_RATE = s["orig_rate"]               # put the operator's settings back
-#             self.gain_db = s["orig_gain"]
-#             self.survey_signals.done.emit(bool(aborted))
 
     def survey_loop(self):
         """
@@ -7342,172 +6094,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                      f"within {s['timeout']:.0f} s - skipped")
             self.survey_next_combo()
 
-    # ---- previous survey_record() / survey_finish(), kept in case of problems ----
-#     def survey_record(self, lp):
-#         s = self._survey
-#         rate, gain, rep = s["combos"][s["idx"]]
-#         f, p, floor, spikes = self.survey_analyse(lp["f"], lp["p"], SURVEY_SPIKE_THRESH_DB)
-#         s["pass_dur"] = lp["dur"]
-#         for fr, lv, pr, bs in spikes:
-#             s["spikes_w"].writerow([rep, f"{rate:.0f}", f"{gain:.1f}", f"{fr:.1f}",
-#                                     f"{lv:.2f}", f"{pr:.2f}", f"{bs:.2f}"])
-#         top = max(spikes, key=lambda x: x[2]) if spikes else None
-#         s["summary_w"].writerow([rep, f"{rate:.0f}", f"{gain:.1f}", lp["n_avg"], len(p),
-#                                  f"{floor:.2f}", len(spikes),
-#                                  f"{top[2]:.2f}" if top else "", f"{top[0]:.1f}" if top else "",
-#                                  f"{lp['dur']:.1f}"])
-#         s["spikes_fh"].flush()
-#         s["summary_fh"].flush()
-#         s["spectra"].append((rate, gain, rep, f, p.astype(np.float32)))
-#         n_done, n_all = s["idx"] + 1, len(s["combos"])
-#         elapsed = time.time() - s["t_start"]
-#         eta = elapsed / n_done * (n_all - n_done)
-#         self.log(f"Survey {n_done}/{n_all}: {rate/1e6:.3f} MS/s, {gain:.1f} dB -> "
-#                  f"{len(spikes)} spikes (ETA {int(eta // 60)}m{int(eta % 60):02d}s)")
-#     def survey_finish(self, aborted):
-#         s = self._survey
-#         if s is None:
-#             return
-#         self._survey_timer.stop()
-#         for k in ("spikes_fh", "summary_fh"):
-#             try:
-#                 s[k].close()
-#             except Exception:
-#                 pass
-#         specs = s["spectra"]
-#         if specs:
-#             try:
-#                 lengths = np.array([len(x[3]) for x in specs])
-#                 np.savez_compressed(
-#                     s["base"] + "_spectra.npz",
-#                     rate_hz=np.array([x[0] for x in specs]),
-#                     gain_db=np.array([x[1] for x in specs]),
-#                     repeat=np.array([x[2] for x in specs]),
-#                     start=np.concatenate(([0], np.cumsum(lengths)[:-1])),
-#                     length=lengths,
-#                     freq_hz=np.concatenate([x[3] for x in specs]),
-#                     level_db=np.concatenate([x[4] for x in specs]))
-#             except Exception as e:
-#                 self.log(f"Survey: could not write spectra file: {e}")
-#         # put the operator's settings back
-#         self.survey_apply(s["orig_rate"], s["orig_gain"])
-#         self.survey_set_lock(False)
-#         if not s["was_running"] and not self.stop_flag.is_set():
-#             self.stop_sweep()
-#         self._survey = None
-#         self.log(f"=== SURVEY {'STOPPED EARLY' if aborted else 'FINISHED'}: {len(specs)} passes saved"
-#                  f"{', ' + str(s['skipped']) + ' skipped' if s['skipped'] else ''} -> "
-#                  f"{s['base']}_spikes.csv / _summary.csv / _spectra.npz ===")
-
-    # ---- previous survey_record() / survey_write_surfaces() / survey_finish() (CSV outputs), kept in case of problems ----
-#     def survey_record(self, lp):
-#         """Analyse and store one finished pass (runs on the survey worker thread)."""
-#         s = self._survey
-#         rate, gain, rep = s["combos"][s["idx"]]
-#         f, p, floor, spikes = self.survey_analyse(lp["f"], lp["p"], SURVEY_SPIKE_THRESH_DB)
-#         for fr, lv, pr, bs in spikes:
-#             s["spikes_w"].writerow([rep, f"{rate:.0f}", f"{gain:.1f}", f"{fr:.1f}",
-#                                     f"{lv:.2f}", f"{pr:.2f}", f"{bs:.2f}"])
-#         top = max(spikes, key=lambda x: x[2]) if spikes else None
-#         s["summary_w"].writerow([rep, f"{rate:.0f}", f"{gain:.1f}", lp["n_avg"], len(p),
-#                                  f"{floor:.2f}", len(spikes),
-#                                  f"{top[2]:.2f}" if top else "", f"{top[0]:.1f}" if top else "",
-#                                  f"{lp['dur']:.1f}"])
-#         s["spikes_fh"].flush()
-#         s["summary_fh"].flush()
-#         # surface-chart data: this pass reduced to npts frequency bins
-#         npts = max(10, min(s["npts"], len(p)))
-#         vec = self.survey_surface_vector(f, p, npts, s["peak"], s["f0"], s["f1"])
-#         s["surface"].setdefault(rate, {}).setdefault(gain, []).append(vec)
-#         # full-resolution levels for the .npz (one frequency axis per rate), while they fit in memory
-#         known = s["freq_by_rate"].get(rate)
-#         if known is None:
-#             s["freq_by_rate"][rate] = known = np.asarray(f, dtype=np.float64)
-#         if len(known) == len(p) and s["full_bytes"] + 4.0 * len(p) <= SURVEY_FULL_NPZ_MAX_BYTES:
-#             s["spectra"].append((rate, gain, rep, np.asarray(p, dtype=np.float32)))
-#             s["full_bytes"] += 4.0 * len(p)
-#         elif not s["full_warned"]:
-#             s["full_warned"] = True
-#             self.log("Survey: full-resolution spectra no longer fit in memory - the .npz keeps only what is "
-#                      "already stored; spikes, summary and surface CSVs are unaffected")
-#         n_done, n_all = s["idx"] + 1, len(s["combos"])
-#         elapsed = time.time() - s["t_start"]
-#         eta = elapsed / n_done * (n_all - n_done)
-#         self.log(f"Survey {n_done}/{n_all}: {rate/1e6:.3f} MS/s, {gain:.1f} dB -> "
-#                  f"{len(spikes)} spikes (ETA {self.survey_fmt_seconds(eta)})")
-#     def survey_write_surfaces(self, s):
-#         """One CSV per sample rate laid out for Excel's 3-D Surface chart: frequency down the rows (category
-#         axis, left blank in the corner cell so Excel treats it as labels), one column per gain with the
-#         LOWEST gain first (= front of the chart), cells = level in dB (repeats averaged in power)."""
-#         written = []
-#         f0, f1, npts_cfg = s["f0"], s["f1"], s["npts"]
-#         for rate, by_gain in sorted(s["surface"].items()):
-#             gains = sorted(by_gain)
-#             cols = []
-#             for g in gains:
-#                 stack = np.vstack(by_gain[g])
-#                 cols.append(10.0 * np.log10(np.mean(10.0 ** (stack / 10.0), axis=0)))
-#             n = len(cols[0])
-#             centres = f0 + (np.arange(n) + 0.5) * (f1 - f0) / n
-#             step_mhz = (f1 - f0) / n / 1e6
-#             dec = max(3, int(math.ceil(-math.log10(step_mhz))) + 2) if step_mhz > 0 else 6
-#             path = f"{s['base']}_surface_{rate / 1e6:.3f}MSps.csv"
-#             with open(path, "w", newline="") as fh:
-#                 w = csv.writer(fh)
-#                 w.writerow([""] + [f"{g:.1f} dB" for g in gains])
-#                 for k in range(n):
-#                     w.writerow([f"{centres[k] / 1e6:.{dec}f}"] +
-#                                [("" if not np.isfinite(c[k]) else f"{c[k]:.2f}") for c in cols])
-#             written.append(path)
-#         return written
-#     def survey_finish(self, aborted):
-#         """GUI thread, after the survey worker has finished: close files, write the surface CSVs and
-#         the .npz, give the controls back and (if it was running before) resume CONTINUOUS."""
-#         s = self._survey
-#         if s is None:
-#             return
-#         for k in ("spikes_fh", "summary_fh"):
-#             try:
-#                 s[k].close()
-#             except Exception:
-#                 pass
-#         surfaces = []
-#         try:
-#             surfaces = self.survey_write_surfaces(s)
-#         except Exception as e:
-#             self.log(f"Survey: could not write the surface-chart CSVs: {e}")
-#         specs = s["spectra"]
-#         if specs:
-#             try:
-#                 lengths = np.array([len(x[3]) for x in specs])
-#                 extra = {f"freq_hz_{int(r)}": fr for r, fr in s["freq_by_rate"].items()}
-#                 np.savez_compressed(
-#                     s["base"] + "_spectra.npz",
-#                     rate_hz=np.array([x[0] for x in specs]),
-#                     gain_db=np.array([x[1] for x in specs]),
-#                     repeat=np.array([x[2] for x in specs]),
-#                     length=lengths,
-#                     level_db=np.concatenate([x[3] for x in specs]),
-#                     **extra)
-#             except Exception as e:
-#                 self.log(f"Survey: could not write spectra file: {e}")
-#         # put the operator's settings back on the controls
-#         self.sync_sample_rate_combo()
-#         self.sync_gain_slider()
-#         self.update_status_panel()
-#         self.survey_set_lock(False)
-#         n_done = sum(len(v) for by_g in s["surface"].values() for v in by_g.values())
-#         self._survey = None
-#         self.log(f"=== SURVEY {'STOPPED EARLY' if aborted else 'FINISHED'}: {n_done} passes saved"
-#                  f"{', ' + str(s['skipped']) + ' skipped' if s['skipped'] else ''} -> "
-#                  f"{s['base']}_spikes.csv / _summary.csv / _spectra.npz ===")
-#         if surfaces:
-#             self.log(f"Surface charts for Excel ({len(surfaces)} file(s), one per sample rate): open one, select all, "
-#                      f"Insert > Charts > Surface > 3-D Surface. Frequency runs along the bottom, level is vertical, "
-#                      f"lowest gain is at the front: {', '.join(os.path.basename(p) for p in surfaces)}")
-#         if s["was_running"] and not aborted:
-#             self.continuous_when_idle()
-
     # ------------------------------------------------------------------------------------
     # Survey REPORT: one self-contained HTML file (data, charts and analysis all inside)
     # ------------------------------------------------------------------------------------
@@ -7558,276 +6144,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                 break
         return out
 
-    # ---- previous survey_analyse_all() (no verdicts), kept in case of problems ----
-#     def survey_analyse_all(self, s):
-#         """
-#         Turn the recorded passes into everything the report shows. Returns a dict.
-#         SAMPLE-RATE EFFECTS: spikes are grouped (a) by their offset from the nearest block centre -
-#         a feature made by the receiver itself moves with the tuning/sample rate, so it keeps the same
-#         offset (in Hz, or as a fraction of the sample rate) from each block centre while its absolute
-#         frequency changes - and then (b) by absolute frequency: seen at (almost) every rate = stable,
-#         seen at only some rates = rate-dependent.
-#         GAIN EFFECTS: for every feature the level is followed against RF gain (read from the stored
-#         spectra at the feature's frequency, so below-threshold points count too) and the slope in dB
-#         per dB is found: ~1 arrives with the signal, ~0 generated after the gain stage, >1.6 rises
-#         faster than the gain (distortion / overload product); plus onset gain and high-gain compression.
-#         """
-#         passes = s["passes"]
-#         rates = sorted({q["rate"] for q in passes})
-#         gains = sorted({q["gain"] for q in passes})
-#         nR, nG = len(rates), len(gains)
-#         ri = {r: i for i, r in enumerate(rates)}
-#         gi = {g: i for i, g in enumerate(gains)}
-#         f0, f1, npts = s["f0"], s["f1"], s["npts"]
-#         n_pass = len(passes)
-#         bin_hz = max(rates) / NFFT
-#         fs_db = 10.0 * math.log10(0.25) + float(getattr(self, "_psd_to_dbuv_const", 33.5))
-#         # ---- per rate/gain tables ----
-#         grp = {}
-#         for q in passes:
-#             grp.setdefault((ri[q["rate"]], gi[q["gain"]]), []).append(q)
-#         spec = [[None] * nG for _ in range(nR)]
-#         floor = [[None] * nG for _ in range(nR)]
-#         peak = [[None] * nG for _ in range(nR)]
-#         for (a, b), qs in grp.items():
-#             st = np.vstack([q["vec"] for q in qs])
-#             with np.errstate(all="ignore"):
-#                 spec[a][b] = 10.0 * np.log10(np.mean(10.0 ** (st / 10.0), axis=0))
-#             fl = [q["floor"] for q in qs if np.isfinite(q["floor"])]
-#             pk = [q["peak"] for q in qs if np.isfinite(q["peak"])]
-#             floor[a][b] = float(np.mean(fl)) if fl else None
-#             peak[a][b] = float(np.max(pk)) if pk else None
-#         # ---- spikes ----
-#         rows = [(ri[q["rate"]], gi[q["gain"]], f, lv, pr, q["pid"]) for q in passes for (f, lv, pr, _bs) in q["spikes"]]
-#         A = np.array(rows, dtype=np.float64) if rows else np.zeros((0, 6))
-#         ia, ib = A[:, 0].astype(int), A[:, 1].astype(int)
-#         pid_arr = A[:, 5].astype(int)
-#         cent = {a: self.build_centers(f0, f1, rates[a]) for a in range(nR)}
-#         feats = []
-#         def make_feature(kind, members, value):
-#             """value: absolute Hz (kind 'abs'), offset Hz ('fixed') or fraction of Fs ('scaled')."""
-#             det = [[None] * nG for _ in range(nR)]
-#             for i in members:
-#                 a, b, lv = int(A[i, 0]), int(A[i, 1]), float(A[i, 3])
-#                 if det[a][b] is None or lv > det[a][b]:
-#                     det[a][b] = lv
-#             lev = [row[:] for row in det]
-#             refined = {}
-#             for q in passes:                              # level at the feature's frequency from the stored spectra
-#                 if q.get("p") is None:
-#                     continue
-#                 a, b = ri[q["rate"]], gi[q["gain"]]
-#                 fa = s["freq_by_rate"][q["rate"]]
-#                 tol = 1.5 * q["rate"] / NFFT
-#                 if kind == "abs":
-#                     targets = [value]
-#                 elif kind == "fixed":
-#                     targets = cent[a] + value
-#                 else:
-#                     targets = cent[a] + value * q["rate"]
-#                 best = -np.inf
-#                 for t in np.atleast_1d(targets):
-#                     lo, hi = np.searchsorted(fa, t - tol, "left"), np.searchsorted(fa, t + tol, "right")
-#                     if hi > lo:
-#                         best = max(best, float(np.max(q["p"][lo:hi])))
-#                 if np.isfinite(best):
-#                     refined[(a, b)] = max(refined.get((a, b), -np.inf), best)
-#             for (a, b), v in refined.items():
-#                 lev[a][b] = v
-#             # gain behaviour from the points that stand clear of the noise floor
-#             vis = [[(lev[a][b] is not None and floor[a][b] is not None and
-#                      lev[a][b] - floor[a][b] >= SURVEY_SPIKE_THRESH_DB) for b in range(nG)] for a in range(nR)]
-#             slopes, lows, highs, onsets = [], [], [], []
-#             for a in range(nR):
-#                 pts = [(gains[b], lev[a][b]) for b in range(nG) if vis[a][b]]
-#                 if len(pts) >= 3 and pts[-1][0] - pts[0][0] >= 6.0:
-#                     x = np.array([p[0] for p in pts]); y = np.array([p[1] for p in pts])
-#                     slopes.append(float(np.polyfit(x, y, 1)[0]))
-#                     if len(pts) >= 6:
-#                         h = len(pts) // 2
-#                         lows.append(float(np.polyfit(x[:h + 1], y[:h + 1], 1)[0]))
-#                         highs.append(float(np.polyfit(x[h:], y[h:], 1)[0]))
-#                 if pts:
-#                     onsets.append(pts[0][0])
-#             slope = float(np.median(slopes)) if slopes else None
-#             tags, gtext = [], ""
-#             if slope is None:
-#                 gtext = "too few points above the noise floor to judge"
-#             elif slope >= 1.6:
-#                 tags.append(("rises faster than gain", "t-sup"))
-#                 gtext = f"{slope:.1f} dB per dB - typical of a distortion / overload product made inside the gain stages"
-#             elif slope >= 1.4:
-#                 tags.append(("steeper than gain", "t-lin"))
-#                 gtext = f"{slope:.1f} dB per dB - slightly steeper than the gain; possibly an early distortion product"
-#             elif slope >= 0.6:
-#                 tags.append(("tracks gain", "t-lin"))
-#                 gtext = f"{slope:.1f} dB per dB - arrives with the signal (antenna side) or follows the receiver noise"
-#             elif slope >= 0.25:
-#                 tags.append(("weakly gain-dependent", "t-fix"))
-#                 gtext = f"{slope:.1f} dB per dB - mostly independent of gain"
-#             else:
-#                 tags.append(("independent of gain", "t-fix"))
-#                 gtext = f"{slope:.1f} dB per dB - level does not follow the gain: made after the gain stage (ADC / clock / digital)"
-#             if lows and highs and np.median(lows) > 0.6 and np.median(highs) < 0.4 * np.median(lows):
-#                 k = gains[len(gains) // 2]
-#                 tags.append(("flattens at high gain", "t-cmp"))
-#                 gtext += f"; stops rising above about {k:.0f} dB (compression / clipping?)"
-#             onset = float(np.median(onsets)) if onsets else None
-#             if onset is not None and onset > gains[0] + 0.25 * (gains[-1] - gains[0]):
-#                 tags.append((f"appears above {onset:.1f} dB", "t-ons"))
-#                 gtext += f"; first stands out of the noise at {onset:.1f} dB gain"
-#             rates_present = [any(det[a][b] is not None for b in range(nG)) for a in range(nR)]
-#             n_rates = sum(rates_present)
-#             n_pids = len({int(pid_arr[i]) for i in members})
-#             lv_all = [float(A[i, 3]) for i in members]
-#             prom_all = [float(A[i, 4]) for i in members]
-#             return {"kind": kind, "value": value, "rates_present": rates_present, "n_rates": n_rates,
-#                     "n_pids": n_pids, "median_level": float(np.median(lv_all)), "max_prom": max(prom_all),
-#                     "slope": slope, "tags": tags, "gtext": gtext, "levels": lev, "onset": onset,
-#                     "super": slope is not None and slope >= 1.6, "fixedgain": slope is not None and slope < 0.25,
-#                     "compress": any(t[0].startswith("flattens") for t in tags),
-#                     "onset_tag": any(t[0].startswith("appears") for t in tags)}
-#         used = np.zeros(len(A), dtype=bool)
-#         if nR >= 2 and len(A):
-#             # offset of every spike from its nearest block centre
-#             d = np.zeros(len(A))
-#             kb = np.zeros(len(A), dtype=int)               # index of the nearest block
-#             for a in range(nR):
-#                 m = ia == a
-#                 c = cent[a]
-#                 ff = A[m, 2]
-#                 if len(c) == 1:
-#                     near = np.full(ff.shape, c[0])
-#                 else:
-#                     k = np.searchsorted(c, ff)
-#                     k0, k1 = np.clip(k - 1, 0, len(c) - 1), np.clip(k, 0, len(c) - 1)
-#                     near = np.where(np.abs(ff - c[k0]) <= np.abs(ff - c[k1]), c[k0], c[k1])
-#                     kb[m] = np.where(np.abs(ff - c[k0]) <= np.abs(ff - c[k1]), k0, k1)
-#                 d[m] = ff - near
-#             frac = d / np.array([rates[a] for a in ia])
-#             min_p = max(3, int(0.3 * n_pass))
-#             def accept_block(members):
-#                 # A tuning / sample-rate artefact repeats in (nearly) EVERY block of a pass. A real signal that
-#                 # merely happens to sit at the same offset from a centre at two rates shows up in one block only.
-#                 cov = []
-#                 for a in range(nR):
-#                     nb = len(cent[a])
-#                     if nb < 3:
-#                         continue
-#                     per = {}
-#                     for i in members[ia[members] == a]:
-#                         per.setdefault(int(pid_arr[i]), set()).add(int(kb[i]))
-#                     if per:
-#                         cov.append(float(np.mean([len(v) / nb for v in per.values()])))
-#                 return (not cov) or float(np.median(cov)) >= 0.5
-#             for members in self.survey_mode_clusters(d, pid_arr, ia, ~used, 2.5 * bin_hz, min_p, 2, 12, accept_block):
-#                 used[members] = True
-#                 feats.append(make_feature("fixed", members, float(np.median(d[members]))))
-#             for members in self.survey_mode_clusters(frac, pid_arr, ia, ~used, 2.5 / NFFT, min_p, 2, 12, accept_block):
-#                 used[members] = True
-#                 feats.append(make_feature("scaled", members, float(np.median(frac[members]))))
-#         if len(A):
-#             for members in self.survey_mode_clusters(A[:, 2], pid_arr, ia, ~used, 3.0 * bin_hz, 2, 1, 150):
-#                 used[members] = True
-#                 feats.append(make_feature("abs", members, float(np.median(A[members, 2]))))
-#         n_single = int((~used).sum())
-#         # ---- present the features ----
-#         def simple_fraction(fr):
-#             for n in (2, 3, 4, 5, 6, 8, 10, 12, 16):
-#                 if abs(abs(fr) - 1.0 / n) < 3.0 / NFFT:
-#                     return f" (about Fs/{n})"
-#             return ""
-#         out_feats = []
-#         for ft in feats:
-#             kind, v = ft["kind"], ft["value"]
-#             if kind == "abs":
-#                 where = self.survey_fmt_hz(v)
-#                 share = ft["n_rates"] / nR
-#                 if nR < 2:
-#                     tag, cls, txt = "single rate", "t-stable", ""
-#                 elif share >= 0.75:
-#                     tag, cls, txt = "stable", "t-stable", f"{ft['n_rates']}/{nR} rates"
-#                 elif share > 0.5:
-#                     tag, cls, txt = "partly rate-dependent", "t-rate", f"{ft['n_rates']}/{nR} rates"
-#                 else:
-#                     tag, cls, txt = "rate-dependent", "t-rate", f"{ft['n_rates']}/{nR} rates"
-#             elif kind == "fixed":
-#                 where = ("at the centre of every block" if abs(v) < 1.5 * bin_hz else
-#                          f"{v / 1e3:+.2f} kHz from every block centre")
-#                 tag, cls, txt = "moves with tuning", "t-block", f"{ft['n_rates']}/{nR} rates"
-#             else:
-#                 where = f"{v:+.4f} x sample rate from every block centre{simple_fraction(v)}"
-#                 tag, cls, txt = "scales with sample rate", "t-block", f"{ft['n_rates']}/{nR} rates"
-#             ft.update({"where": where, "rate_tag": tag, "rate_cls": cls, "rate_text": txt})
-#             lv = [x for row in ft["levels"] for x in row if x is not None]
-#             ft["level_text"] = (f"{ft['median_level']:.1f} dB (up to {ft['max_prom']:.0f} dB above its surroundings)")
-#             out_feats.append(ft)
-#         order = sorted(out_feats, key=lambda x: (0 if x["kind"] != "abs" else 1, -x["n_pids"], -x["max_prom"]))
-#         # ---- findings ----
-#         fnd = []
-#         def add(level, text):
-#             fnd.append({"level": level, "text": text})
-#         add("", f"{n_pass} pass(es): {nR} sample rate(s) x {nG} gain step(s), band {self.survey_fmt_hz(f0)} - {self.survey_fmt_hz(f1)}. "
-#                 f"{len(A)} spike(s) found; {len(order)} recurring feature(s) listed below"
-#                 + (f", {n_single} isolated spike(s) seen only once (not listed - normally noise)." if n_single else "."))
-#         if nR < 2:
-#             add("warn", "Only one sample rate was surveyed, so sample-rate effects cannot be separated from real signals. Survey at least two rates.")
-#         blk = [x for x in order if x["kind"] != "abs"]
-#         absf = [x for x in order if x["kind"] == "abs"]
-#         if nR >= 2:
-#             if blk:
-#                 for x in blk[:5]:
-#                     add("bad", f"SAMPLE-RATE / TUNING ARTEFACT - {x['where']}: seen at {x['n_rates']} of {nR} rates, in {x['n_pids']} of {n_pass} passes, "
-#                                f"typically {x['median_level']:.1f} dB. Its absolute frequency changes with the block centres, so it is made by the "
-#                                f"receiver, not received from outside. Gain: {x['gtext']}.")
-#             else:
-#                 add("ok", "No feature keeps a fixed offset from the block centres across sample rates (no tuning / sample-rate artefact found).")
-#             rd = [x for x in absf if x["rate_tag"] in ("rate-dependent", "partly rate-dependent")]
-#             st = [x for x in absf if x["rate_tag"] == "stable"]
-#             if rd:
-#                 top = sorted(rd, key=lambda x: -x["max_prom"])[:5]
-#                 add("warn", f"{len(rd)} feature(s) appear at only some sample rates - candidates for sample-rate effects (aliasing / images / spurs). Strongest: " +
-#                     "; ".join(f"{x['where']} at {x['n_rates']}/{nR} rates ({x['max_prom']:.0f} dB above surroundings)" for x in top) + ".")
-#             if st:
-#                 top = sorted(st, key=lambda x: -x["median_level"])[:5]
-#                 add("ok", f"{len(st)} feature(s) are stable across sample rates (real signals or rate-independent spurs). Strongest: " +
-#                     "; ".join(f"{x['where']} ({x['median_level']:.1f} dB)" for x in top) + ".")
-#         sup = sorted([x for x in order if x["super"]], key=lambda x: -x["slope"])
-#         if sup:
-#             add("bad", "GAIN-STAGE DISTORTION SUSPECTED - these rise faster than the gain: " +
-#                 "; ".join(f"{x['where']} ({x['slope']:.1f} dB per dB)" for x in sup[:6]) +
-#                 ". Signals from the antenna rise 1 dB per dB; 2 dB per dB and 3 dB per dB are the signature of 2nd and 3rd order products. Try lower gain or an attenuator.")
-#         ons = [x for x in order if x["onset_tag"]]
-#         if ons:
-#             add("warn", "Appear only above a certain gain: " + "; ".join(f"{x['where']} (from about {x['onset']:.1f} dB)" for x in ons[:6]) + ".")
-#         cmp_ = [x for x in order if x["compress"]]
-#         if cmp_:
-#             add("warn", "Stop rising at high gain (possible compression / clipping): " + "; ".join(x["where"] for x in cmp_[:6]) + ".")
-#         fx = [x for x in order if x["fixedgain"]]
-#         if fx:
-#             add("warn", f"{len(fx)} feature(s) do not follow the gain at all (generated after the gain stage - ADC, clocks, digital): " +
-#                 "; ".join(f"{x['where']}" for x in fx[:6]) + ("; ..." if len(fx) > 6 else "") + ".")
-#         hmin, where_min = np.inf, None
-#         for a in range(nR):
-#             for b in range(nG):
-#                 if peak[a][b] is not None and fs_db - peak[a][b] < hmin:
-#                     hmin, where_min = fs_db - peak[a][b], (a, b)
-#         if where_min is not None:
-#             a, b = where_min
-#             if hmin < 6.0:
-#                 add("bad", f"CLIPPING RISK: the strongest component comes within {hmin:.1f} dB of the ADC full-scale equivalent at {gains[b]:.1f} dB gain / "
-#                            f"{rates[a] / 1e6:.3f} MS/s. Above that gain the front end is likely overloaded.")
-#             else:
-#                 add("ok", f"The strongest single component never comes closer than {hmin:.1f} dB to the ADC full-scale equivalent. "
-#                           f"(Many strong signals together can still overload the ADC without any one tone being near full scale.)")
-#         fs_slopes = []
-#         for a in range(nR):
-#             xs = [(gains[b], floor[a][b]) for b in range(nG) if floor[a][b] is not None]
-#             if len(xs) >= 3 and xs[-1][0] - xs[0][0] >= 6.0:
-#                 fs_slopes.append(float(np.polyfit([p[0] for p in xs], [p[1] for p in xs], 1)[0]))
-#         if fs_slopes:
-#             add("", f"The noise floor rises {np.median(fs_slopes):.2f} dB per dB of gain (about 1 while receiver noise dominates; lower means ADC / digital noise dominates).")
-#         return {"rates": rates, "gains": gains, "spec": spec, "floor": floor, "peak": peak, "fs_db": fs_db,
 #                 "features": order, "findings": fnd, "A": A, "n_pass": n_pass}
 
     def survey_analyse_all(self, s):
@@ -8216,215 +6532,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         hz = abs(float(hz))
         return f"{hz / 1e6:.4f} MHz" if hz >= 1e6 else f"{hz / 1e3:.2f} kHz"
 
-    # ---- previous survey_build_report() (no verdicts), kept in case of problems ----
-#     def survey_build_report(self, s, partial=False):
-#         """Build the complete single-file HTML report for the passes recorded so far."""
-#         r = self.survey_analyse_all(s)
-#         rates, gains = r["rates"], r["gains"]
-#         nR, nG = len(rates), len(gains)
-#         f0, f1, npts = s["f0"], s["f1"], s["npts"]
-#         def v1(x):
-#             return None if x is None or not np.isfinite(x) else round(float(x), 1)
-#         def arr1(v):
-#             return None if v is None else [v1(x) for x in v]
-#         freq = [round((f0 + (k + 0.5) * (f1 - f0) / npts) / 1e6, 6) for k in range(npts)]
-#         feats = []
-#         for ft in r["features"]:
-#             feats.append({
-#                 "where": ft["where"], "rate_tag": ft["rate_tag"], "rate_cls": ft["rate_cls"], "rate_text": ft["rate_text"],
-#                 "seen": f"{ft['n_pids']}/{r['n_pass']} passes", "level_text": ft["level_text"],
-#                 "slope": None if ft["slope"] is None else round(ft["slope"], 2),
-#                 "gain_tags": [list(t) for t in ft["tags"]], "gain_text": ft["gtext"],
-#                 "levels": [[v1(x) for x in row] for row in ft["levels"]]})
-#         A = r["A"]
-#         spikes = []
-#         if len(A):
-#             top = np.argsort(-A[:, 4])[:SURVEY_REPORT_MAX_SPIKES]
-#             spikes = [[int(A[i, 0]), int(A[i, 1]), int(round(A[i, 2])), v1(A[i, 3]), v1(A[i, 4])] for i in top]
-#         ri = {x: i for i, x in enumerate(rates)}
-#         fs_db = r["fs_db"]
-#         table = [[int(q["rate"]), q["gain"], q["rep"], v1(q["floor"]), v1(q["peak"]),
-#                   v1(fs_db - q["peak"]) if np.isfinite(q["peak"]) else None, len(q["spikes"]), round(q["dur"], 1)]
-#                  for q in s["passes"]]
-#         D = {"meta": {"band": f"{self.survey_fmt_hz(f0)} - {self.survey_fmt_hz(f1)}", "passes": r["n_pass"],
-#                       "n_avg": s["passes"][0]["n_avg"] if s["passes"] else 1,
-#                       "created": time.strftime("%Y-%m-%d %H:%M"), "partial": bool(partial)},
-#              "freq": freq, "rates": [int(x) for x in rates], "gains": [float(x) for x in gains],
-#              "spec": [[arr1(x) for x in row] for row in r["spec"]],
-#              "floor": [[v1(x) for x in row] for row in r["floor"]], "peak": [[v1(x) for x in row] for row in r["peak"]],
-#              "fs_db": round(fs_db, 1), "findings": r["findings"], "features": feats, "spikes": spikes, "table": table}
-#         payload = json.dumps(D, separators=(",", ":"), allow_nan=False).replace("</", "<\\/")
-#         return SURVEY_REPORT_TEMPLATE.replace("__DATA__", payload)
-
-    # ---- previous survey_build_report() (verdict analysis page), kept in case of problems ----
-#     def survey_build_report(self, s, partial=False):
-#         """Build the complete single-file HTML report for the passes recorded so far."""
-#         r = self.survey_analyse_all(s)
-#         rates, gains = r["rates"], r["gains"]
-#         nR, nG, n_rel = r["nR"], r["nG"], r["n_rel"]
-#         f0, f1, npts = s["f0"], s["f1"], s["npts"]
-#         byv, fs_db = r["byv"], r["fs_db"]
-#         fmt = self.survey_fmt_hz
-#         def v1(x):
-#             return None if x is None or not np.isfinite(x) else round(float(x), 1)
-#         def arr1(v):
-#             return None if v is None else [v1(x) for x in v]
-#         def med(vals):
-#             vals = [x for x in vals if x is not None]
-#             return float(np.median(vals)) if vals else None
-#         freq = [round((f0 + (k + 0.5) * (f1 - f0) / npts) / 1e6, 6) for k in range(npts)]
-#         # ---- features for the report ----
-#         order = sorted(r["feats"], key=lambda x: ({"reliable": 0, "rate": 1, "gain": 2, "internal": 3, "unsure": 4}[x["verdict"]],
-#                                                     -x["n_pids"], -x["max_prom"]))
-#         feats = []
-#         for ft in order:
-#             pos = None
-#             if ft["kind"] == "abs":
-#                 pos = round(ft["value"] / 1e6, 6)
-#             elif ft["kind"] == "fixed":
-#                 pos = round(ft["value"], 1)
-#             else:
-#                 pos = round(ft["value"], 6)
-#             feats.append({"where": ft["where"], "verdict": ft["verdict"], "kind": ft["kind"], "pos": pos, "cause": ft["cause"],
-#                           "rate_text": ft["rate_text"], "seen": f"{ft['n_pids']}/{r['n_pass']} passes",
-#                           "level_text": f"{ft['median_level']:.1f} dB (up to {ft['max_prom']:.0f} dB above its surroundings)",
-#                           "level": round(ft["median_level"], 1), "slope": None if ft["slope"] is None else round(ft["slope"], 2),
-#                           "lin_to": ft["lin_to"], "first_vis": ft["first_vis"], "knee": ft["knee"],
-#                           "levels": [[v1(x) for x in row] for row in ft["levels"]]})
-#         A = r["A"]
-#         spikes = []
-#         if len(A):
-#             top = np.argsort(-A[:, 4])[:SURVEY_REPORT_MAX_SPIKES]
-#             spikes = [[int(A[i, 0]), int(A[i, 1]), int(round(A[i, 2])), v1(A[i, 3]), v1(A[i, 4])] for i in top]
-#         table = [[int(q["rate"]), q["gain"], q["rep"], v1(q["floor"]), v1(q["peak"]),
-#                   v1(fs_db - q["peak"]) if np.isfinite(q["peak"]) else None, len(q["spikes"]), round(q["dur"], 1)]
-#                  for q in s["passes"]]
-#         # ---- gain analysis for the charts ----
-#         def col(m, b, fn):
-#             return fn([m[a][b] for a in range(nR)])
-#         gain_info = {
-#             "gains": [float(g) for g in gains],
-#             "floor": [v1(col(r["floor"], b, med)) for b in range(nG)],
-#             "dut_level": [v1(col(r["dut_level"], b, med)) for b in range(nG)],
-#             "dut_snr": [v1(col(r["dut_snr"], b, med)) for b in range(nG)],
-#             "gart_level": [v1(col(r["gart_level"], b, lambda v: max([x for x in v if x is not None], default=None))) for b in range(nG)],
-#             "n_gart": [round(float(np.mean([r["n_gart"][a][b] for a in range(nR)])), 2) for b in range(nG)],
-#             "n_art": [round(float(np.mean([r["n_art"][a][b] for a in range(nR)])), 2) for b in range(nG)],
-#             "gmax": gains[r["gmax_all_b"]], "gmin": (gains[r["gmin_all_b"]] if r["gmin_all_b"] is not None else None),
-#             "hypothesis": SURVEY_EXPECTED_GAIN_LIMIT_DB,
-#             "per_rate": [{"rate": int(p["rate"]), "gmax": gains[p["gmax_b"]], "reason": p["reason"],
-#                           "gmin": (gains[p["gmin_b"]] if p["gmin_b"] is not None else None)} for p in r["per_rate"]]}
-#         best = [{"rate_i": x["a"], "gain_i": x["b"], "rate": int(rates[x["a"]]), "gain": gains[x["b"]], "score": round(x["score"], 1),
-#                  "coverage": round(x["coverage"], 2), "snr": v1(x["snr"]), "n_art": x["n_art"], "margin": v1(x["margin"]),
-#                  "headroom": v1(x["headroom"]), "notes": x["notes"]} for x in r["best"]]
-#         scores = [[v1(x) for x in row] for row in r["scores"]]
-#         # ---- summary text ----
-#         summary = []
-#         def add(level, text):
-#             summary.append({"level": level, "text": text})
-#         nrate, ngain, nint, nuns = len(byv["rate"]), len(byv["gain"]), len(byv["internal"]), len(byv["unsure"])
-#         add("", f"{r['n_pass']} pass(es): {nR} sample rate(s) x {nG} gain step(s), band {fmt(f0)} - {fmt(f1)}. "
-#                 f"{len(A)} spike(s) found, grouped into {len(feats)} recurring feature(s): {n_rel} reliably sensed, {nrate} caused by the sample rate / tuning, "
-#                 f"{ngain} caused by the gain stages, {nint} generated inside the receiver, {nuns} unconfirmed"
-#                 + (f"; {r['n_single']} isolated spike(s) seen only once were ignored (normally noise)." if r["n_single"] else "."))
-#         navg = s["passes"][0]["n_avg"] if s["passes"] else 1
-#         if navg < 5:
-#             add("warn", f"Averaging was only {navg} capture(s) per block. With so little averaging, random noise peaks can look like weak features and distort the verdicts - use 10 or more (the Time Averaging setting) for the survey.")
-#         if nR < 2:
-#             add("warn", "Only one sample rate was surveyed, so a real signal cannot be told from a sample-rate artefact. Survey at least two (preferably three or more) rates; nothing can be confirmed as reliably sensed.")
-#         if n_rel:
-#             top = byv["reliable"][:6]
-#             add("ok", f"RELIABLY SENSED - {n_rel} signal(s) appear at the same frequency at (nearly) every sample rate and rise in step with the RF gain, "
-#                       f"so they are the best candidates for coming from the device under test. Strongest: " +
-#                 "; ".join(f"{x['where']} ({x['median_level']:.1f} dB)" for x in top) + ("; ..." if n_rel > 6 else "") + ".")
-#         elif nR >= 2:
-#             add("warn", "No feature was both stable across the sample rates and tracking the gain, so nothing could be confirmed as reliably sensed. "
-#                         "Check the 'unconfirmed' list, or whether the device under test is producing a signal in this band.")
-#         if nrate:
-#             add("bad", f"IGNORE - {nrate} feature(s) are caused by the sample rate / tuning (LO leakage, images, aliases, fixed-offset spurs): " +
-#                 "; ".join(f"{x['where']}" + (f" ({x['short']})" if x.get("short") else "") for x in byv["rate"][:5]) + ("; ..." if nrate > 5 else "") + " (details below).")
-#         if ngain:
-#             add("bad", f"IGNORE - {ngain} feature(s) are caused by the gain stages (non-linear products that rise faster than the gain): " +
-#                 "; ".join(f"{x['where']} ({x['slope']:.1f} dB/dB" + (f", {x['short']}" if x.get("short") else "") + ")" for x in byv["gain"][:5]) + ("; ..." if ngain > 5 else "") + " (details below).")
-#         if nint:
-#             add("warn", f"IGNORE - {nint} feature(s) are stable but do not follow the gain, so they are generated inside the receiver after the gain stage: " +
-#                 "; ".join(f"{x['where']}" for x in byv["internal"][:5]) + ("; ..." if nint > 5 else "") + ".")
-#         # maximum usable gain
-#         gmax, gmin = gain_info["gmax"], gain_info["gmin"]
-#         reasons = [p["reason"] for p in gain_info["per_rate"]]
-#         rep = min(r["per_rate"], key=lambda p: abs(p["gmax_b"] - r["gmax_all_b"]))         # a rate that sets the overall limit
-#         lim_rate = rep
-#         lower = [p for p in r["per_rate"] if p["gmax_b"] < r["gmax_all_b"]]
-#         add("ok" if gmax >= gains[-1] else "warn",
-#             f"MAXIMUM USABLE GAIN - about {gmax:.1f} dB" + (" (the highest surveyed gain; no limit was found)" if gmax >= gains[-1] else
-#             f". Limited by: {rep['reason']}") + "."
-#             + (" Lower limits at other sample rates: " + "; ".join(f"{p['rate'] / 1e6:.3f} MS/s {gains[p['gmax_b']]:.1f} dB ({p['reason']})" for p in lower) +
-#                " - a lower limit at one rate only is often a coincidence with a rate-dependent artefact, see the table below." if lower else "")
-#             + (f" Below about {gmin:.1f} dB the DUT signals are less than 10 dB above the noise floor, so the useful window is {gmin:.1f} - {gmax:.1f} dB." if gmin is not None and n_rel else ""))
-#         dist_on = r["dist_on"]
-#         exp = SURVEY_EXPECTED_GAIN_LIMIT_DB
-#         gsl = [x["slope"] for x in byv["gain"] if x["slope"] is not None]
-#         if dist_on:
-#             on = float(np.median(dist_on))
-#             sl = float(np.median(gsl)) if gsl else None
-#             sltxt = f" and rise about {sl:.1f} dB per dB of gain against 1 dB per dB for real signals" if sl is not None else ""
-#             if abs(on - exp) <= 3.0:
-#                 add("bad", f"YOUR ESTIMATE (gains above about {exp:g} dB add disproportionate distortion) IS CONFIRMED: gain-caused artefacts first appear at about {on:.1f} dB{sltxt}.")
-#             elif on < exp - 3.0:
-#                 add("bad", f"YOUR ESTIMATE (about {exp:g} dB) IS PARTLY CONFIRMED but optimistic: gain-caused artefacts already appear from about {on:.1f} dB{sltxt}.")
-#             else:
-#                 add("warn", f"YOUR ESTIMATE (about {exp:g} dB) IS NOT CONFIRMED as stated: gain-caused artefacts only appear above about {on:.1f} dB{sltxt}.")
-#         else:
-#             lim_txt = ""
-#             if gmax < gains[-1]:
-#                 lim_txt = f" Another limit does appear: {lim_rate['reason']} (at {lim_rate['rate'] / 1e6:.3f} MS/s)."
-#             add("warn", f"YOUR ESTIMATE (gains above about {exp:g} dB add disproportionate distortion) IS NOT CONFIRMED by this survey: no gain-caused artefacts "
-#                         f"were identified between {gains[0]:.1f} and {gains[-1]:.1f} dB.{lim_txt}")
-#         if best:
-#             b0 = best[0]
-#             parts = [f"{b0['rate'] / 1e6:.3f} MS/s at {b0['gain']:.1f} dB"]
-#             det = []
-#             if n_rel:
-#                 det.append(f"shows {int(round(b0['coverage'] * n_rel))} of {n_rel} reliable signal(s)")
-#                 if b0["snr"] is not None:
-#                     det.append(f"median {b0['snr']:.0f} dB above the noise")
-#             det.append(f"{b0['n_art']} known artefact(s) visible")
-#             if b0["margin"] is not None:
-#                 det.append(f"the strongest artefact is {b0['margin']:.0f} dB below the strongest DUT signal")
-#             if b0["headroom"] is not None:
-#                 det.append(f"{b0['headroom']:.0f} dB below ADC full scale")
-#             add("ok", "BEST SPECTRUM - " + parts[0] + ": " + "; ".join(det) + ".")
-#         # other observations
-#         hmin, where_min = np.inf, None
-#         for a in range(nR):
-#             for b in range(nG):
-#                 if r["peak"][a][b] is not None and fs_db - r["peak"][a][b] < hmin:
-#                     hmin, where_min = fs_db - r["peak"][a][b], (a, b)
-#         if where_min is not None:
-#             a, b = where_min
-#             if hmin < 6.0:
-#                 add("bad", f"CLIPPING RISK: the strongest component comes within {hmin:.1f} dB of the ADC full-scale equivalent at {gains[b]:.1f} dB gain / {rates[a] / 1e6:.3f} MS/s.")
-#             else:
-#                 add("", f"The strongest single component never comes closer than {hmin:.1f} dB to the ADC full-scale equivalent (many strong signals together can still overload the ADC).")
-#         fs_slopes = []
-#         for a in range(nR):
-#             xs = [(gains[b], r["floor"][a][b]) for b in range(nG) if r["floor"][a][b] is not None]
-#             if len(xs) >= 3 and xs[-1][0] - xs[0][0] >= 6.0:
-#                 fs_slopes.append(float(np.polyfit([p[0] for p in xs], [p[1] for p in xs], 1)[0]))
-#         if fs_slopes:
-#             add("", f"The noise floor rises {np.median(fs_slopes):.2f} dB per dB of gain (about 1 while receiver noise dominates; lower means ADC / digital noise dominates; clearly higher means the gain stages are adding noise).")
-#         D = {"meta": {"band": f"{fmt(f0)} - {fmt(f1)}", "passes": r["n_pass"], "n_reliable": n_rel,
-#                       "n_avg": s["passes"][0]["n_avg"] if s["passes"] else 1,
-#                       "created": time.strftime("%Y-%m-%d %H:%M"), "partial": bool(partial)},
-#              "freq": freq, "rates": [int(x) for x in rates], "gains": [float(x) for x in gains],
-#              "centres": [[round(float(c) / 1e6, 6) for c in r["cent"][a]] for a in range(nR)],
-#              "spec": [[arr1(x) for x in row] for row in r["spec"]],
-#              "floor": [[v1(x) for x in row] for row in r["floor"]], "peak": [[v1(x) for x in row] for row in r["peak"]],
-#              "fs_db": round(fs_db, 1), "summary": summary, "features": feats, "gain": gain_info, "best": best, "scores": scores,
-#              "spikes": spikes, "table": table}
-#         payload = json.dumps(D, separators=(",", ":"), allow_nan=False).replace("</", "<\\/")
-#         return SURVEY_REPORT_TEMPLATE.replace("__DATA__", payload)
-
     def survey_build_report(self, s, partial=False):
         """Build the single-file HTML report: the two maps first, then the repeatability results."""
         passes = s["passes"]
@@ -8545,40 +6652,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         os.replace(tmp, s["report_path"])
         return s["report_path"]
 
-    # ---- previous survey_record(), kept in case of problems ----
-#     def survey_record(self, lp):
-#         """Analyse and store one finished pass (runs on the survey worker thread)."""
-#         s = self._survey
-#         rate, gain, rep = s["combos"][s["idx"]]
-#         f, p, floor, spikes = self.survey_analyse(lp["f"], lp["p"], SURVEY_SPIKE_THRESH_DB)
-#         vec = self.survey_surface_vector(f, p, s["npts"], s["peak"], s["f0"], s["f1"])
-#         rec = {"pid": len(s["passes"]), "rate": rate, "gain": gain, "rep": rep, "floor": floor,
-#                "peak": float(np.max(p)) if len(p) else float("nan"), "n_avg": lp["n_avg"], "dur": lp["dur"],
-#                "spikes": spikes, "vec": vec, "p": None}
-#         # full-resolution levels are kept (one frequency axis per rate) while they fit in memory, so the
-#         # report can follow each feature's level through every pass, including passes where it was too
-#         # weak to count as a spike
-#         known = s["freq_by_rate"].setdefault(rate, np.asarray(f, dtype=np.float64))
-#         if len(known) == len(p) and s["full_bytes"] + 4.0 * len(p) <= SURVEY_FULL_NPZ_MAX_BYTES:
-#             rec["p"] = np.asarray(p, dtype=np.float32)
-#             s["full_bytes"] += 4.0 * len(p)
-#         elif not s["full_warned"]:
-#             s["full_warned"] = True
-#             self.log("Survey: full-resolution spectra no longer fit in memory - the report will follow feature "
-#                      "levels through the detected spikes only for the remaining passes")
-#         s["passes"].append(rec)
-#         n_done, n_all = s["idx"] + 1, len(s["combos"])
-#         elapsed = time.time() - s["t_start"]
-#         eta = elapsed / n_done * (n_all - n_done)
-#         self.log(f"Survey {n_done}/{n_all}: {rate/1e6:.3f} MS/s, {gain:.1f} dB -> "
-#                  f"{len(spikes)} spikes (ETA {self.survey_fmt_seconds(eta)})")
-#         if time.time() - s["last_report"] > SURVEY_REPORT_EVERY_S:
-#             s["last_report"] = time.time()
-#             try:
-#                 self.survey_write_report(s, partial=True)
-#             except Exception as e:
-#                 self.log(f"Survey: could not update the report file: {e}")
-
     def survey_compare_scans(self, rec_a, lp_a, rec_b, lp_b):
         """
         Are two consecutive scans of the same rate/gain the same? Three tests, with limits that account for
@@ -8622,29 +6695,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         out.update({"shift": shift, "local": local, "spikes": int(missing)})
         out["same"] = bool(abs(shift) <= max(SURVEY_REPEAT_SHIFT_DB, 0.0) and local <= SURVEY_REPEAT_LOCAL_FRAC and missing == 0)
         return out
-
-    # ---- previous survey_record() (no rate read-back), kept in case of problems ----
-#     def survey_record(self, lp, scan_no, rate, gain):
-#         """Analyse and store one finished scan (runs on the survey worker thread); returns its record."""
-#         s = self._survey
-#         f, p, floor, spikes = self.survey_analyse(lp["f"], lp["p"], SURVEY_SPIKE_THRESH_DB)
-#         vec = self.survey_surface_vector(f, p, s["npts"], s["peak"], s["f0"], s["f1"])
-#         rec = {"pid": len(s["passes"]), "rate": rate, "gain": gain, "scan": scan_no, "accepted": False, "floor": floor,
-#                "peak": float(np.max(p)) if len(p) else float("nan"), "n_avg": lp["n_avg"], "dur": lp["dur"],
-#                "spikes": spikes, "vec": vec}
-#         s["passes"].append(rec)
-#         n_done, n_all = s["idx"], len(s["combos"])
-#         elapsed = time.time() - s["t_start"]
-#         eta = elapsed / max(n_done + 0.5, 0.5) * (n_all - n_done - 0.5) if n_done + 0.5 > 0 else 0.0
-#         self.log(f"Survey {n_done + 1}/{n_all}: {rate/1e6:.3f} MS/s, {gain:.1f} dB, scan {scan_no} "
-#                  f"({len(spikes)} spikes, ETA {self.survey_fmt_seconds(max(eta, 0.0))})")
-#         if time.time() - s["last_report"] > SURVEY_REPORT_EVERY_S:
-#             s["last_report"] = time.time()
-#             try:
-#                 self.survey_write_report(s, partial=True)
-#             except Exception as e:
-#                 self.log(f"Survey: could not update the report file: {e}")
-#         return rec
 
     def survey_record(self, lp, scan_no, rate, gain):
         """Analyse and store one finished scan (runs on the survey worker thread); returns its record."""
@@ -8731,174 +6781,6 @@ class EmcScanner(QtWidgets.QMainWindow):
     # in scope_on_frame() on the GUI thread. The scope thread is stored in self.sweep_thread
     # so closeEvent(), STOP and sample_rate_on_changed() treat it as "a sweep is running".
     # =====================================================================
-
-    # ---- previous scope_build_ui(), kept in case of problems ----
-#     def scope_build_ui(self, left_layout):
-#         # ---- state ----
-#         self.scope_active = False
-#         self.scope_hold = False
-#         self.scope_channel = 0            # 0 signal, 1 envelope, 2 signal + envelope
-#         self.scope_window_s = 0.002
-#         self.scope_trig_mode = 0          # 0 free run, 1 rising, 2 falling
-#         self.scope_trig_level = 0.0
-#         self.scope_bw_hz = 0.0            # optional extra low-pass (0 = off, i.e. full DC..Nyquist)
-#         self.scope_phase_rad = 0.0        # manual overall phase rotation
-#         self.scope_remove_lo_spike = True
-#         self.scope_auto_y = True
-#         self._scope_pending = False       # a frame is queued for the GUI; don't flood it
-#         self._scope_last = None
-#         self._scope_mask_cache = None
-#         self.scope_signals = ScopeSignals()
-#         self.scope_signals.frame.connect(self.scope_on_frame)
-#         # ---- scope plot (sits where the spectrum plot is; shown only in scope mode) ----
-#         self.scope_plot = pg.PlotWidget()
-#         self.scope_plot.setLabel('bottom', 'Time', units='s')
-#         self.scope_plot.setLabel('left', 'Amplitude (1.0 = ADC full scale)')
-#         self.scope_plot.showGrid(x=True, y=True, alpha=0.3)
-#         self.scope_curve1 = self.scope_plot.plot(pen=pg.mkPen('y', width=1))
-#         self.scope_curve2 = self.scope_plot.plot(pen=pg.mkPen('c', width=1))
-#         for _c in (self.scope_curve1, self.scope_curve2):
-#             try:
-#                 _c.setClipToView(True)
-#                 _c.setDownsampling(auto=True, method='peak')
-#             except Exception:
-#                 pass
-#         self.scope_curve2.hide()
-#         # draggable trigger-level line (orange) and trigger-point marker (grey, t = 0)
-#         self.scope_trig_line = pg.InfiniteLine(
-#             pos=0.0, angle=0, movable=True,
-#             pen=pg.mkPen((255, 128, 0), width=1, style=QtCore.Qt.DashLine))
-#         self.scope_plot.addItem(self.scope_trig_line)
-#         self.scope_zero_line = pg.InfiniteLine(
-#             pos=0.0, angle=90, movable=False,
-#             pen=pg.mkPen((140, 140, 140), width=1, style=QtCore.Qt.DotLine))
-#         self.scope_plot.addItem(self.scope_zero_line)
-#         self.scope_trig_line.sigPositionChanged.connect(self.scope_on_trig_line)
-#         self.scope_plot.setVisible(False)
-#         left_layout.insertWidget(left_layout.indexOf(self.plot), self.scope_plot)
-#         # ---- always-visible row: the mode button + a one-line readout ----
-#         row_top = QtWidgets.QHBoxLayout()
-#         left_layout.addLayout(row_top)
-#         self.btn_scope = QtWidgets.QPushButton("BASEBAND SCOPE (DC to Fs/2)")
-#         self.btn_scope.setCheckable(True)
-#         self.btn_scope.setToolTip(
-#             "Switch the display from the spectrum to a time-domain scope of the probe signal "
-#             "from DC up to half the Sample Rate. The Sample Rate control sets the maximum input "
-#             "frequency. Built from tuned IQ on the V4 (no direct sampling), so overall phase is "
-#             "unknown - see the Phase control. Press again to return to the spectrum.")
-#         self.btn_scope.toggled.connect(self.scope_toggle)
-#         self.scope_status = QtWidgets.QLabel("")
-#         self.scope_status.setFont(QtGui.QFont("Consolas", 9))
-#         row_top.addWidget(self.btn_scope)
-#         row_top.addWidget(self.scope_status, 1)
-#         # ---- scope controls (hidden until scope mode) ----
-#         self.scope_ctrl_widget = QtWidgets.QWidget()
-#         vbox = QtWidgets.QVBoxLayout(self.scope_ctrl_widget)
-#         vbox.setContentsMargins(0, 0, 0, 0)
-#         r1 = QtWidgets.QHBoxLayout()
-#         r2 = QtWidgets.QHBoxLayout()
-#         vbox.addLayout(r1)
-#         vbox.addLayout(r2)
-#         self.scope_channel_combo = QtWidgets.QComboBox()
-#         for txt in ("Signal", "Envelope", "Signal + envelope"):
-#             self.scope_channel_combo.addItem(txt)
-#         self.scope_channel_combo.setToolTip("Signal = the reconstructed waveform. Envelope = its magnitude "
-#                                              "(faithful regardless of the unknown phase).")
-#         self.scope_channel_combo.currentIndexChanged.connect(self.scope_on_channel_changed)
-#         self.scope_window_combo = QtWidgets.QComboBox()
-#         for ms in SCOPE_WINDOWS_MS:
-#             label = f"{ms * 1000:g} us" if ms < 1 else f"{ms:g} ms"
-#             self.scope_window_combo.addItem(label, ms / 1000.0)
-#         self.scope_window_combo.setCurrentIndex(SCOPE_WINDOWS_MS.index(2))
-#         self.scope_window_combo.setToolTip(
-#             "Total time shown across the screen. Limited by SCOPE_MAX_SAMPLES at high sample "
-#             "rates (the readout shows the window actually used). Lower sample rates reach "
-#             "longer windows.")
-#         self.scope_window_combo.currentIndexChanged.connect(self.scope_on_window_changed)
-#         self.scope_bw_spin = QtWidgets.QDoubleSpinBox()
-#         self.scope_bw_spin.setLocale(SCOPE_LOCALE)
-#         self.scope_bw_spin.setRange(0.0, 1600.0)
-#         self.scope_bw_spin.setDecimals(1)
-#         self.scope_bw_spin.setSingleStep(10.0)
-#         self.scope_bw_spin.setSuffix(" kHz")
-#         self.scope_bw_spin.setSpecialValueText("Full")
-#         self.scope_bw_spin.setKeyboardTracking(False)
-#         self.scope_bw_spin.setToolTip(
-#             "Optional bandwidth limit (like a scope's BW-limit button): a smooth low-pass, -3 dB "
-#             "at this frequency, to reduce noise. Full = DC to Nyquist (Sample Rate / 2). "
-#             "Values at or above Nyquist have no effect.")
-#         self.scope_bw_spin.valueChanged.connect(self.scope_on_bw_changed)
-#         self.scope_phase_spin = QtWidgets.QDoubleSpinBox()
-#         self.scope_phase_spin.setLocale(SCOPE_LOCALE)
-#         self.scope_phase_spin.setRange(0.0, 359.0)
-#         self.scope_phase_spin.setDecimals(0)
-#         self.scope_phase_spin.setSingleStep(15.0)
-#         self.scope_phase_spin.setWrapping(True)
-#         self.scope_phase_spin.setSuffix(" deg")
-#         self.scope_phase_spin.setToolTip(
-#             "Overall phase of the reconstructed waveform. The V4's tuner LO phase is random, so this "
-#             "is unknown; it does not matter for a sine wave, but rotates the SHAPE of waveforms "
-#             "with harmonics (square waves, pulses). Adjust until a known waveform looks right.")
-#         self.scope_phase_spin.valueChanged.connect(self.scope_on_phase_changed)
-#         self.chk_scope_lo = QtWidgets.QCheckBox("Remove LO spike")
-#         self.chk_scope_lo.setChecked(True)
-#         self.chk_scope_lo.setToolTip(
-#             "The tuner's own DC spike shows up as a steady sine at exactly Fs/4. Tick to remove it. "
-#             "(It also removes a genuine input signal at exactly Fs/4.)")
-#         self.chk_scope_lo.toggled.connect(self.scope_on_lo_toggled)
-#         r1.addWidget(QtWidgets.QLabel("Show"))
-#         r1.addWidget(self.scope_channel_combo)
-#         r1.addWidget(QtWidgets.QLabel("Window"))
-#         r1.addWidget(self.scope_window_combo)
-#         r1.addWidget(QtWidgets.QLabel("BW limit"))
-#         r1.addWidget(self.scope_bw_spin)
-#         r1.addWidget(QtWidgets.QLabel("Phase"))
-#         r1.addWidget(self.scope_phase_spin)
-#         r1.addWidget(self.chk_scope_lo)
-#         r1.addStretch()
-#         self.scope_trig_combo = QtWidgets.QComboBox()
-#         for txt in ("Trigger: free run", "Trigger: rising edge", "Trigger: falling edge"):
-#             self.scope_trig_combo.addItem(txt)
-#         self.scope_trig_combo.setToolTip(
-#             "Edge trigger on the first trace. If no edge is found the frame is shown "
-#             "untriggered (the readout says so) so the display never freezes.")
-#         self.scope_trig_combo.currentIndexChanged.connect(self.scope_on_trig_mode_changed)
-#         self.scope_trig_spin = QtWidgets.QDoubleSpinBox()
-#         self.scope_trig_spin.setLocale(SCOPE_LOCALE)
-#         self.scope_trig_spin.setRange(-1.0, 1.0)
-#         self.scope_trig_spin.setDecimals(4)
-#         self.scope_trig_spin.setSingleStep(0.01)
-#         self.scope_trig_spin.setPrefix("Level ")
-#         self.scope_trig_spin.setToolTip("Trigger level as a fraction of ADC full scale. Also draggable as the "
-#                                          "orange line on the plot.")
-#         self.scope_trig_spin.valueChanged.connect(self.scope_on_trig_level_changed)
-#         self.chk_scope_auto_y = QtWidgets.QCheckBox("Auto Y")
-#         self.chk_scope_auto_y.setChecked(True)
-#         self.chk_scope_auto_y.toggled.connect(self.scope_on_auto_y_toggled)
-#         self.scope_y_spin = QtWidgets.QDoubleSpinBox()
-#         self.scope_y_spin.setLocale(SCOPE_LOCALE)
-#         self.scope_y_spin.setRange(0.0001, 10.0)
-#         self.scope_y_spin.setDecimals(4)
-#         self.scope_y_spin.setSingleStep(0.05)
-#         self.scope_y_spin.setValue(0.5)
-#         self.scope_y_spin.setPrefix("Y +/- ")
-#         self.scope_y_spin.setEnabled(False)
-#         self.scope_y_spin.setToolTip("Fixed vertical range (used when Auto Y is off).")
-#         self.scope_y_spin.valueChanged.connect(self.scope_on_y_changed)
-#         self.chk_scope_hold = QtWidgets.QCheckBox("Hold")
-#         self.chk_scope_hold.setToolTip("Freeze the display on the current frame (the SDR stays open).")
-#         self.chk_scope_hold.toggled.connect(self.scope_on_hold_toggled)
-#         self.btn_scope_save = QtWidgets.QPushButton("SAVE SCOPE CSV")
-#         self.btn_scope_save.clicked.connect(self.scope_save_csv)
-#         r2.addWidget(self.scope_trig_combo)
-#         r2.addWidget(self.scope_trig_spin)
-#         r2.addWidget(self.chk_scope_auto_y)
-#         r2.addWidget(self.scope_y_spin)
-#         r2.addWidget(self.chk_scope_hold)
-#         r2.addWidget(self.btn_scope_save)
-#         r2.addStretch()
-#         self.scope_ctrl_widget.setVisible(False)
-#         left_layout.addWidget(self.scope_ctrl_widget)
 
     def scope_build_ui(self, left_layout):
         # ---- state ----
@@ -9212,19 +7094,6 @@ class EmcScanner(QtWidgets.QMainWindow):
     def scope_on_hold_toggled(self, checked):
         self.scope_hold = bool(checked)
 
-    # ---- previous scope_apply_y_range(), kept in case of problems ----
-#     def scope_apply_y_range(self):
-#         """Auto Y on -> let pyqtgraph range it; off -> fixed +/- range (0..+ for the envelope alone)."""
-#         try:
-#             if self.scope_auto_y:
-#                 self.scope_plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-#             else:
-#                 v = float(self.scope_y_spin.value())
-#                 lo = 0.0 if self.scope_channel == 1 else -v
-#                 self.scope_plot.setYRange(lo, v, padding=0)
-#         except Exception:
-#             pass
-
     def scope_apply_y_range(self):
         """
         Manual (default): the screen shows +/- Y (0..Y for the envelope alone), with 10 divisions
@@ -9245,21 +7114,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    # ---- previous scope_update_trig_step(), kept in case of problems ----
-#     def scope_update_trig_step(self, *args):
-#         """Trigger level spin box: each up/down click moves 1/20 of the screen's full Y range."""
-#         try:
-#             if self.scope_auto_y:
-#                 yr = self.scope_plot.getViewBox().viewRange()[1]
-#                 full = float(yr[1]) - float(yr[0])
-#             else:
-#                 v = float(self.scope_y_spin.value())
-#                 full = v - (0.0 if self.scope_channel == 1 else -v)
-#             if full > 0.0:
-#                 self.scope_trig_spin.setSingleStep(full / 20.0)
-#         except Exception:
-#             pass
-
     def scope_update_trig_step(self, *args):
         """Trigger level spin box: each up/down click moves 1/20 of the screen's full Y range.
         Also sets the trigger hysteresis (a fraction of the same range) used by the edge trigger."""
@@ -9277,29 +7131,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             pass
 
     # ---- mode entry / exit (GUI thread) ----
-
-    # ---- previous scope_toggle(), kept in case of problems ----
-#     def scope_toggle(self, checked):
-#         if checked:
-#             if not self.scope_enter():
-#                 self.btn_scope.blockSignals(True)
-#                 self.btn_scope.setChecked(False)
-#                 self.btn_scope.blockSignals(False)
-#         else:
-#             self.scope_exit()
-
-    # ---- previous scope_toggle(), kept in case of problems ----
-#     def scope_toggle(self, checked):
-#         if checked:
-#             self.scope_limit_rates(True)            # BEFORE the SDR is opened, so it never starts at 3.0/3.2 MS/s
-#             if not self.scope_enter():
-#                 self.btn_scope.blockSignals(True)
-#                 self.btn_scope.setChecked(False)
-#                 self.btn_scope.blockSignals(False)
-#                 self.scope_limit_rates(False)
-#         else:
-#             self.scope_exit()
-#             self.scope_limit_rates(False)
 
     def scope_toggle(self, checked):
         if checked:
@@ -9349,8 +7180,8 @@ class EmcScanner(QtWidgets.QMainWindow):
     def scope_tame_status_label(self):
         """
         The scope readout line is long (and longer still with pulse counts / warnings). A QLabel
-        refuses to be narrower than its text, so it used to push the whole program window wider -
-        off the screen. Now it ignores its text width, wraps onto at most three lines and has a
+        refuses to be narrower than its text, which would push the whole program window wider -
+        off the screen. So it ignores its text width, wraps onto at most three lines and has a
         fixed height, so no settings change can resize the window.
         """
         lab = self.scope_status
@@ -9364,38 +7195,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         """Spectrum-only controls are disabled while the scope owns the SDR."""
         for wdg in ([self.btn_start, self.btn_cont, self.btn_survey] + list(self.mode_buttons)):
             wdg.setEnabled(not locked)
-
-    # ---- previous scope_enter(), kept in case of problems ----
-#     def scope_enter(self):
-#         if self._survey is not None:
-#             self.log("Scope: not available while a survey is running")
-#             return False
-#         # Stop any sweep first so two threads never share the SDR.
-#         if self.sweep_thread and self.sweep_thread.is_alive():
-#             self.log("=== SCOPE: stopping current sweep ===")
-#             self.stop_flag.set()
-#             self.sweep_thread.join(timeout=3.0)
-#             if self.sweep_thread.is_alive():
-#                 self.log("Scope: ERROR - the sweep thread did not stop; try again")
-#                 return False
-#         self.stop_flag.clear()
-#         try:
-#             self.init_sdr()
-#         except Exception as e:
-#             self.log(f"Scope: error opening the SDR: {e}")
-#             return False
-#         self._scope_pending = False
-#         self.scope_active = True
-#         self.scope_set_lock(True)
-#         self.plot.hide()
-#         self.scope_plot.show()
-#         self.scope_ctrl_widget.setVisible(True)
-#         self.btn_scope.setText("BACK TO SPECTRUM")
-#         self.scope_apply_y_range()
-#         self.log("=== BASEBAND SCOPE STARTED ===")
-#         self.sweep_thread = threading.Thread(target=self.scope_loop, daemon=True)
-#         self.sweep_thread.start()
-#         return True
 
     def scope_enter(self):
         if self._survey is not None:
@@ -9494,190 +7293,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             return f"{f / 1e6:.4f} MHz"
         return f"{f / 1e3:.2f} kHz"
 
-    # ---- previous scope_process_capture(), kept in case of problems ----
-#     def scope_process_capture(self, x, rate, n_disp, fc, gain):
-#         """
-#         Turn one raw IQ capture (tuned at fc = rate/4) into (time_s, trace1, trace2_or_None,
-#         info) ready to plot. Steps: metrics on the RAW capture (peak / clipping / DC) ->
-#         optional removal of the tuner's DC spike -> keep only RF 0..Nyquist (rejects the mirror
-#         image and anything above Nyquist; optional BW-limit low-pass) -> shift back to true RF
-#         and take the real part -> edge trigger -> slice n_disp samples for display.
-#         """
-#         n_total = int(x.size)
-#         n_disp = min(int(n_disp), n_total)
-#         # ---- metrics on the raw capture ----
-#         i_raw = x.real
-#         q_raw = x.imag
-#         peak = float(max(np.max(np.abs(i_raw)), np.max(np.abs(q_raw))))
-#         clipped = bool(np.any((np.abs(i_raw) >= SCOPE_CLIP_LEVEL) | (np.abs(q_raw) >= SCOPE_CLIP_LEVEL)))
-#         # ---- the tuner's own DC spike sits at the exact centre = RF Fs/4 ----
-#         if self.scope_remove_lo_spike:
-#             x = x - np.mean(x)
-#         # ---- band select: keep RF 0 .. Nyquist (mask cached; it only depends on these four) ----
-#         bw = float(self.scope_bw_hz)
-#         nyq = rate / 2.0
-#         key = (n_total, float(rate), float(fc), bw)
-#         cache = self._scope_mask_cache
-#         if cache is None or cache[0] != key:
-#             nu = np.fft.fftfreq(n_total, d=1.0 / rate) + fc          # RF frequency of every FFT bin
-#             h = ((nu >= 0.0) & (nu <= nyq)).astype(np.float64)
-#             t_edge = (1.0 - SCOPE_TOP_TAPER) * nyq                   # smooth skirt just below Nyquist
-#             sk = (nu > t_edge) & (nu <= nyq)
-#             h[sk] = 0.5 * (1.0 + np.cos(np.pi * (nu[sk] - t_edge) / (nyq - t_edge)))
-#             if 0.0 < bw < nyq:
-#                 h *= np.exp(-0.5 * math.log(2.0) * (nu / bw) ** 2)   # -3 dB at nu = bw
-#             self._scope_mask_cache = cache = (key, h, nu)
-#         h, nu = cache[1], cache[2]
-#         band = np.fft.fft(x) * h
-#         z = np.fft.ifft(band)                                        # one-sided (analytic) signal
-#         # ---- shift back to true RF (Fs/4 shift = 1, j, -1, -j) and take the real part ----
-#         lut = np.array([1.0, 1j, -1.0, -1j], dtype=np.complex128) * np.exp(1j * float(self.scope_phase_rad))
-#         sig = (z * lut[np.arange(n_total) & 3]).real.astype(np.float32)
-#         env = np.abs(z).astype(np.float32)
-#         ch = int(self.scope_channel)
-#         tr2 = None
-#         if ch == 0:
-#             tr1 = sig
-#         elif ch == 1:
-#             tr1 = env
-#         else:
-#             tr1, tr2 = sig, env
-#         # ---- edge trigger on trace 1 (10 % pre-trigger) ----
-#         mode = int(self.scope_trig_mode)
-#         pre = int(0.1 * n_disp)
-#         start = 0
-#         t0_idx = 0
-#         trig_text = "free run"
-#         if mode in (1, 2):
-#             lvl = float(self.scope_trig_level)
-#             a = tr1[:-1]
-#             b = tr1[1:]
-#             if mode == 1:
-#                 hits = np.nonzero((a < lvl) & (b >= lvl))[0] + 1
-#             else:
-#                 hits = np.nonzero((a > lvl) & (b <= lvl))[0] + 1
-#             hits = hits[(hits >= pre) & (hits <= n_total - n_disp + pre)]
-#             if hits.size:
-#                 start = int(hits[0]) - pre
-#                 t0_idx = pre
-#                 trig_text = "triggered"
-#             else:
-#                 trig_text = "NO TRIGGER (showing free run)"
-#         sl = slice(start, start + n_disp)
-#         tr1 = tr1[sl]
-#         if tr2 is not None:
-#             tr2 = tr2[sl]
-#         t = (np.arange(n_disp, dtype=np.float64) - t0_idx) / rate
-#         vpp = float(np.max(sig[sl]) - np.min(sig[sl])) if n_disp else 0.0
-#         kpk = int(np.argmax(np.abs(band)))
-#         text = (f"Input DC-{self._scope_fmt_hz(nyq)} (Fs {rate / 1e6:.3f} MS/s) | "
-#                 f"{n_disp / rate * 1e3:.3f} ms | gain {gain:.1f} dB | "
-#                 f"peak {peak:.2f} FS{'  ** CLIPPING **' if clipped else ''} | "
-#                 f"pk-pk {vpp:.3g} FS | strongest {self._scope_fmt_hz(nu[kpk])} | {trig_text}")
-#         info = {"text": text, "clip": clipped, "trig": trig_text, "channel": ch}
-#         return t, tr1, tr2, info
-
-    # ---- previous scope_process_capture(), kept in case of problems ----
-#     def scope_process_capture(self, x, rate, n_disp, fc, gain, guard=0):
-#         """
-#         Turn one raw IQ capture (tuned at fc = rate/4) into (time_s, trace1, trace2_or_None,
-#         info) ready to plot. x holds n_disp-plus-headroom samples PLUS `guard` extra samples at
-#         each end. Steps: metrics on the RAW capture -> optional removal of the tuner's DC spike
-#         -> keep only RF 0..Nyquist with SMOOTH edges at both ends -> shift back to true RF and
-#         take the real part -> TRIM the guard samples off both ends -> edge trigger -> slice.
-#         Why the guard and the smooth lower edge (they cure the start/end/middle spikes):
-#         filtering with an FFT treats the capture as endlessly repeating, so anything that is not
-#         perfectly periodic in the frame - above all a strong, steady component sitting near a
-#         sharp filter edge, such as the upconverter's 28.8 MHz LO feed-through at RF ~0 - shows up
-#         as log-shaped spikes at the frame ends (and at any step/phase jump inside it) with long
-#         tails across the whole trace. The lower edge is now a smooth high-pass that stops that
-#         feed-through, and the frame ends - where the wrap-around lands - are captured but trimmed
-#         away before display.
-#         """
-#         n_cap = int(x.size)
-#         guard = int(max(0, min(guard, (n_cap - 256) // 2)))
-#         n_total = n_cap - 2 * guard                     # samples that survive the trim
-#         n_disp = min(int(n_disp), n_total)
-#         # ---- metrics on the raw capture ----
-#         i_raw = x.real
-#         q_raw = x.imag
-#         peak = float(max(np.max(np.abs(i_raw)), np.max(np.abs(q_raw))))
-#         clipped = bool(np.any((np.abs(i_raw) >= SCOPE_CLIP_LEVEL) | (np.abs(q_raw) >= SCOPE_CLIP_LEVEL)))
-#         # ---- the tuner's own DC spike sits at the exact centre = RF Fs/4 ----
-#         if self.scope_remove_lo_spike:
-#             x = x - np.mean(x)
-#         # ---- band select: RF 0..Nyquist, smooth at BOTH edges (mask cached) ----
-#         bw = float(self.scope_bw_hz)
-#         nyq = rate / 2.0
-#         key = (n_cap, float(rate), float(fc), bw)
-#         cache = self._scope_mask_cache
-#         if cache is None or cache[0] != key:
-#             nu = np.fft.fftfreq(n_cap, d=1.0 / rate) + fc            # RF frequency of every FFT bin
-#             h = ((nu >= 0.0) & (nu <= nyq)).astype(np.float64)
-#             f1 = SCOPE_LOW_CUT_FRAC * nyq                            # lower edge: stop below f1,
-#             f2 = 3.0 * f1                                            # pass above f2, raised cosine between
-#             lo = (nu > f1) & (nu < f2)
-#             h[(nu <= f1)] = 0.0
-#             h[lo] = 0.5 * (1.0 - np.cos(np.pi * (nu[lo] - f1) / (f2 - f1)))
-#             t_edge = (1.0 - SCOPE_TOP_TAPER) * nyq                   # upper edge: smooth skirt below Nyquist
-#             sk = (nu > t_edge) & (nu <= nyq)
-#             h[sk] = 0.5 * (1.0 + np.cos(np.pi * (nu[sk] - t_edge) / (nyq - t_edge)))
-#             if 0.0 < bw < nyq:
-#                 h *= np.exp(-0.5 * math.log(2.0) * (nu / bw) ** 2)   # -3 dB at nu = bw
-#             self._scope_mask_cache = cache = (key, h, nu)
-#         h, nu = cache[1], cache[2]
-#         band = np.fft.fft(x) * h
-#         z = np.fft.ifft(band)                                        # one-sided (analytic) signal
-#         # ---- shift back to true RF (Fs/4 shift = 1, j, -1, -j) and take the real part ----
-#         lut = np.array([1.0, 1j, -1.0, -1j], dtype=np.complex128) * np.exp(1j * float(self.scope_phase_rad))
-#         sig = (z * lut[np.arange(n_cap) & 3]).real.astype(np.float32)
-#         env = np.abs(z).astype(np.float32)
-#         if guard:                                                    # drop the wrap-around zones
-#             sig = sig[guard:n_cap - guard]
-#             env = env[guard:n_cap - guard]
-#         ch = int(self.scope_channel)
-#         tr2 = None
-#         if ch == 0:
-#             tr1 = sig
-#         elif ch == 1:
-#             tr1 = env
-#         else:
-#             tr1, tr2 = sig, env
-#         # ---- edge trigger on trace 1 (10 % pre-trigger) ----
-#         mode = int(self.scope_trig_mode)
-#         pre = int(0.1 * n_disp)
-#         start = 0
-#         t0_idx = 0
-#         trig_text = "free run"
-#         if mode in (1, 2):
-#             lvl = float(self.scope_trig_level)
-#             a = tr1[:-1]
-#             b = tr1[1:]
-#             if mode == 1:
-#                 hits = np.nonzero((a < lvl) & (b >= lvl))[0] + 1
-#             else:
-#                 hits = np.nonzero((a > lvl) & (b <= lvl))[0] + 1
-#             hits = hits[(hits >= pre) & (hits <= n_total - n_disp + pre)]
-#             if hits.size:
-#                 start = int(hits[0]) - pre
-#                 t0_idx = pre
-#                 trig_text = "triggered"
-#             else:
-#                 trig_text = "NO TRIGGER (showing free run)"
-#         sl = slice(start, start + n_disp)
-#         tr1 = tr1[sl]
-#         if tr2 is not None:
-#             tr2 = tr2[sl]
-#         t = (np.arange(n_disp, dtype=np.float64) - t0_idx) / rate
-#         vpp = float(np.max(sig[sl]) - np.min(sig[sl])) if n_disp else 0.0
-#         kpk = int(np.argmax(np.abs(band)))
-#         text = (f"Input DC-{self._scope_fmt_hz(nyq)} (Fs {rate / 1e6:.3f} MS/s) | "
-#                 f"{n_disp / rate * 1e3:.3f} ms | gain {gain:.1f} dB | "
-#                 f"peak {peak:.2f} FS{'  ** CLIPPING **' if clipped else ''} | "
-#                 f"pk-pk {vpp:.3g} FS | strongest {self._scope_fmt_hz(nu[kpk])} | {trig_text}")
-#         info = {"text": text, "clip": clipped, "trig": trig_text, "channel": ch}
-#         return t, tr1, tr2, info
-
     def scope_process_capture(self, x, rate, n_disp, fc, gain, guard=0):
         """
         Turn one raw IQ capture (tuned at fc = rate/4) into (time_s, trace1, trace2_or_None,
@@ -9691,7 +7306,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         perfectly periodic in the frame - above all a strong, steady component sitting near a
         sharp filter edge, such as the upconverter's 28.8 MHz LO feed-through at RF ~0 - shows up
         as log-shaped spikes at the frame ends (and at any step/phase jump inside it) with long
-        tails across the whole trace. The lower edge is now a smooth high-pass that stops that
+        tails across the whole trace. The lower edge is a smooth high-pass that stops that
         feed-through, and the frame ends - where the wrap-around lands - are captured but trimmed
         away before display.
         """
@@ -9812,64 +7427,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             return None, None, None, info      # status only - the display keeps its last triggered frame
         return t, tr1, tr2, info
 
-    # ---- previous scope_loop(), kept in case of problems ----
-#     def scope_loop(self):
-#         applied_center = None
-#         need_settle = False
-#         while not self.stop_flag.is_set():
-#             if self.scope_hold:
-#                 time.sleep(0.05)
-#                 continue
-#             try:
-#                 if self.sdr is None:
-#                     break
-#                 # Live sample rate - applied here (worker thread) only, like sweep_loop().
-#                 self._restart_pass = False      # set by sample_rate_on_changed(); meaningless here
-#                 if getattr(self, "_applied_sample_rate", None) != self.SAMPLE_RATE:
-#                     print(f"scope_loop: applying sample-rate change -> {self.SAMPLE_RATE/1e6:.3f} MS/s")
-#                     self.sdr.sample_rate = self.SAMPLE_RATE
-#                     self._applied_sample_rate = self.SAMPLE_RATE
-#                     need_settle = True
-#                 self.apply_gain_if_changed()    # live RF Gain slider
-#                 rate = float(self._applied_sample_rate)
-#                 fc = rate / 4.0                 # tuner parked at Fs/4: RF 0..Fs/2 fills the middle half
-#                 if applied_center != fc:
-#                     self.sdr.center_freq = fc
-#                     applied_center = fc
-#                     need_settle = True
-#                 if need_settle:
-#                     time.sleep(0.12)
-#                     _ = self.sdr.read_samples(512)
-#                     _ = self.sdr.read_samples(512)
-#                     need_settle = False
-#                 n_disp = int(round(self.scope_window_s * rate))
-#                 n_disp = max(SCOPE_MIN_SAMPLES, ((n_disp + 255) // 256) * 256)
-#                 n_total = n_disp if int(self.scope_trig_mode) == 0 else 2 * n_disp   # headroom to find an edge
-#                 n_total = min(n_total, SCOPE_MAX_SAMPLES)
-#                 n_total = max(256, (n_total // 256) * 256)
-#                 n_disp = min(n_disp, n_total)
-#                 x = self._scope_read_iq(n_total)
-#                 gain = self.actual_gain_db if self.actual_gain_db is not None else self.gain_db
-#                 res = self.scope_process_capture(x, rate, n_disp, fc, float(gain))
-#                 if res is not None and not self._scope_pending:
-#                     self._scope_pending = True
-#                     self.scope_signals.frame.emit(*res)
-#             except OSError as e:
-#                 print(f"scope_loop: read error: {e}")
-#                 try:
-#                     self.init_sdr()             # reopen, then re-apply the tuning next time round
-#                     applied_center = None
-#                     need_settle = True
-#                 except Exception as e2:
-#                     print(f"scope_loop: failed to reopen SDR device: {e2}")
-#                     time.sleep(0.5)
-#             except Exception as e:
-#                 import traceback
-#                 print(f"scope_loop: error {e!r}")
-#                 traceback.print_exc()
-#                 time.sleep(0.5)
-#             time.sleep(0.02)
-
     def scope_loop(self):
         applied_center = None
         need_settle = False
@@ -9937,56 +7494,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             time.sleep(0.02)
 
     # ---- GUI thread: draw a frame ----
-
-    # ---- previous scope_on_frame(), kept in case of problems ----
-#     # ---- previous scope_on_frame(), kept in case of problems ----
-#     def scope_on_frame(self, t, tr1, tr2, info):
-# #         try:
-# #             self.scope_curve1.setData(t, tr1)
-# #             if tr2 is None:
-# #                 self.scope_curve2.hide()
-# #             else:
-# #                 self.scope_curve2.setData(t, tr2)
-# #                 self.scope_curve2.show()
-# #             self.scope_status.setText(info.get("text", ""))
-# #             self.scope_status.setStyleSheet(
-# #                 "QLabel { color: #FF4040; font-weight: bold; }" if info.get("clip") else "")
-# #             self._scope_last = (t, tr1, tr2, info)
-# #         finally:
-# #             self._scope_pending = False
-#     def scope_on_frame(self, t, tr1, tr2, info):
-#         """
-#         Draw a frame (GUI thread). A "waiting" frame (NORMAL sweep, no trigger found) carries no
-#         trace: only the status line is updated and the display keeps its last triggered frame.
-#         The time axis is held at a fixed span relative to the trigger (t = 0) so the sub-sample
-#         alignment of each triggered sweep is actually visible, instead of the view re-fitting to
-#         the data every frame; zooming with the mouse stops that until the Window is changed.
-#         """
-#         try:
-#             waiting = bool(info.get("waiting"))
-#             if t is not None:
-#                 self.scope_curve1.setData(t, tr1)
-#                 if tr2 is None:
-#                     self.scope_curve2.hide()
-#                 else:
-#                     self.scope_curve2.setData(t, tr2)
-#                     self.scope_curve2.show()
-#                 xr = info.get("xrange")
-#                 if xr is not None and getattr(self, "_scope_x_follow", True):
-#                     try:
-#                         self.scope_plot.getViewBox().setXRange(xr[0], xr[1], padding=0)
-#                     except Exception:
-#                         pass
-#                 self._scope_last = (t, tr1, tr2, info)
-#             self.scope_status.setText(info.get("text", ""))
-#             if info.get("clip"):
-#                 self.scope_status.setStyleSheet("QLabel { color: #FF4040; font-weight: bold; }")
-#             elif waiting:
-#                 self.scope_status.setStyleSheet("QLabel { color: #FFA040; }")
-#             else:
-#                 self.scope_status.setStyleSheet("")
-#         finally:
-#             self._scope_pending = False
 
     def scope_on_frame(self, t, tr1, tr2, info):
         """
@@ -10096,27 +7603,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.log(" STOP SWEEP ")
         self.stop_flag.set()
 
-    # ---- previous single_sweep_loop() / continuous_loop(), kept in case of problems ----
-#     def single_sweep_loop(self):
-#         # One-shot sweep, but re-run it if a live sample-rate change abandoned the pass.
-#         while not self.stop_flag.is_set():
-#             self.sweep_loop()
-#             if not self._restart_pass:
-#                 break
-#     def continuous_loop(self):
-#         while not self.stop_flag.is_set():
-#             try:
-#                 self.sweep_loop()   # run one sweep
-#             except Exception as e:
-#                 # Last-resort safety net: an unhandled exception anywhere in
-#                 # sweep_loop() used to kill this whole thread (silently, from the
-#                 # GUI's point of view, apart from a console traceback). Log it and
-#                 # keep the continuous scan alive instead of letting it die.
-#                 import traceback
-#                 print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
-#                 traceback.print_exc()
-#                 time.sleep(0.5)
-
     def single_sweep_loop(self):
         # One-shot sweep, but re-run it if a live sample-rate change abandoned the pass.
         try:
@@ -10127,45 +7613,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             self.sweep_loop()
             if not self._restart_pass:
                 break
-
-    # ---- previous continuous_loop() (no single-frequency hook), kept in case of problems ----
-#     def continuous_loop(self):
-#         try:
-#             self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
-#         except Exception as e:
-#             print(f"continuous_loop: settle_radio failed: {e!r}")
-#         while not self.stop_flag.is_set():
-#             try:
-#                 self.sweep_loop()   # run one sweep
-#             except Exception as e:
-#                 # Last-resort safety net: an unhandled exception anywhere in
-#                 # sweep_loop() used to kill this whole thread (silently, from the
-#                 # GUI's point of view, apart from a console traceback). Log it and
-#                 # keep the continuous scan alive instead of letting it die.
-#                 import traceback
-#                 print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
-#                 traceback.print_exc()
-#                 time.sleep(0.5)
-
-    # ---- previous continuous_loop() (no waterfall hook), kept in case of problems ----
-#    def continuous_loop(self):
-#        try:
-#            self.settle_radio(float(self.centers[0]) if len(self.centers) else float(self.START_FREQ))
-#        except Exception as e:
-#            print(f"continuous_loop: settle_radio failed: {e!r}")
-#        while not self.stop_flag.is_set():
-#            self.single_apply_pending()     # single-frequency mode: a new centre chosen on the front panel starts here
-#            try:
-#                self.sweep_loop()   # run one sweep
-#            except Exception as e:
-#                # Last-resort safety net: an unhandled exception anywhere in
-#                # sweep_loop() used to kill this whole thread (silently, from the
-#                # GUI's point of view, apart from a console traceback). Log it and
-#                # keep the continuous scan alive instead of letting it die.
-#                import traceback
-#                print(f"continuous_loop: sweep_loop raised {e!r}, continuing")
-#                traceback.print_exc()
-#                time.sleep(0.5)
 
     def continuous_loop(self):
         try:
@@ -10279,12 +7726,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         self.start_continuous()
 
-    # ---- previous set_preset_and_run(), kept in case of problems ----
-#     def set_preset_and_run(self, preset_index):
-#         """MODE button: apply the preset, then immediately (re)start CONTINUOUS mode."""
-#         self.set_preset(preset_index)
-#         self.continuous_when_idle()
-
     def set_preset_and_run(self, preset_index):
         """MODE button: leave single-frequency mode, apply the preset, then immediately (re)start CONTINUOUS mode."""
         self.single_exit()
@@ -10311,7 +7752,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         if not np.any(valid):
             return
         f = f[valid]
-        # p = p[valid]
         p = p[valid] + self.cal_total_offset_db()   # SDR dB -> dBuV at attenuator input
 
         # --- IMPORTANT: do NOT overwrite stitched arrays used by the sweep ---
@@ -10332,25 +7772,6 @@ class EmcScanner(QtWidgets.QMainWindow):
             print("update_plot: emit error:", e)
 
 
-    # ---- previous set_plot_data() (no saturation lines), kept in case of problems ----
-#    @QtCore.pyqtSlot(object, object)
-#    def set_plot_data(self, f, p):
-#        """
-#        Runs on the GUI thread (queued slot from plot_signals.update). Draws the
-#        latest stitched FFT data, then draws the CISPR line immediately after -
-#        this is the ONLY place the CISPR line is redrawn as part of a normal
-#        sweep, so it is always in step with the FFT curve it sits alongside.
-#        (Previously this method also built its own interpolated CISPR curve with
-#        a hard-coded "L_interp - 80.0" calibration, in parallel with
-#        cispr_update_curve()'s offset/ViewBox-range approach. The two disagreed,
-#        so whichever one last executed - the timing depended on the worker
-#        thread's call to update_cispr_curve() racing this queued slot - won,
-#        which is why the line and its axis appeared to move relative to each
-#        other unpredictably. There is now a single source of truth.)
-#        """
-#        self.curve.setData(f, p)
-#        self.cispr_update_curve()
-
     @QtCore.pyqtSlot(object, object)
     def set_plot_data(self, f, p):
         """
@@ -10358,65 +7779,10 @@ class EmcScanner(QtWidgets.QMainWindow):
         latest stitched FFT data, then draws the CISPR line immediately after -
         this is the ONLY place the CISPR line is redrawn as part of a normal
         sweep, so it is always in step with the FFT curve it sits alongside.
-        (Previously this method also built its own interpolated CISPR curve with
-        a hard-coded "L_interp - 80.0" calibration, in parallel with
-        cispr_update_curve()'s offset/ViewBox-range approach. The two disagreed,
-        so whichever one last executed - the timing depended on the worker
-        thread's call to update_cispr_curve() racing this queued slot - won,
-        which is why the line and its axis appeared to move relative to each
-        other unpredictably. There is now a single source of truth.)
         """
         self.curve.setData(f, p)
         self.cispr_update_curve()
         self.sat_update_lines()      # keep the ADC saturation lines in step with gain / attenuator / calibration
-
-    # ---- previous save_csv() (header always dBuV), kept in case of problems ----
-#    def save_csv(self):
-#        if self.freq_axis is None or self.power_axis is None:
-#            self.log("Save FFT: no live data to save yet")
-#            return
-
-#        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-#            self, "Save Spectrum CSV", "spectrum.csv", "CSV Files (*.csv)"
-#        )
-#        if not path:
-#            return
-
-#        idx = np.argsort(self.freq_axis)
-#        f = self.freq_axis[idx]
-#        # p = self.power_axis[idx]
-#        p = self.power_axis[idx] + self.cal_total_offset_db()   # dBuV at attenuator input
-
-#        have_ref = (getattr(self, "reference_freq", None) is not None
-#                    and getattr(self, "reference_power", None) is not None
-#                    and len(self.reference_freq) > 0)
-
-#        if not have_ref:
-#            # No reference captured - unchanged behaviour from before.
-#            data = np.column_stack((f, p))
-#            # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
-#            np.savetxt(path, data, delimiter=",", header="freq_hz,level_dbuv", comments="")
-#            self.log(f"Saved live trace ({len(f)} points) to {path}")
-#            return
-
-#        # A captured reference trace may have been taken under different sweep settings
-#        # (different MODE, sample rate, etc.) than the current live trace, so it can have
-#        # a different length and a different frequency grid. Rather than assume the two
-#        # line up row-for-row, write them as two independent (freq, level) column pairs;
-#        # whichever trace is shorter just leaves its trailing cells blank.
-#        rf = np.asarray(self.reference_freq, dtype=np.float64)
-#        rp = np.asarray(self.reference_power, dtype=np.float64)
-#        n = max(len(f), len(rf))
-#        with open(path, "w", newline="") as fh:
-#            # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
-#            fh.write("freq_hz,level_dbuv,ref_freq_hz,ref_level_dbuv\n")
-#            for i in range(n):
-#                a = f"{f[i]:.6f}" if i < len(f) else ""
-#                b = f"{p[i]:.3f}" if i < len(p) else ""
-#                c = f"{rf[i]:.6f}" if i < len(rf) else ""
-#                d = f"{rp[i]:.3f}" if i < len(rp) else ""
-#                fh.write(f"{a},{b},{c},{d}\n")
-#        self.log(f"Saved live ({len(f)} pts) + reference ({len(rf)} pts) trace to {path}")
 
     def save_csv(self):
         if self.freq_axis is None or self.power_axis is None:
@@ -10431,7 +7797,6 @@ class EmcScanner(QtWidgets.QMainWindow):
 
         idx = np.argsort(self.freq_axis)
         f = self.freq_axis[idx]
-        # p = self.power_axis[idx]
         p = self.power_axis[idx] + self.cal_total_offset_db()   # dBuV at attenuator input
 
         have_ref = (getattr(self, "reference_freq", None) is not None
@@ -10439,9 +7804,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                     and len(self.reference_freq) > 0)
 
         if not have_ref:
-            # No reference captured - unchanged behaviour from before.
+            # No reference captured: write the live trace only.
             data = np.column_stack((f, p))
-            # np.savetxt(path, data, delimiter=",", header="freq_hz,level_db", comments="")
             np.savetxt(path, data, delimiter=",", header="freq_hz," + self.csv_level_name(), comments="")
             self.log(f"Saved live trace ({len(f)} points) to {path}")
             return
@@ -10455,7 +7819,6 @@ class EmcScanner(QtWidgets.QMainWindow):
         rp = np.asarray(self.reference_power, dtype=np.float64)
         n = max(len(f), len(rf))
         with open(path, "w", newline="") as fh:
-            # fh.write("freq_hz,level_db,ref_freq_hz,ref_level_db\n")
             fh.write("freq_hz,%s,ref_freq_hz,ref_%s\n" % (self.csv_level_name(), self.csv_level_name()))
             for i in range(n):
                 a = f"{f[i]:.6f}" if i < len(f) else ""
@@ -10476,14 +7839,6 @@ class EmcScanner(QtWidgets.QMainWindow):
                 pass
         event.accept()
 
-
-# ---- previous main(), kept in case of problems ----
-# def main():
-#     app = QtWidgets.QApplication(sys.argv)
-#     win = EmcScanner()
-#     win.resize(1200, 600)
-#     win.show()
-#     sys.exit(app.exec_())
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
