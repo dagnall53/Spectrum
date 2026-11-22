@@ -1204,6 +1204,1007 @@ buildTrSel();drawHeats();drawSpec();drawFloor();
 '''
 
 
+# =====================================================================================================================
+# DECODER (single-frequency mode): audio demodulators (WFM / NFM / AM) and an OOK / FSK burst decoder.
+# Pure numpy - no scipy, no extra installs. Audio goes to the PC speaker through PyQt5's own QtMultimedia.
+# The DSP below has no Qt in it; the front-panel / thread / audio-output side is in EmcScanner (see "DECODER" section).
+# =====================================================================================================================
+try:
+    from PyQt5 import QtMultimedia
+except Exception as _dec_err:          # a stripped-down PyQt5 install: audio modes are then disabled, burst decoding still works
+    QtMultimedia = None
+    print(f"decoder: PyQt5.QtMultimedia not available ({_dec_err}) - audio modes disabled")
+
+DECODER_BLOCK = 16 * 4096              # IQ samples per read (about 27 ms at 2.4 MS/s); one spectrum / waterfall row per 4096
+DECODER_UI_INTERVAL_S = 0.12           # spectrum / waterfall / status refresh interval while decoding
+DECODER_OFFSET_DIVISOR = 8.0           # offset tuning: the SDR is tuned Fs/8 above the wanted frequency and mixed back in software,
+                                       # so the tuner's own DC spike never lands on the signal being decoded
+
+# ---------------------------------------------------------------- filters
+def _fir_lowpass(cutoff_hz, rate, ntaps=101):
+    """Windowed-sinc low-pass FIR (Hamming), unity DC gain."""
+    n = np.arange(ntaps) - (ntaps - 1) / 2.0
+    fc = cutoff_hz / rate
+    h = 2 * fc * np.sinc(2 * fc * n) * np.hamming(ntaps)
+    return (h / h.sum()).astype(np.float32)
+
+
+class Decimator:
+    """Streaming FIR low-pass + integer decimation for complex or real data (keeps filter state between blocks)."""
+    def __init__(self, rate_in, factor, cutoff_hz, ntaps=None):
+        self.factor = max(1, int(factor))
+        if ntaps is None:
+            ntaps = int(max(31, min(401, 4.0 * rate_in / max(cutoff_hz, 1.0)))) | 1
+        self.h = _fir_lowpass(cutoff_hz, rate_in, ntaps)
+        self.tail = None
+        self.phase = 0
+
+    def process(self, x):
+        if self.tail is None:
+            self.tail = np.zeros(self.h.size - 1, dtype=x.dtype)
+        buf = np.concatenate([self.tail, x])
+        self.tail = buf[-(self.h.size - 1):].copy()
+        y = np.convolve(buf, self.h, mode="valid")          # len == len(x)
+        out = y[self.phase::self.factor]
+        self.phase = (self.phase - y.size) % self.factor
+        return out
+
+
+# ---------------------------------------------------------------- audio demodulator
+class AudioDemod:
+    """IQ -> mono audio at AUDIO_RATE.  mode: 'WFM', 'NFM', 'AM'.
+    Stage 1: IQ rate -> ~240 kHz IF (coarse channel filter).  NFM / AM add stage 2: IF -> ~48 kHz with a sharp channel filter.
+    Then demodulate, audio low-pass, resample to exactly 48 kHz (linear interpolation) and de-emphasise (FM only)."""
+    AUDIO_RATE = 48000
+    # mode: (stage-1 cutoff Hz, stage-2 cutoff Hz or None, de-emphasis tau s or None, audio low-pass Hz, deviation Hz)
+    MODES = {"WFM": (110e3, None, 50e-6, 15e3, 75e3),      # tau 75e-6 for the Americas
+             "NFM": (30e3, 7e3, None, 3.4e3, 5e3),
+             "AM":  (30e3, 6e3, None, 5e3, 0.0)}
+    IF_TARGET = 240e3
+
+    def __init__(self, rate_in, mode, deemph_tau=None):
+        self.mode = mode
+        c1, c2, tau, alp, self.dev = self.MODES[mode]
+        if deemph_tau is not None and tau is not None:
+            tau = deemph_tau
+        self.rate_in = float(rate_in)
+        f1 = max(1, int(self.rate_in // self.IF_TARGET))
+        rate1 = self.rate_in / f1
+        self.dec1 = Decimator(self.rate_in, f1, min(c1, rate1 * 0.45))
+        if c2 is None:
+            self.dec2, self.demod_rate = None, rate1
+        else:
+            f2 = max(1, int(rate1 // self.AUDIO_RATE))
+            self.dec2 = Decimator(rate1, f2, c2, ntaps=241)
+            self.demod_rate = rate1 / f2
+        self.alp = Decimator(self.demod_rate, 1, min(alp, self.demod_rate * 0.45), ntaps=63)
+        self.ratio = self.demod_rate / self.AUDIO_RATE
+        self.pos = 0.0
+        self.hist = np.zeros(1, dtype=np.float32)
+        self.prev = np.complex64(1.0)
+        self.dc = 0.0
+        self.deemph_a = (1.0 - math.exp(-1.0 / (tau * self.AUDIO_RATE))) if tau else None
+        self.de_state = 0.0
+
+    def _resample(self, y):
+        x = np.concatenate([self.hist, y.astype(np.float32)])
+        n = x.size - 1
+        if n < 1:
+            return np.zeros(0, np.float32)
+        idx = np.arange(self.pos, n, self.ratio)
+        i0 = idx.astype(np.int64)
+        fr = (idx - i0).astype(np.float32)
+        out = x[i0] * (1 - fr) + x[np.minimum(i0 + 1, n)] * fr
+        self.pos = (idx[-1] + self.ratio - n) if idx.size else self.pos - n
+        self.hist = x[-1:].copy()
+        return out
+
+    def _deemph(self, x):
+        """Single-pole de-emphasis as a streaming 64-tap FIR (the truncated impulse response; error < 1e-11). Replaces a
+        48000-iterations-per-second Python loop."""
+        a = self.deemph_a
+        h = getattr(self, "_de_h", None)
+        if h is None:
+            h = self._de_h = a * (1.0 - a) ** np.arange(64)
+            self._de_tail = np.zeros(63)
+        buf = np.concatenate([self._de_tail, x.astype(np.float64)])
+        self._de_tail = buf[-63:].copy()
+        return np.convolve(buf, h, mode="valid").astype(np.float32)
+
+    def process(self, iq):
+        """iq: complex64 at rate_in.  Returns (audio float32 at 48 kHz, about -1..1;  channel level, linear, 1.0 = ADC full scale)."""
+        z = self.dec1.process(iq)
+        if self.dec2 is not None:
+            z = self.dec2.process(z)
+        if z.size < 2:
+            return np.zeros(0, np.float32), 0.0
+        level = float(np.abs(z).mean())
+        if self.mode == "AM":
+            env = np.abs(z)
+            m = float(env.mean())
+            self.dc = m if self.dc == 0.0 else 0.995 * self.dc + 0.005 * m     # slow carrier tracker = AGC
+            a = env / max(self.dc, 1e-6) - 1.0                                  # carrier-normalised, DC removed
+        else:
+            zz = np.concatenate([[self.prev], z])
+            d = np.angle(zz[1:] * np.conj(zz[:-1]))                              # instantaneous frequency, radians/sample
+            self.prev = z[-1]
+            a = d * (self.demod_rate / (2 * math.pi * self.dev))                 # +-1.0 at nominal deviation
+        a = self.alp.process(a.astype(np.float32))
+        out = self._resample(a)
+        if self.deemph_a is not None and out.size:
+            out = self._deemph(out)
+        return out.astype(np.float32), level
+        # ---- version 1 (per-sample Python loop), kept in case of problems ----
+        #OLD#         if self.deemph_a is not None and out.size:
+        #OLD#             al = self.deemph_a
+        #OLD#             y = np.empty_like(out)
+        #OLD#             s = self.de_state
+        #OLD#             for i in range(out.size):
+        #OLD#                 s += al * (out[i] - s)
+        #OLD#                 y[i] = s
+        #OLD#             self.de_state = s
+        #OLD#             out = y
+        #OLD#         return out.astype(np.float32), level
+
+
+# ---------------------------------------------------------------- burst decoder
+def _runs(bits):
+    """Run-length encode a 0/1 array -> (values, lengths)."""
+    if bits.size == 0:
+        return np.zeros(0, np.int8), np.zeros(0, np.int64)
+    ch = np.flatnonzero(np.diff(bits)) + 1
+    starts = np.concatenate([[0], ch])
+    ends = np.concatenate([ch, [bits.size]])
+    return bits[starts], ends - starts
+
+
+def _to_hex(bits):
+    b = list(bits)
+    while len(b) % 8:
+        b.append(0)
+    return "".join(f"{int(''.join(str(int(x)) for x in b[i:i+8]), 2):02X}" for i in range(0, len(b), 8))
+
+
+def _cluster_widths(w, tol=0.30):
+    """Group pulse widths into clusters of similar value -> sorted list of cluster centres."""
+    cl = []
+    for x in sorted(w):
+        if cl and abs(x - cl[-1][-1]) <= tol * cl[-1][-1]:
+            cl[-1].append(x)
+        else:
+            cl.append([x])
+    return [float(np.mean(c)) for c in cl if len(c) >= 1]
+
+
+def analyse_bits(sl, rate):
+    """sl: 0/1 array of the demodulated/sliced burst at sample rate `rate`.
+    Returns dict: baud, coding, bits (list), hex, notes.  Tries (a) NRZ at constant bit period,
+    (b) Manchester, (c) pulse-width / pulse-position (PWM/PPM) coding as used by most 433 MHz remotes."""
+    vals, lens = _runs(sl.astype(np.int8))
+    if vals.size < 4:
+        return None
+    # drop a leading/trailing partial run of zeros (idle) - keep from the first 1 to the last 1
+    first = int(np.argmax(vals == 1)) if (vals == 1).any() else 0
+    last = vals.size - 1 - int(np.argmax(vals[::-1] == 1))
+    vals, lens = vals[first:last + 1], lens[first:last + 1]
+    if vals.size < 3:
+        return None
+    L = lens.astype(np.float64)
+    centres = _cluster_widths(L, 0.30)
+    res = {"runs": int(vals.size), "centres_us": [c / rate * 1e6 for c in centres]}
+    # candidate unit = smallest cluster centre (shortest run = one bit period in NRZ/Manchester half-period)
+    unit = centres[0]
+    # ---- (a) Manchester / NRZ : all run lengths ~ integer multiples of unit
+    mult = L / unit
+    frac_err = np.abs(mult - np.round(mult))
+    integer_like = float(np.mean(frac_err < 0.25)) > 0.9 and mult.max() < 40
+    # ---- (b) PWM/PPM : exactly 2 (or 3) distinct widths among the HIGH pulses (or gaps)
+    hi_w = L[vals == 1]
+    lo_w = L[vals == 0]
+    hi_c = _cluster_widths(hi_w, 0.30) if hi_w.size else []
+    lo_c = _cluster_widths(lo_w, 0.30) if lo_w.size else []
+    bits = []
+    coding, baud, notes = "unknown", None, ""
+    # (hi, lo) pairs: every HIGH run followed by its LOW run (the final pulse has no trailing gap - it was trimmed)
+    pairs = [(L[i], L[i + 1]) for i in range(vals.size - 1) if vals[i] == 1 and vals[i + 1] == 0]
+    psum = np.array([a + b for a, b in pairs]) if pairs else np.zeros(0)
+    const_period = psum.size >= 6 and float(psum.std() / psum.mean()) < 0.12     # every bit takes the same time
+    # PWM: HIGH width carries the bit (2 clusters, ratio ~2-4) and either the gap is constant or the bit period is constant.
+    # (Manchester also has 2 pulse widths, but neither the gap nor the period is constant - so it falls through to the next test.)
+    if (len(hi_c) == 2 and 1.6 < hi_c[1] / hi_c[0] < 4.5 and hi_w.size >= 8
+            and (len(lo_c) <= 1 or const_period)):
+        thr = math.sqrt(hi_c[0] * hi_c[1])
+        bits = [1 if L[i] > thr else 0 for i in range(vals.size) if vals[i] == 1]
+        bit_period = float(psum.mean()) if psum.size else unit
+        baud = rate / bit_period
+        coding = "PWM (long pulse=1, short=0)" + (" fixed bit period" if const_period else " fixed gap")
+        notes = f"pulse widths {hi_c[0]/rate*1e6:.0f} / {hi_c[1]/rate*1e6:.0f} us"
+    elif (len(lo_c) == 2 and 1.6 < lo_c[1] / lo_c[0] < 4.5 and len(hi_c) <= 1 and lo_w.size >= 8):
+        thr = math.sqrt(lo_c[0] * lo_c[1])
+        bits = [1 if L[i] > thr else 0 for i in range(vals.size - 1) if vals[i] == 0]
+        coding = "PPM / gap-width (long gap=1, short=0)"
+        baud = rate / (np.mean(hi_c) + np.mean(lo_c)) if hi_c else None
+        notes = f"gap widths {lo_c[0]/rate*1e6:.0f} / {lo_c[1]/rate*1e6:.0f} us"
+    elif integer_like:
+        # unit estimate refinement: least-squares over all runs
+        unit = float(np.sum(L * np.round(mult)) / np.sum(np.round(mult) ** 2))
+        n = np.maximum(1, np.round(L / unit)).astype(int)
+        raw = np.repeat(vals, n)
+        has_long = bool((n >= 2).any())
+        # Manchester check: no run longer than 2 half-bits
+        if n.max() <= 2 and raw.size >= 8:
+            # Manchester half-bit rate = 1/unit; bit rate = half of that.  Two phase choices; pick the one with fewer violations.
+            def man(off):
+                pairs = raw[off:off + (raw.size - off) // 2 * 2].reshape(-1, 2)
+                bad = int(np.sum(pairs[:, 0] == pairs[:, 1]))
+                return bad, (pairs[:, 0] == 0).astype(int) if pairs.size else np.zeros(0, int), pairs.shape[0]
+            b0, bits0, n0 = man(0)
+            b1, bits1, n1 = man(1)
+            ok0 = b0 <= 0.1 * max(n0, 1)
+            ok1 = b1 <= 0.1 * max(n1, 1)
+            if ok0 or ok1:
+                use1 = (ok1 and not ok0) or (ok0 and ok1 and b1 < b0)
+                bits = list(bits1 if use1 else bits0)
+                coding = "Manchester (01=1, 10=0 - invert all bits if your protocol is the other way round)"
+                baud = rate / (2 * unit)
+                notes = f"half-bit {unit/rate*1e6:.0f} us; a first bit that starts LOW cannot be told from idle, so it may be missing"
+                if ok0 and ok1:
+                    alt = bits0 if use1 else bits1
+                    res["hex_alt"] = _to_hex(list(alt))
+                    notes += " (other half-bit alignment also valid - see alt)"
+        if not bits:
+            bits = list(raw[::1][::1]) if unit < 1.5 else list(np.repeat(vals, n))
+            coding = "NRZ / plain OOK at a fixed bit period"
+            baud = rate / unit
+            notes = f"bit period {unit/rate*1e6:.0f} us"
+    else:
+        notes = "irregular widths - could be analogue/noise or a coding not recognised; raw run widths listed"
+    res.update({"baud": baud, "coding": coding, "bits": bits, "hex": _to_hex(bits) if bits else "", "notes": notes,
+                "nbits": len(bits)})
+    return res
+
+
+# ---- version 2 of the burst decoder (frame splitting, hysteresis slicer, voting across frames, locked timing). The version 1 class is kept,
+# ---- commented out, at the end of this block in case of problems.
+def _clusters_counts(w, tol=0.30):
+    """[(centre, count), ...] groups of similar widths, sorted by centre."""
+    cl = []
+    for x in sorted(w):
+        if cl and abs(x - cl[-1][-1]) <= tol * cl[-1][-1]:
+            cl[-1].append(x)
+        else:
+            cl.append([x])
+    return [(float(np.mean(c)), len(c)) for c in cl]
+
+
+def _deglitch(vals, lens, min_len):
+    """Merge runs shorter than min_len into their neighbours (edge chatter / noise dips on a weak signal)."""
+    v = [int(x) for x in vals]
+    l = [int(x) for x in lens]
+    i = 0
+    while i < len(v):
+        if l[i] < min_len and len(v) > 1:
+            if i == 0:
+                del v[0]
+                del l[0]
+                continue
+            if i == len(v) - 1:
+                del v[i]
+                del l[i]
+                break
+            l[i - 1] += l[i] + l[i + 1]
+            del v[i:i + 2]
+            del l[i:i + 2]
+            i = max(i - 1, 0)
+            continue
+        i += 1
+    return np.array(v, np.int8), np.array(l, np.int64)
+
+
+def _ook_slice(x, rate):
+    """Complex burst -> 0/1 array. 40 us envelope smoothing, then a Schmitt trigger whose switching level FOLLOWS the local signal
+    strength (running maximum over +-3 ms, never lower than 25 % of the transmission's span), so pulses late in a frame whose
+    amplitude has sagged are still seen, while the long gaps between frames cannot trigger on noise."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    mag = np.abs(x).astype(np.float32)
+    n = max(3, int(round(rate * 40e-6)))
+    sm = np.convolve(mag, np.ones(n, np.float32) / n, mode="same")
+    hi = float(np.percentile(sm, 92))
+    lo = float(np.percentile(sm, 8))
+    if hi < 1.6 * lo:
+        lo = 0.0
+    span = max(hi - lo, 1e-12)
+    d = 8
+    pad_n = (-sm.size) % d
+    m = np.concatenate([sm, np.full(pad_n, sm[-1], np.float32)]).reshape(-1, d).max(axis=1)
+    w = max(3, int(0.003 * rate / d))
+    lm = sliding_window_view(np.pad(m, w, mode="edge"), 2 * w + 1).max(axis=1)
+    local = np.repeat(lm, d)[:sm.size]
+    peak = np.minimum(np.maximum(local, lo + 0.25 * span), lo + 1.5 * span)
+    mid = lo + 0.5 * (peak - lo)
+    hy = 0.18 * (peak - lo)
+    s = np.full(sm.size, -1, np.int8)
+    s[sm > mid + hy] = 1
+    s[sm < mid - hy] = 0
+    idx = np.maximum.accumulate(np.where(s >= 0, np.arange(sm.size), 0))
+    st = s[idx]
+    st[st < 0] = 0
+    return st.astype(np.int8)
+
+
+def _bits_to_hex_q(code):
+    """'1111 10?1...' -> hex, with '?' for any nibble that contains an unsure bit."""
+    out = ""
+    for i in range(0, len(code), 4):
+        nib = code[i:i + 4].ljust(4, "0")
+        out += "?" if "?" in nib else f"{int(nib, 2):X}"
+    return out
+
+
+def _pwm_frames(pulses, lows, rate, profile, strip_sync, skip_first=False):
+    """Split a transmission into frames at the long sync gaps, decode every frame with ONE set of pulse-width thresholds
+    (learned from the whole transmission, or the locked profile from the previous one) and vote across the frames
+    position by position, so frames that fade out part-way still contribute their reliable first bits."""
+    from collections import Counter
+    p75 = float(np.percentile(lows, 75))
+    gap_thr = max(2.2 * p75, 0.0012 * rate)            # a gap this long is not a bit
+    big = [lo for _, lo in pulses if lo is not None and lo > gap_thr]
+    sync_thr = gap_thr
+    if len(big) >= 4:                                  # separate real sync gaps (the typical big gap) from shorter drop-outs
+        G = float(np.median(big))
+        if G > 2.5 * p75:
+            sync_thr = max(gap_thr, 0.7 * G)
+    segs, cur, gaps, broken = [], [], [], False
+    for hi, lo in pulses:
+        if not broken:
+            cur.append((hi, lo))
+        if lo is not None and lo > gap_thr:
+            if lo > sync_thr:                          # frame separator
+                segs.append((cur, not broken))
+                gaps.append(lo)
+                cur, broken = [], False
+            else:                                      # drop-out inside a frame: what follows is unreliable until the next sync
+                broken = True
+    if cur:
+        segs.append((cur, False))
+    if skip_first and len(segs) >= 2:                  # this chunk continues a long press: its first piece starts mid-frame
+        segs = segs[1:]
+    frames = []
+    for pl, gap_after in segs:
+        data = pl[:-1] if (strip_sync and gap_after) else pl      # the pulse just before a sync gap is the sync pulse
+        if len(data) >= 4:
+            frames.append(data)
+    if not frames:
+        return None
+    his = np.array([h for f in frames for h, _ in f])
+    if his.size < 8:
+        return None
+    cc = sorted(sorted(_clusters_counts(his, 0.30), key=lambda t: -t[1])[:2])
+    ok = (len(cc) == 2 and 1.6 < cc[1][0] / cc[0][0] < 4.5 and (cc[0][1] + cc[1][1]) >= 0.8 * his.size)
+    locked = False
+    if profile is not None:
+        c0, c1 = profile["c0_us"] * rate * 1e-6, profile["c1_us"] * rate * 1e-6
+        fit = float(np.mean((np.abs(his - c0) < 0.3 * c0) | (np.abs(his - c1) < 0.3 * c1)))
+        if fit >= 0.85:
+            cc, ok, locked = [(c0, 1), (c1, 1)], True, True
+    if not ok:
+        return None
+    # PWM (as opposed to Manchester, which also has two pulse widths): constant gap, or constant bit period
+    inner = [(h, l) for f in frames for h, l in f if l is not None and l <= gap_thr]
+    if len(inner) < 6:
+        return None
+    psum = np.array([h + l for h, l in inner])
+    const_period = float(psum.std() / psum.mean()) < 0.12
+    low_cl = [c for c, k in _clusters_counts(np.array([l for _, l in inner]), 0.30) if k >= 0.10 * len(inner)]
+    if not (const_period or len(low_cl) <= 1):
+        return None
+    thr = math.sqrt(cc[0][0] * cc[1][0])
+    cand = []
+    for f in frames:
+        if all(0.6 * cc[0][0] < h < 1.5 * cc[1][0] for h, _ in f):
+            s = "".join("1" if h > thr else "0" for h, _ in f)
+            if len(s) >= 6:
+                cand.append(s)
+    if not cand:
+        return None
+    def ref_len(c):
+        n_f = len(c)
+        nd = max(2, math.ceil(0.2 * n_f)) if n_f > 1 else 1
+        return nd, sorted((len(x) for x in c), reverse=True)[min(nd, n_f) - 1]   # longest length that at least nd frames reach
+    need, Lref = ref_len(cand)
+    if len(cand) > 2 and len(cand[0]) < Lref:          # a press that starts mid-frame (fade-in) begins with a TAIL fragment: drop it
+        cand = cand[1:]
+        need, Lref = ref_len(cand)
+    F = len(cand)
+    def majority(vs):
+        return "".join("1" if sum(x[i] == "1" for x in vs) * 2 > len(vs) else "0" for i in range(len(vs[0])))
+    full = [s[:Lref] for s in cand if len(s) >= Lref]
+    partial = [s[:-1] for s in cand if len(s) < Lref and len(s) > 1]   # cut short: its last bit is suspect
+    if len(full) >= 2:                                 # a short frame may only vote if it agrees with the full-length frames
+        prov = majority(full)                          # (a genuine truncated frame does; a misaligned tail piece does not)
+        partial = [v for v in partial if sum(a == b for a, b in zip(v, prov)) >= 0.85 * len(v)]
+    voters = full + partial
+    code, conf = [], []
+    for i in range(Lref):
+        col = [v[i] for v in voters if len(v) > i]
+        if len(col) < min(need, len(voters)):
+            break
+        ones = col.count("1")
+        code.append("1" if ones * 2 > len(col) else "0")
+        conf.append(max(ones, len(col) - ones) / len(col))
+    while code and conf[-1] < 0.6:                     # drop an unstable tail
+        code.pop()
+        conf.pop()
+    if len(code) < 4:
+        return None
+    marked = "".join(c if q >= 0.8 else "?" for c, q in zip(code, conf))
+    if marked.count("?") * 2 > len(marked):            # most bits unsure (e.g. 3 frames at the start of a press): not worth a line
+        return "drop"
+    plain = "".join(code)
+    k = sum(1 for v in voters if v[:len(plain)] == plain[:len(v)])
+    full = sum(1 for s in cand if len(s) >= len(plain))
+    period = float(np.mean(psum))                      # average bit period (constant for fixed-period codes)
+    lens_ct = Counter(len(s) for s in cand).most_common(4)
+    r = {"baud": rate / period, "nbits": len(plain), "bits": [int(c) for c in plain],
+         "hex": _bits_to_hex_q(marked), "bin": marked, "frames": F, "frames_all": len(frames), "agree": k, "full": full,
+         "locked": locked,
+         "coding": "PWM (long pulse=1, short=0), " + ("fixed bit period" if const_period else "fixed gap"),
+         "notes": f"pulses {cc[0][0] / rate * 1e6:.0f}/{cc[1][0] / rate * 1e6:.0f} us; bit period {period / rate * 1e6:.0f} us"
+                  + (f"; sync gap {float(np.median(gaps)) / rate * 1e3:.1f} ms" if gaps else "")
+                  + "; frame lengths " + " ".join(f"{n}x{c}" for n, c in lens_ct)}
+    prof = profile if locked else {"c0_us": cc[0][0] / rate * 1e6, "c1_us": cc[1][0] / rate * 1e6, "period_us": period / rate * 1e6}
+    return r, prof
+
+
+def analyse_ook_transmission(sl, rate, profile=None, strip_sync=True, pulses_out=None, skip_first=False):
+    """One OOK transmission (0/1 array) -> ([result dicts], profile). A press of a PWM remote gives ONE result: the code that most
+    frames agree on. Anything that is not PWM falls back to analyse_bits() on each burst separated by >= 4 ms."""
+    vals, lens = _runs(sl)
+    if vals.size < 6:
+        return [], profile
+    vals, lens = _deglitch(vals, lens, max(2, int(40e-6 * rate)))
+    if vals.size < 6:
+        return [], profile
+    cc = _clusters_counts(lens.astype(float), 0.30)
+    cand = [c for c, k in cc if k >= 0.08 * lens.size and c > 100e-6 * rate]
+    if cand:
+        vals, lens = _deglitch(vals, lens, int(0.45 * min(cand)))
+    ones = np.flatnonzero(vals == 1)
+    if ones.size < 4:
+        return [], profile
+    vals, lens = vals[ones[0]:ones[-1] + 1], lens[ones[0]:ones[-1] + 1]
+    L = lens.astype(np.float64)
+    pulses = [(L[i], L[i + 1] if i + 1 < L.size else None) for i in range(0, L.size, 2)]
+    if pulses_out is not None:
+        pulses_out[:] = pulses
+    lows = np.array([lo for _, lo in pulses if lo is not None])
+    if lows.size >= 6:
+        res = _pwm_frames(pulses, lows, rate, profile, strip_sync, skip_first)
+        if isinstance(res, str):                       # "drop": recognised as PWM but too unreliable to report
+            return [], profile
+        if res is not None:
+            return [res[0]], res[1]
+    out = []                                           # fallback: NRZ / Manchester / irregular, one analysis per burst
+    sl2 = np.repeat(vals, lens)
+    cuts = [0]
+    pos = 0
+    for v, n in zip(vals, lens):
+        if v == 0 and n >= 0.004 * rate:
+            cuts.append(pos + n // 2)
+        pos += n
+    cuts.append(sl2.size)
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        if b - a >= 0.0008 * rate:
+            r = analyse_bits(sl2[a:b], rate)
+            if r is not None:
+                r["t_off_s"] = a / rate
+                r["dur_ms"] = (b - a) / rate * 1e3
+                out.append(r)
+    return out, profile
+
+
+class BurstDecoder:
+    """Streaming burst detector + demodulator.
+    mode 'OOK': envelope -> Schmitt slicer; one TRANSMISSION (a whole button press, up to 0.6 s per report) is analysed as a
+                whole: split into frames, one set of timing thresholds, vote across frames. Timing is remembered (self.profile)
+                so the next press on the same remote is decoded with the same settings.
+    mode 'FSK': FM discriminator -> adaptive threshold, one burst at a time (as before).
+    Feed it IQ (complex64, rate_in); it yields result dicts."""
+    def __init__(self, rate_in, mode="OOK", target_rate=None, bw_hz=None):
+        self.mode = mode
+        if target_rate is None:
+            target_rate = 600e3 if mode == "OOK" else 250e3     # OOK: wide channel - cheap transmitters drift and chirp
+        if bw_hz is None:
+            bw_hz = 200e3 if mode == "OOK" else 100e3
+        self.bw_hz = float(bw_hz)
+        f = max(1, int(rate_in // target_rate))
+        self.rate = rate_in / f
+        cutoff = min(bw_hz, self.rate * 0.45)
+        self.dec = Decimator(rate_in, f, cutoff, ntaps=int(min(401, max(63, 8.0 * rate_in / cutoff))) | 1)
+        self.last_pulses_us = []
+        self._flush_g = -10 ** 12       # global sample index of the last forced (max_len) flush
+        self._cur_cont = False          # the buffer being collected continues a long press that was flushed a moment ago
+        self.noise = None
+        self.sens = 6.0
+        self.strip_sync = True
+        self.profile = None
+        self.last_nbits = None          # length of the last well-supported (2+ frames) code, to reject lone fragments
+        self.active = False
+        self.buf = []
+        self.pre_n = max(8, int(0.0005 * self.rate))
+        self.pre = np.zeros(0, np.complex64)
+        self.t_samples = 0
+        self.t_burst0 = 0
+        self.last_above = -10 ** 12
+        self.gap_max = int((0.025 if mode == "OOK" else 0.004) * self.rate)   # quiet this long ends a transmission / burst
+        self.min_len = int(0.0008 * self.rate)
+        self.max_len = int((0.6 if mode == "OOK" else 0.5) * self.rate)
+
+    def process(self, iq):
+        out = []
+        z = self.dec.process(iq)
+        n = z.size
+        if n == 0:
+            return out
+        sm = np.convolve(np.abs(z), np.ones(8, np.float32) / 8.0, mode="same")
+        if self.noise is None:
+            self.noise = float(np.median(sm))
+        thr = max(self.noise * self.sens, 1e-5)
+        above = sm > thr
+        g0 = self.t_samples
+        idx = np.arange(n)
+        la = np.maximum.accumulate(np.where(above, idx, -1))
+        last_g = np.where(la >= 0, g0 + la, self.last_above)       # global index of the last above-threshold sample so far
+        held = (g0 + idx - last_g) < self.gap_max                  # True until gap_max quiet samples have passed
+        prev_last = self.last_above
+        self.last_above = int(last_g[-1])
+        if not self.active:
+            q = sm[~held]
+            if q.size:
+                self.noise = 0.98 * self.noise + 0.02 * float(np.median(q))
+        ch = np.flatnonzero(np.diff(held.astype(np.int8))) + 1
+        for a, b in zip(np.concatenate([[0], ch]), np.concatenate([ch, [n]])):
+            a, b = int(a), int(b)
+            if held[a]:
+                if not self.active:
+                    self.active = True
+                    self._cur_cont = (g0 + a - self._flush_g) < int(0.003 * self.rate)
+                    if a < self.pre_n and self.pre.size:
+                        pre = self.pre[-(self.pre_n - a):]
+                    else:
+                        pre = np.zeros(0, np.complex64)
+                    lead = z[max(0, a - self.pre_n):a]
+                    self.buf = [np.concatenate([pre, lead, z[a:b]])]
+                    self.t_burst0 = g0 + a - (pre.size + lead.size)
+                else:
+                    self.buf.append(z[a:b])
+                if b < n:                                           # the run ended inside this block: transmission over
+                    self._end(int(last_g[b - 1]), out)
+            elif self.active:                                       # ended exactly at a block boundary
+                self._end(int(last_g[a - 1]) if a > 0 else prev_last, out)
+        if self.active and sum(c.size for c in self.buf) > self.max_len:
+            self._end(self.last_above, out)                         # long press: report now, carry on with the next chunk
+            self._flush_g = g0 + n
+        self.pre = np.concatenate([self.pre, z])[-self.pre_n:]
+        self.t_samples += n
+        return out
+
+    def _end(self, last_above_g, out):
+        x = np.concatenate(self.buf) if self.buf else np.zeros(0, np.complex64)
+        self.buf = []
+        self.active = False
+        keep = max(0, min(int(last_above_g + 1 + 16 - self.t_burst0), x.size))
+        self._finish(x[:keep], out, self._cur_cont)
+
+    def _finish(self, x, out, cont=False):
+        if x.size < self.min_len:
+            return
+        t0 = self.t_burst0 / self.rate
+        dur = x.size / self.rate * 1e3
+        if self.mode == "OOK":
+            pl = []
+            res, self.profile = analyse_ook_transmission(_ook_slice(x, self.rate), self.rate, self.profile, self.strip_sync, pl, cont)
+            self.last_pulses_us = [(h / self.rate * 1e6, None if l is None else l / self.rate * 1e6) for h, l in pl]
+            for r in res:
+                if r.get("frames") is not None:                      # PWM consensus result
+                    if r["frames"] >= 3 and r["nbits"] >= 8:
+                        self.last_nbits = r["nbits"]
+                    elif self.last_nbits is not None and r["nbits"] != self.last_nbits:
+                        continue                                      # a thinly supported result of a different length = a chopped fragment
+                    elif "?" in r["bin"] or r["nbits"] < 8:
+                        continue                                      # thinly supported AND unsure / tiny: a fragment, not a code
+                r.update({"t_s": t0 + r.get("t_off_s", 0.0), "mode": "OOK"})
+                r.setdefault("dur_ms", dur)
+                out.append(r)
+            return
+        d = np.angle(x[1:] * np.conj(x[:-1]))
+        mag = np.abs(x[1:])
+        d = np.convolve(d, np.ones(5) / 5.0, mode="same")
+        act = mag > 0.5 * np.percentile(mag, 90)
+        if act.sum() < 8:
+            return
+        dd = d[act]
+        thr = 0.5 * (np.percentile(dd, 95) + np.percentile(dd, 5))
+        sl = (d > thr).astype(np.int8)
+        sl[~act] = 0
+        dev = float(0.5 * (np.percentile(dd, 95) - np.percentile(dd, 5)) * self.rate / (2 * math.pi))
+        r = analyse_bits(sl, self.rate)
+        if r is None:
+            return
+        r.update({"t_s": t0, "dur_ms": dur, "mode": "FSK", "dev_khz": dev / 1e3})
+        out.append(r)
+
+    def dump_text(self, max_frames=8):
+        """The raw pulse table (high/low widths in us) of the last OOK transmission, one line per frame (split at gaps > 3 ms)."""
+        if not self.last_pulses_us:
+            return "no OOK transmission analysed yet"
+        lines, cur = [], []
+        for h, l in self.last_pulses_us:
+            cur.append(f"{h:.0f}/" + ("end" if l is None else f"{l:.0f}"))
+            if l is not None and l > 3000:
+                lines.append(cur)
+                cur = []
+        if cur:
+            lines.append(cur)
+        out = [f"pulse table (high/low widths in us), {len(lines)} frames split at gaps > 3 ms; first {min(len(lines), max_frames)}:"]
+        for i, ln in enumerate(lines[:max_frames]):
+            out.append(f"  F{i + 1:<2d} ({len(ln):2d} pulses) " + " ".join(ln))
+        return "\n".join(out)
+
+
+#OLD# class BurstDecoder:
+#OLD#     """Streaming burst detector + demodulator.
+#OLD#     mode 'OOK': envelope -> adaptive threshold -> slicer.   mode 'FSK': FM discriminator -> adaptive threshold.
+#OLD#     Feed it IQ (complex64, rate_in); it decimates, finds bursts (energy above noise floor), and when one ends calls
+#OLD#     analyse_bits() and yields result dicts."""
+#OLD#     def __init__(self, rate_in, mode="OOK", target_rate=250e3, bw_hz=100e3):
+#OLD#         self.mode = mode
+#OLD#         f = max(1, int(rate_in // target_rate))
+#OLD#         self.rate = rate_in / f
+#OLD#         self.dec = Decimator(rate_in, f, min(bw_hz, self.rate * 0.45))
+#OLD#         self.noise = None           # running noise-floor estimate of smoothed magnitude
+#OLD#         self.active = False
+#OLD#         self.buf = []               # decimated complex samples of the burst in progress
+#OLD#         self.pre = np.zeros(0, np.complex64)   # a little pre-roll
+#OLD#         self.quiet = 0
+#OLD#         self.t_samples = 0          # decimated samples consumed (for timestamps)
+#OLD#         self.t_burst0 = 0
+#OLD#         self.gap_max = int(0.004 * self.rate)    # a gap longer than 4 ms ends the burst
+#OLD#         self.min_len = int(0.0008 * self.rate)   # ignore anything shorter than 0.8 ms
+#OLD#         self.max_len = int(0.5 * self.rate)
+#OLD#         self.sens = 6.0             # burst threshold = this many times the noise floor (amplitude)
+#OLD#
+#OLD#     def process(self, iq):
+#OLD#         out = []
+#OLD#         z = self.dec.process(iq)
+#OLD#         if z.size == 0:
+#OLD#             return out
+#OLD#         mag = np.abs(z)
+#OLD#         sm = np.convolve(mag, np.ones(8) / 8.0, mode="same")
+#OLD#         if self.noise is None:
+#OLD#             self.noise = float(np.median(sm))
+#OLD#         # thr = max(self.noise * self.sens, 0.01)   # OLD: the fixed 0.01 (-40 dBFS) floor hid every burst weaker than that
+#OLD#         thr = max(self.noise * self.sens, 1e-5)      # tiny floor only, so it can never be zero
+#OLD#         above = sm > thr
+#OLD#         # noise floor tracks only samples not in a burst
+#OLD#         quiet = sm[~above]
+#OLD#         if quiet.size:
+#OLD#             self.noise = 0.98 * self.noise + 0.02 * float(np.median(quiet)) if not self.active else self.noise
+#OLD#         i = 0
+#OLD#         n = z.size
+#OLD#         while i < n:
+#OLD#             if not self.active:
+#OLD#                 idx = np.flatnonzero(above[i:])
+#OLD#                 if idx.size == 0:
+#OLD#                     self.pre = z[-int(0.0005 * self.rate):].copy()
+#OLD#                     break
+#OLD#                 s = i + int(idx[0])
+#OLD#                 self.active = True
+#OLD#                 self.quiet = 0
+#OLD#                 self.buf = [self.pre, z[s:]] if s == 0 else [z[max(0, s - 40):]]
+#OLD#                 self.t_burst0 = self.t_samples + s
+#OLD#                 # fallthrough: scan the rest of this block for the end
+#OLD#                 seg_above = above[s:]
+#OLD#                 rest_start = s
+#OLD#             else:
+#OLD#                 self.buf.append(z[i:])
+#OLD#                 seg_above = above[i:]
+#OLD#                 rest_start = i
+#OLD#             # look for the end: a run of >= gap_max below-threshold samples
+#OLD#             below = ~seg_above
+#OLD#             if below.size >= self.gap_max:
+#OLD#                 # sliding sum via cumsum
+#OLD#                 cs = np.concatenate([[0], np.cumsum(below)])
+#OLD#                 w = cs[self.gap_max:] - cs[:-self.gap_max]
+#OLD#                 full = np.flatnonzero(w >= self.gap_max)
+#OLD#             else:
+#OLD#                 full = np.zeros(0, int)
+#OLD#             tot = sum(b.size for b in self.buf)
+#OLD#             if full.size:
+#OLD#                 end_in_seg = int(full[0])                       # burst ends gap_max after last activity ~ start of the quiet run
+#OLD#                 # trim buffer: remove the part after the last active sample
+#OLD#                 keep = (tot - seg_above.size) + end_in_seg
+#OLD#                 x = np.concatenate(self.buf)[:keep]
+#OLD#                 self._finish(x, out)
+#OLD#                 self.active = False
+#OLD#                 self.buf = []
+#OLD#                 i = rest_start + end_in_seg + self.gap_max
+#OLD#                 continue
+#OLD#             if tot > self.max_len:
+#OLD#                 x = np.concatenate(self.buf)
+#OLD#                 self._finish(x, out)
+#OLD#                 self.active = False
+#OLD#                 self.buf = []
+#OLD#             break
+#OLD#         self.t_samples += z.size
+#OLD#         return out
+#OLD#
+#OLD#     def _finish(self, x, out):
+#OLD#         if x.size < self.min_len:
+#OLD#             return
+#OLD#         t0 = self.t_burst0 / self.rate
+#OLD#         if self.mode == "OOK":
+#OLD#             sig = np.abs(x).astype(np.float32)
+#OLD#             sig = np.convolve(sig, np.ones(3) / 3.0, mode="same")
+#OLD#             hi, lo = np.percentile(sig, 95), np.percentile(sig, 10)
+#OLD#             thr = 0.5 * (hi + lo) if hi > 2 * lo else 0.5 * hi
+#OLD#             sl = (sig > thr).astype(np.int8)
+#OLD#         else:
+#OLD#             d = np.angle(x[1:] * np.conj(x[:-1]))
+#OLD#             mag = np.abs(x[1:])
+#OLD#             d = np.convolve(d, np.ones(5) / 5.0, mode="same")
+#OLD#             act = mag > 0.5 * np.percentile(mag, 90)
+#OLD#             if act.sum() < 8:
+#OLD#                 return
+#OLD#             dd = d[act]
+#OLD#             thr = 0.5 * (np.percentile(dd, 95) + np.percentile(dd, 5))
+#OLD#             sl = (d > thr).astype(np.int8)
+#OLD#             sl[~act] = 0
+#OLD#             res_dev = float(0.5 * (np.percentile(dd, 95) - np.percentile(dd, 5)) * self.rate / (2 * math.pi))
+#OLD#         r = analyse_bits(sl, self.rate)
+#OLD#         if r is None:
+#OLD#             return
+#OLD#         r.update({"t_s": t0, "dur_ms": x.size / self.rate * 1e3, "mode": self.mode})
+#OLD#         if self.mode == "FSK":
+#OLD#             r["dev_khz"] = res_dev / 1e3
+#OLD#         out.append(r)
+
+
+class DecoderSignals(QtCore.QObject):
+    audio = QtCore.pyqtSignal(object)      # bytes: signed 16-bit mono, 48 kHz
+    burst = QtCore.pyqtSignal(object)      # one decoded burst (dict from analyse_bits + timing)
+    status = QtCore.pyqtSignal(str)
+    marker = QtCore.pyqtSignal(float)      # the listening frequency, for the marker line on the spectrum
+    stopped = QtCore.pyqtSignal(int)       # decoder thread ended (argument = session number)
+
+
+DECODER_AUDIO_CUSHION_S = 0.30         # audio is pre-buffered this long before playing starts (and again after an under-run)
+
+
+class DecoderAudioSink(QtCore.QObject):
+    """Owns the QAudioOutput and lives in its OWN QThread (see EmcScanner.decoder_audio_open). The decoder thread sends 48 kHz mono int16
+    chunks straight to push() through a queued signal, so a slow GUI redraw can no longer starve the sound card."""
+    def __init__(self):
+        super().__init__()
+        self.out = None
+        self.dev = None
+        self.channels = 1
+        self.primed = False
+        self.prebuf = bytearray()
+        self.prime_bytes = 0
+        self.dropped = 0
+        self.underruns = 0
+        self.ok = False
+        self.name = ""
+        self.error = ""
+
+    @QtCore.pyqtSlot()
+    def open(self):
+        self.ok = False
+        try:
+            info = QtMultimedia.QAudioDeviceInfo.defaultOutputDevice()
+            fmt = None
+            for ch in (1, 2):
+                f = QtMultimedia.QAudioFormat()
+                f.setSampleRate(AudioDemod.AUDIO_RATE)
+                f.setChannelCount(ch)
+                f.setSampleSize(16)
+                f.setCodec("audio/pcm")
+                f.setByteOrder(QtMultimedia.QAudioFormat.LittleEndian)
+                f.setSampleType(QtMultimedia.QAudioFormat.SignedInt)
+                if info.isFormatSupported(f):
+                    fmt = f
+                    self.channels = ch
+                    break
+            if fmt is None:
+                self.error = "the default audio output does not accept 48 kHz 16-bit audio"
+                return
+            self.out = QtMultimedia.QAudioOutput(info, fmt)
+            self.out.setBufferSize(int(AudioDemod.AUDIO_RATE * 2 * self.channels * 1.0))
+            self.dev = self.out.start()
+            self.prime_bytes = int(AudioDemod.AUDIO_RATE * 2 * self.channels * DECODER_AUDIO_CUSHION_S)
+            self.name = info.deviceName()
+            self.ok = True
+        except Exception as e:
+            self.error = repr(e)
+
+    @QtCore.pyqtSlot(object)
+    def push(self, data):
+        out, dev = self.out, self.dev
+        if out is None or dev is None:
+            return
+        if self.channels == 2:
+            data = np.repeat(np.frombuffer(data, dtype=np.int16), 2).tobytes()
+        if self.primed and out.state() == QtMultimedia.QAudio.IdleState:
+            self.primed = False                        # under-run: build the cushion up again
+            self.prebuf = bytearray()
+            self.underruns += 1
+        if not self.primed:
+            self.prebuf += data
+            if len(self.prebuf) >= self.prime_bytes:
+                n = min(out.bytesFree(), len(self.prebuf))
+                dev.write(bytes(self.prebuf[:n]))
+                self.prebuf = bytearray()
+                self.primed = True
+            return
+        if out.bytesFree() >= len(data):
+            dev.write(data)
+        else:
+            self.dropped += 1
+
+    @QtCore.pyqtSlot()
+    def close(self):
+        try:
+            if self.out is not None:
+                self.out.stop()
+        except Exception:
+            pass
+        self.out = None
+        self.dev = None
+        self.primed = False
+
+
+import collections
+DECODER_USE_ASYNC = True        # gap-free capture through librtlsdr's ASYNCHRONOUS reader (see SdrStreamer). False = old synchronous reads
+DECODER_LIVE_RETUNE = True      # centre-frequency / gain changes are made while the stream runs (as rtl_fm does).
+                                # False = stop the stream, change, restart it (slower, most cautious)
+
+
+def _iq_from_samples(samples):
+    """Whatever read_samples() / packed_bytes_to_iq() delivered -> normalised complex64, identically to _scope_read_iq()."""
+    if np.iscomplexobj(samples):
+        return samples.astype(np.complex64) / SCOPE_COMPLEX_DIVISOR
+    if samples.dtype == np.uint8:
+        f = samples.astype(np.float32) - 128.0
+    else:
+        f = samples.astype(np.float32)
+    if (f.size % 2) != 0:
+        f = f[:-1]
+    f = f.reshape(-1, 2)
+    return (f[:, 0] + 1j * f[:, 1]).astype(np.complex64) / 128.0
+
+
+class SdrStreamer:
+    """Continuous, gap-free IQ capture.
+
+    Why: calling sdr.read_samples() repeatedly with processing in between is a SYNCHRONOUS USB read - while Python is busy (filters, FFT,
+    redraws) nothing is queued to the dongle, so every sample it streams in that time is lost. That is a small hole at the end of every
+    block: audible as warble, and it chops the end off every key-fob frame. Worse, the audio then gets fewer samples than real time
+    and slowly runs dry.
+
+    How: librtlsdr's asynchronous reader (read_bytes_async) runs in its own thread with ~15 USB buffers queued in the driver (about
+    0.4 s of cushion), so the dongle is always being drained. Each buffer is converted and put in a queue; the decoder takes blocks
+    from the queue at its own pace. Only if the decoder falls more than MAX_BLOCKS behind are blocks dropped (counted in .overruns)."""
+    BUF_BYTES = 131072          # per USB buffer = 65536 samples (must be a multiple of 512)
+    MAX_BLOCKS = 48             # about 1.3 s at 2.4 MS/s
+
+    def __init__(self, sdr):
+        self.sdr = sdr
+        self.cv = threading.Condition()
+        self.q = collections.deque()
+        self.pending = np.zeros(0, np.complex64)
+        self.thread = None
+        self.running = False
+        self.error = None
+        self.overruns = 0
+        self.blocks = 0
+
+    def _convert(self, values):
+        conv = getattr(self.sdr, "packed_bytes_to_iq", None)     # the same converter read_samples() uses -> identical scaling
+        samples = conv(values) if conv is not None else np.ctypeslib.as_array(values).copy()
+        return _iq_from_samples(samples)
+
+    def _cb(self, values, ctx):
+        """Runs in librtlsdr's reader thread: convert, queue, return - never block."""
+        try:
+            iq = self._convert(values)
+        except Exception as e:
+            self.error = e
+            return
+        with self.cv:
+            self.q.append(iq)
+            self.blocks += 1
+            while len(self.q) > self.MAX_BLOCKS:
+                self.q.popleft()
+                self.overruns += 1
+            self.cv.notify()
+
+    def _run(self):
+        try:
+            self.sdr.read_bytes_async(self._cb, self.BUF_BYTES)    # blocks here until cancel_read_async()
+        except Exception as e:
+            self.error = e
+        finally:
+            self.running = False
+            with self.cv:
+                self.cv.notify_all()
+
+    def start(self):
+        self.stop()
+        with self.cv:
+            self.q.clear()
+        self.pending = np.zeros(0, np.complex64)
+        self.error = None
+        self.overruns = 0
+        self.blocks = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._run, name="rtl-async-reader", daemon=True)
+        self.thread.start()
+        t_end = time.time() + 3.0                              # wait for the first buffer so a start-up failure is reported here
+        with self.cv:
+            while not self.q and self.error is None and self.running and time.time() < t_end:
+                self.cv.wait(0.05)
+        if self.error is not None:
+            raise OSError(f"SDR async stream could not start: {self.error!r}")
+
+    def stop(self):
+        th = self.thread
+        if th is None:
+            return
+        try:
+            self.sdr.cancel_read_async()
+        except Exception as e:
+            print(f"SdrStreamer.stop: cancel_read_async: {e!r}")
+        th.join(timeout=3.0)
+        if th.is_alive():
+            print("SdrStreamer.stop: reader thread did not finish in 3 s")
+        self.thread = None
+        self.running = False
+
+    def flush(self):
+        """Throw away everything captured so far (after a retune: the data is from the old frequency / still settling)."""
+        with self.cv:
+            self.q.clear()
+        self.pending = np.zeros(0, np.complex64)
+
+    @property
+    def depth(self):
+        return len(self.q)
+
+    def read(self, n, timeout=2.0):
+        """Exactly n samples (complex64), continuous with the previous call."""
+        parts = [self.pending] if self.pending.size else []
+        have = self.pending.size
+        t_end = time.time() + timeout
+        while have < n:
+            with self.cv:
+                while not self.q:
+                    if self.error is not None:
+                        raise OSError(f"SDR stream error: {self.error!r}")
+                    if not self.running:
+                        raise OSError("SDR stream stopped")
+                    left = t_end - time.time()
+                    if left <= 0:
+                        raise OSError(f"SDR stream stalled (no data for {timeout:.1f} s)")
+                    self.cv.wait(min(left, 0.1))
+                blk = self.q.popleft()
+            parts.append(blk)
+            have += blk.size
+        x = np.concatenate(parts) if len(parts) > 1 else parts[0]
+        self.pending = x[n:].copy() if x.size > n else np.zeros(0, np.complex64)
+        return x[:n]
+
+
 class SurveySignals(QtCore.QObject):
     # survey worker thread -> GUI thread: True if the survey was stopped early
     done = QtCore.pyqtSignal(object)
@@ -3653,6 +4654,7 @@ class EmcScanner(QtWidgets.QMainWindow):
     # receives there (the whole captured bandwidth - there is nothing to stitch, so no edge masking).
     # ------------------------------------------------------------------------------------
 
+    # ---- single_build_ui(): the version before the decoder was added is kept, commented out, just below the new one ----
     def single_build_ui(self, left_layout):
         self.single_mode = False
         self.single_centre_hz = 100000000
@@ -3703,6 +4705,58 @@ class EmcScanner(QtWidgets.QMainWindow):
                 break
         left_layout.insertWidget(pos, self.single_panel)
         self.single_panel.setVisible(False)
+        self.decoder_build_ui(left_layout)               # DECODER panel (audio / burst decode), under the centre-frequency row
+
+    #OLD# def single_build_ui(self, left_layout):
+    #OLD#     self.single_mode = False
+    #OLD#     self.single_centre_hz = 100000000
+    #OLD#     self._pending_centre = None
+    #OLD#     self._single_lock = threading.Lock()
+    #OLD#     self._last_preset_index = None
+    #OLD#     # the mode button goes ABOVE the range (preset) buttons, same size and shape as them
+    #OLD#     first = self.mode_buttons[0]
+    #OLD#     self.btn_single = QtWidgets.QPushButton("Single Frequency")
+    #OLD#     self.btn_single.setCheckable(True)
+    #OLD#     self.btn_single.setSizePolicy(first.sizePolicy())
+    #OLD#     self.btn_single.setMinimumSize(first.minimumSize())
+    #OLD#     self.btn_single.setToolTip("Test mode: tune to one centre frequency and show a single spectrum of the whole captured "
+    #OLD#                                 "bandwidth. The centre frequency is set digit by digit below the gain controls. Press a "
+    #OLD#                                 "range button to go back to the range sweeps.")
+    #OLD#     self.btn_single.toggled.connect(self.single_on_toggled)
+    #OLD#     main_layout = self.centralWidget().layout()
+    #OLD#     placed = False
+    #OLD#     for i in range(main_layout.count()):
+    #OLD#         lay = main_layout.itemAt(i).layout()
+    #OLD#         if lay is not None and lay.indexOf(first) >= 0:
+    #OLD#             lay.insertWidget(lay.indexOf(first), self.btn_single)
+    #OLD#             placed = True
+    #OLD#             break
+    #OLD#     if not placed:
+    #OLD#         main_layout.addWidget(self.btn_single)
+    #OLD#     self.mode_buttons.append(self.btn_single)       # joins the controls that are locked during a survey / the scope
+    #OLD#     # the digit selector sits in its own row BELOW the gain row, visible only in this mode
+    #OLD#     self.single_panel = QtWidgets.QWidget()
+    #OLD#     prow = QtWidgets.QHBoxLayout(self.single_panel)
+    #OLD#     prow.setContentsMargins(0, 2, 0, 2)
+    #OLD#     lab = QtWidgets.QLabel("Centre frequency")
+    #OLD#     self.freq_selector = DigitalFreqSelector(self.single_centre_hz)
+    #OLD#     self.freq_selector.setToolTip("Click a digit (or use its arrows / the mouse wheel) to change it; with a digit selected "
+    #OLD#                                    "the Up / Down keys step it, Left / Right move along, and typing 0-9 overwrites it.")
+    #OLD#     self.freq_selector.valueChanged.connect(self.single_on_freq)
+    #OLD#     hint = QtWidgets.QLabel("(click a digit, then arrows, wheel, Up/Down or type 0-9)")
+    #OLD#     hint.setStyleSheet("QLabel { color: #9aa0a8; }")
+    #OLD#     prow.addWidget(lab)
+    #OLD#     prow.addWidget(self.freq_selector)
+    #OLD#     prow.addWidget(hint)
+    #OLD#     prow.addStretch()
+    #OLD#     pos = left_layout.count()
+    #OLD#     for i in range(left_layout.count()):
+    #OLD#         lay = left_layout.itemAt(i).layout()
+    #OLD#         if lay is not None and lay.indexOf(self.gain_slider) >= 0:
+    #OLD#             pos = i + 1                              # directly under the row that holds the gain slider
+    #OLD#             break
+    #OLD#     left_layout.insertWidget(pos, self.single_panel)
+    #OLD#     self.single_panel.setVisible(False)
 
     def single_on_toggled(self, checked):
         if checked:
@@ -3710,6 +4764,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         else:
             self.single_leave()
 
+    # ---- single_enter(): the version before the decoder was added is kept, commented out, just below the new one ----
     def single_enter(self):
         """Switch to the single-frequency test mode and start capturing at once."""
         if self._survey is not None or getattr(self, "scope_active", False) or self._stitch is not None:
@@ -3733,9 +4788,37 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.centers = np.array([float(centre)], dtype=np.float64)
         self.current_mode_label = f"Single frequency {centre / 1e6:.6f} MHz"
         self.single_panel.setVisible(True)
+        self.decoder_panel.setVisible(True)
         self.log(f"=== SINGLE FREQUENCY MODE: centre {centre / 1e6:.6f} MHz ===")
         self.update_status_panel()
         self.continuous_when_idle()
+
+    #OLD# def single_enter(self):
+    #OLD#     """Switch to the single-frequency test mode and start capturing at once."""
+    #OLD#     if self._survey is not None or getattr(self, "scope_active", False) or self._stitch is not None:
+    #OLD#         self.log("Single frequency mode is not available while a survey, the scope or a stitch check is running")
+    #OLD#         self.btn_single.blockSignals(True)
+    #OLD#         self.btn_single.setChecked(False)
+    #OLD#         self.btn_single.blockSignals(False)
+    #OLD#         return
+    #OLD#     if self.sweep_thread and self.sweep_thread.is_alive():
+    #OLD#         self.stop_flag.set()
+    #OLD#         self.sweep_thread.join(timeout=1.0)
+    #OLD#     centre = int(round(0.5 * (self.START_FREQ + self.STOP_FREQ))) if not self.single_mode else self.single_centre_hz
+    #OLD#     centre = max(self.freq_selector._min, min(self.freq_selector._max, centre))
+    #OLD#     self.single_mode = True
+    #OLD#     self.single_centre_hz = centre
+    #OLD#     self.freq_selector.setValue(centre)
+    #OLD#     with self._single_lock:
+    #OLD#         self._pending_centre = None
+    #OLD#     self.START_FREQ = self.STOP_FREQ = float(centre)
+    #OLD#     self.hf_mode = False
+    #OLD#     self.centers = np.array([float(centre)], dtype=np.float64)
+    #OLD#     self.current_mode_label = f"Single frequency {centre / 1e6:.6f} MHz"
+    #OLD#     self.single_panel.setVisible(True)
+    #OLD#     self.log(f"=== SINGLE FREQUENCY MODE: centre {centre / 1e6:.6f} MHz ===")
+    #OLD#     self.update_status_panel()
+    #OLD#     self.continuous_when_idle()
 
     def single_leave(self):
         """The mode button was switched off: go back to the last range that was selected (if any)."""
@@ -3743,17 +4826,32 @@ class EmcScanner(QtWidgets.QMainWindow):
         if self._last_preset_index is not None:
             self.set_preset_and_run(self._last_preset_index)
 
+    # ---- single_exit(): the version before the decoder was added is kept, commented out, just below the new one ----
     def single_exit(self):
         """Leave single-frequency mode (a range button was pressed, or the mode button was switched off)."""
         if not self.single_mode:
             return
         self.single_mode = False
         self.single_panel.setVisible(False)
+        self.decoder_cleanup()                           # decoder off, audio closed (the sweep thread is stopped by the caller)
+        self.decoder_panel.setVisible(False)
         self.btn_single.blockSignals(True)
         self.btn_single.setChecked(False)
         self.btn_single.blockSignals(False)
         with self._single_lock:
             self._pending_centre = None
+
+    #OLD# def single_exit(self):
+    #OLD#     """Leave single-frequency mode (a range button was pressed, or the mode button was switched off)."""
+    #OLD#     if not self.single_mode:
+    #OLD#         return
+    #OLD#     self.single_mode = False
+    #OLD#     self.single_panel.setVisible(False)
+    #OLD#     self.btn_single.blockSignals(True)
+    #OLD#     self.btn_single.setChecked(False)
+    #OLD#     self.btn_single.blockSignals(False)
+    #OLD#     with self._single_lock:
+    #OLD#         self._pending_centre = None
 
     def single_on_freq(self, hz):
         """A digit changed. While a sweep thread owns the SDR it applies the new centre itself at the start of its
@@ -3785,6 +4883,1046 @@ class EmcScanner(QtWidgets.QMainWindow):
         if hz is not None:
             self.START_FREQ = self.STOP_FREQ = float(hz)
             self.update_status_panel()
+
+    # ------------------------------------------------------------------------------------
+    # DECODER (single-frequency mode only)
+    # ------------------------------------------------------------------------------------
+    # Pick a decoder in the combo box under the centre-frequency digits:
+    #   WFM / NFM / AM audio   - demodulate the signal at the single frequency and play it on the PC speaker
+    #                            (volume + squelch controls).
+    #   OOK bursts / FSK bursts - find short data bursts (433 MHz remotes, sensors...), work out the bit rate (baud) and the
+    #                            coding (PWM, Manchester, plain NRZ) and list the data in hex, one entry per burst.
+    # While a decoder runs it OWNS the SDR (like the baseband scope): the decoder thread is self.sweep_thread, so every
+    # existing "stop the sweep first" path (mode buttons, scope, closeEvent) stops it too. It keeps the spectrum and the
+    # waterfall live from the same IQ. The RF Gain slider, Sample Rate and the centre-frequency digits all act immediately.
+    #
+    # Offset tuning (tick box, default on): the SDR is tuned Fs/8 ABOVE the wanted frequency and the signal is mixed back to
+    # zero in software, so the RTL-SDR's own DC spike (always at its tuned centre) is not sitting on the signal. The spectrum
+    # is therefore centred Fs/8 above the frequency you set; the orange dashed line marks the frequency being decoded.
+
+    DEC_MODES = [("Off", None),
+                 ("WFM audio (broadcast FM)", "WFM"),
+                 ("NFM audio (marine VHF / PMR)", "NFM"),
+                 ("AM audio", "AM"),
+                 ("OOK bursts (433 MHz remotes)", "OOK"),
+                 ("FSK bursts", "FSK")]
+
+    # ---- decoder_build_ui(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_build_ui(self, left_layout):
+        self.dec_active = False
+        self.dec_mode = None
+        self.dec_volume = 0.5
+        self.dec_squelch_db = -80.0
+        self.dec_burst_sens = 6.0
+        self.dec_offset_tune = True
+        self.dec_lite = True                       # audio modes: slower spectrum / waterfall refresh so the GUI never starves the SDR reads
+        self.dec_strip_sync = True                 # PWM remotes: the pulse just before the sync gap is the sync pulse, not a data bit
+        self.dec_reset_profile = False
+        self.dec_burst_bw = 200.0                  # OOK channel half-width in kHz: cheap transmitters drift and chirp, so it is wide
+        self.dec_dump_request = False
+        self._dec_session = 0
+        self._dec_out = None                       # (name kept from version 1) = the audio sink object that lives in its own thread
+        self._dec_thread = None
+        self._dec_entries = []                     # burst list entries; repeats of the same code are merged into one entry
+        self._dec_hinted = False
+        self.dec_signals = DecoderSignals()
+        # audio is NOT connected here: decoder_audio_open() connects it straight to the audio thread (the GUI thread is bypassed)
+        self.dec_signals.burst.connect(self.decoder_on_burst)
+        self.dec_signals.marker.connect(self.decoder_on_marker)
+        self.dec_signals.stopped.connect(self.decoder_on_thread_stopped)
+
+        self.decoder_panel = QtWidgets.QWidget()
+        vbox = QtWidgets.QVBoxLayout(self.decoder_panel)
+        vbox.setContentsMargins(0, 2, 0, 2)
+        vbox.setSpacing(2)
+
+        # ---- row 1: decoder choice + audio controls ----
+        r1 = QtWidgets.QHBoxLayout()
+        vbox.addLayout(r1)
+        r1.addWidget(QtWidgets.QLabel("Decoder"))
+        self.dec_combo = QtWidgets.QComboBox()
+        for label, _m in self.DEC_MODES:
+            self.dec_combo.addItem(label)
+        self.dec_combo.setToolTip("Decode the signal at the single frequency.\n"
+                                  "WFM / NFM / AM: play the demodulated audio on the PC speaker.\n"
+                                  "OOK / FSK bursts: find data bursts (e.g. 433 MHz remote controls) and list baud rate, coding and data in hex.\n"
+                                  "Off: back to the normal single-frequency spectrum.")
+        self.dec_combo.currentIndexChanged.connect(self.decoder_on_mode)
+        r1.addWidget(self.dec_combo)
+
+        self.dec_audio_widgets = []
+        lab = QtWidgets.QLabel("Volume")
+        self.dec_vol_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.dec_vol_slider.setRange(0, 100)
+        self.dec_vol_slider.setValue(int(round(self.dec_volume * 100)))
+        self.dec_vol_slider.setFixedWidth(90)
+        self.dec_vol_slider.valueChanged.connect(lambda v: setattr(self, "dec_volume", v / 100.0))
+        lab2 = QtWidgets.QLabel("Squelch")
+        self.dec_sq_spin = QtWidgets.QSpinBox()
+        self.dec_sq_spin.setRange(-80, 0)
+        self.dec_sq_spin.setValue(-80)
+        self.dec_sq_spin.setSuffix(" dBFS")
+        self.dec_sq_spin.setSpecialValueText("Off")
+        self.dec_sq_spin.setToolTip("Audio is muted while the signal level in the channel (shown in the status line) is below this.\n"
+                                    "Off = never muted (noise is loud on an empty channel!). Set it a few dB above the level you see with no signal.")
+        self.dec_sq_spin.valueChanged.connect(lambda v: setattr(self, "dec_squelch_db", float(v)))
+        self.dec_chk_lite = QtWidgets.QCheckBox("Light display")
+        self.dec_chk_lite.setChecked(True)
+        self.dec_chk_lite.setToolTip("While listening, redraw the spectrum about 3 times a second and the waterfall about every 0.6 s (instead of 8 times\n"
+                                     "a second). The graph redraws are the heaviest thing the program does; when they take too long the SDR is not read\n"
+                                     "in time and the audio breaks up. Untick for a smoother display if your PC copes.")
+        self.dec_chk_lite.toggled.connect(lambda c: setattr(self, "dec_lite", bool(c)))
+        for w in (lab, self.dec_vol_slider, lab2, self.dec_sq_spin, self.dec_chk_lite):
+            r1.addWidget(w)
+            self.dec_audio_widgets.append(w)
+
+        self.dec_burst_widgets = []
+        lab3 = QtWidgets.QLabel("Burst threshold")
+        self.dec_sens_spin = QtWidgets.QDoubleSpinBox()
+        self.dec_sens_spin.setRange(2.0, 40.0)
+        self.dec_sens_spin.setDecimals(1)
+        self.dec_sens_spin.setSingleStep(0.5)
+        self.dec_sens_spin.setValue(self.dec_burst_sens)
+        self.dec_sens_spin.setSuffix(" x noise")
+        self.dec_sens_spin.setToolTip("A burst starts when the signal amplitude exceeds the measured noise floor by this factor\n"
+                                      "(6 = about 16 dB). Lower it for weak remotes; raise it if noise triggers false bursts.")
+        self.dec_sens_spin.valueChanged.connect(lambda v: setattr(self, "dec_burst_sens", float(v)))
+        lab_bw = QtWidgets.QLabel("Channel \u00b1")
+        self.dec_bw_spin = QtWidgets.QSpinBox()
+        self.dec_bw_spin.setRange(25, 450)
+        self.dec_bw_spin.setSingleStep(25)
+        self.dec_bw_spin.setValue(int(self.dec_burst_bw))
+        self.dec_bw_spin.setSuffix(" kHz")
+        self.dec_bw_spin.setToolTip("OOK decoder channel width either side of the marked frequency. Cheap remotes drift in frequency and their\n"
+                                    "amplitude sags during a frame, so a narrow channel loses the end of each frame. Wider = more tolerant of\n"
+                                    "drift but a little more noise (and other signals nearby can interfere). 200 kHz is a good start.")
+        self.dec_bw_spin.valueChanged.connect(lambda v: setattr(self, "dec_burst_bw", float(v)))
+        btn_dump = QtWidgets.QPushButton("Dump")
+        btn_dump.setToolTip("Print the raw pulse table (high/low widths in us, one line per frame) of the last OOK transmission into the list.\n"
+                            "Useful to see exactly what the remote is sending when a code will not decode cleanly.")
+        btn_dump.clicked.connect(lambda: setattr(self, "dec_dump_request", True))
+        self.dec_chk_sync = QtWidgets.QCheckBox("Strip sync pulse")
+        self.dec_chk_sync.setChecked(True)
+        self.dec_chk_sync.setToolTip("PWM remotes (EV1527 / PT2262 style) send a short sync pulse followed by a long gap before each frame.\n"
+                                     "That pulse is not part of the code, so it is left out. If your code comes out one bit LONGER than the\n"
+                                     "remote's real length, leave this ticked; if it is one bit SHORT, untick it.")
+        self.dec_chk_sync.toggled.connect(lambda c: setattr(self, "dec_strip_sync", bool(c)))
+        btn_clear = QtWidgets.QPushButton("Clear")
+        btn_clear.setToolTip("Clear the list AND forget the learned timing (use when you change to a different remote).")
+        btn_clear.clicked.connect(self.decoder_clear_list)
+        btn_copy = QtWidgets.QPushButton("Copy")
+        btn_copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.dec_log.toPlainText()))
+        for w in (lab3, self.dec_sens_spin, lab_bw, self.dec_bw_spin, self.dec_chk_sync, btn_dump, btn_clear, btn_copy):
+            r1.addWidget(w)
+            self.dec_burst_widgets.append(w)
+
+        self.dec_chk_offset = QtWidgets.QCheckBox("Offset tune")
+        self.dec_chk_offset.setChecked(True)
+        self.dec_chk_offset.setToolTip("Tune the SDR Fs/8 above the wanted frequency and mix back in software, so the tuner's DC spike\n"
+                                       "is not on top of the signal. The spectrum is then centred Fs/8 above the frequency you set\n"
+                                       "(the orange dashed line marks the frequency being decoded). Untick to tune exactly on it.")
+        self.dec_chk_offset.toggled.connect(lambda c: setattr(self, "dec_offset_tune", bool(c)))
+        r1.addWidget(self.dec_chk_offset)
+        r1.addStretch(1)
+
+        # ---- row 2: status line, and (burst modes) the list of decoded bursts ----
+        self.dec_status = QtWidgets.QLabel("")
+        self.dec_status.setFont(QtGui.QFont("Consolas", 9))
+        self.dec_status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.dec_status.setMinimumWidth(0)
+        vbox.addWidget(self.dec_status)
+        self.dec_signals.status.connect(self.dec_status.setText)
+        self.dec_log = QtWidgets.QPlainTextEdit()
+        self.dec_log.setReadOnly(True)
+        self.dec_log.setFont(QtGui.QFont("Consolas", 9))
+        self.dec_log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.dec_log.setFixedHeight(8 * self.dec_log.fontMetrics().lineSpacing() + 10)
+        vbox.addWidget(self.dec_log)
+
+        # marker for the frequency being decoded on the spectrum
+        self._dec_line = pg.InfiniteLine(pos=0, angle=90, movable=False,
+                                         pen=pg.mkPen("#e08a00", width=1, style=QtCore.Qt.DashLine))
+        self.plot.addItem(self._dec_line, ignoreBounds=True)
+        self._dec_line.setVisible(False)
+
+        pos = left_layout.indexOf(self.single_panel)
+        left_layout.insertWidget(pos + 1 if pos >= 0 else left_layout.count(), self.decoder_panel)
+        self.decoder_panel.setVisible(False)
+        self.decoder_show_controls()
+
+    #OLD# def decoder_build_ui(self, left_layout):
+    #OLD#     self.dec_active = False
+    #OLD#     self.dec_mode = None
+    #OLD#     self.dec_volume = 0.5
+    #OLD#     self.dec_squelch_db = -80.0
+    #OLD#     self.dec_burst_sens = 6.0
+    #OLD#     self.dec_offset_tune = True
+    #OLD#     self._dec_session = 0
+    #OLD#     self._dec_out = None
+    #OLD#     self._dec_dev = None
+    #OLD#     self._dec_channels = 1
+    #OLD#     self._dec_prebuf = bytearray()
+    #OLD#     self._dec_primed = False
+    #OLD#     self._dec_prime_bytes = 0
+    #OLD#     self._dec_dropped = 0
+    #OLD#     self._dec_last_hex = None
+    #OLD#     self._dec_last_t = 0.0
+    #OLD#     self.dec_signals = DecoderSignals()
+    #OLD#     self.dec_signals.audio.connect(self.decoder_on_audio)
+    #OLD#     self.dec_signals.burst.connect(self.decoder_on_burst)
+    #OLD#     self.dec_signals.marker.connect(self.decoder_on_marker)
+    #OLD#     self.dec_signals.stopped.connect(self.decoder_on_thread_stopped)
+    #OLD#
+    #OLD#     self.decoder_panel = QtWidgets.QWidget()
+    #OLD#     vbox = QtWidgets.QVBoxLayout(self.decoder_panel)
+    #OLD#     vbox.setContentsMargins(0, 2, 0, 2)
+    #OLD#     vbox.setSpacing(2)
+    #OLD#
+    #OLD#     # ---- row 1: decoder choice + audio controls ----
+    #OLD#     r1 = QtWidgets.QHBoxLayout()
+    #OLD#     vbox.addLayout(r1)
+    #OLD#     r1.addWidget(QtWidgets.QLabel("Decoder"))
+    #OLD#     self.dec_combo = QtWidgets.QComboBox()
+    #OLD#     for label, _m in self.DEC_MODES:
+    #OLD#         self.dec_combo.addItem(label)
+    #OLD#     self.dec_combo.setToolTip("Decode the signal at the single frequency.\n"
+    #OLD#                               "WFM / NFM / AM: play the demodulated audio on the PC speaker.\n"
+    #OLD#                               "OOK / FSK bursts: find data bursts (e.g. 433 MHz remote controls) and list baud rate, coding and data in hex.\n"
+    #OLD#                               "Off: back to the normal single-frequency spectrum.")
+    #OLD#     self.dec_combo.currentIndexChanged.connect(self.decoder_on_mode)
+    #OLD#     r1.addWidget(self.dec_combo)
+    #OLD#
+    #OLD#     self.dec_audio_widgets = []
+    #OLD#     lab = QtWidgets.QLabel("Volume")
+    #OLD#     self.dec_vol_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+    #OLD#     self.dec_vol_slider.setRange(0, 100)
+    #OLD#     self.dec_vol_slider.setValue(int(round(self.dec_volume * 100)))
+    #OLD#     self.dec_vol_slider.setFixedWidth(90)
+    #OLD#     self.dec_vol_slider.valueChanged.connect(lambda v: setattr(self, "dec_volume", v / 100.0))
+    #OLD#     lab2 = QtWidgets.QLabel("Squelch")
+    #OLD#     self.dec_sq_spin = QtWidgets.QSpinBox()
+    #OLD#     self.dec_sq_spin.setRange(-80, 0)
+    #OLD#     self.dec_sq_spin.setValue(-80)
+    #OLD#     self.dec_sq_spin.setSuffix(" dBFS")
+    #OLD#     self.dec_sq_spin.setSpecialValueText("Off")
+    #OLD#     self.dec_sq_spin.setToolTip("Audio is muted while the signal level in the channel (shown in the status line) is below this.\n"
+    #OLD#                                 "Off = never muted (noise is loud on an empty channel!). Set it a few dB above the level you see with no signal.")
+    #OLD#     self.dec_sq_spin.valueChanged.connect(lambda v: setattr(self, "dec_squelch_db", float(v)))
+    #OLD#     for w in (lab, self.dec_vol_slider, lab2, self.dec_sq_spin):
+    #OLD#         r1.addWidget(w)
+    #OLD#         self.dec_audio_widgets.append(w)
+    #OLD#
+    #OLD#     self.dec_burst_widgets = []
+    #OLD#     lab3 = QtWidgets.QLabel("Burst threshold")
+    #OLD#     self.dec_sens_spin = QtWidgets.QDoubleSpinBox()
+    #OLD#     self.dec_sens_spin.setRange(2.0, 40.0)
+    #OLD#     self.dec_sens_spin.setDecimals(1)
+    #OLD#     self.dec_sens_spin.setSingleStep(0.5)
+    #OLD#     self.dec_sens_spin.setValue(self.dec_burst_sens)
+    #OLD#     self.dec_sens_spin.setSuffix(" x noise")
+    #OLD#     self.dec_sens_spin.setToolTip("A burst starts when the signal amplitude exceeds the measured noise floor by this factor\n"
+    #OLD#                                   "(6 = about 16 dB). Lower it for weak remotes; raise it if noise triggers false bursts.")
+    #OLD#     self.dec_sens_spin.valueChanged.connect(lambda v: setattr(self, "dec_burst_sens", float(v)))
+    #OLD#     btn_clear = QtWidgets.QPushButton("Clear")
+    #OLD#     btn_clear.clicked.connect(lambda: self.dec_log.clear())
+    #OLD#     btn_copy = QtWidgets.QPushButton("Copy")
+    #OLD#     btn_copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.dec_log.toPlainText()))
+    #OLD#     for w in (lab3, self.dec_sens_spin, btn_clear, btn_copy):
+    #OLD#         r1.addWidget(w)
+    #OLD#         self.dec_burst_widgets.append(w)
+    #OLD#
+    #OLD#     self.dec_chk_offset = QtWidgets.QCheckBox("Offset tune")
+    #OLD#     self.dec_chk_offset.setChecked(True)
+    #OLD#     self.dec_chk_offset.setToolTip("Tune the SDR Fs/8 above the wanted frequency and mix back in software, so the tuner's DC spike\n"
+    #OLD#                                    "is not on top of the signal. The spectrum is then centred Fs/8 above the frequency you set\n"
+    #OLD#                                    "(the orange dashed line marks the frequency being decoded). Untick to tune exactly on it.")
+    #OLD#     self.dec_chk_offset.toggled.connect(lambda c: setattr(self, "dec_offset_tune", bool(c)))
+    #OLD#     r1.addWidget(self.dec_chk_offset)
+    #OLD#     r1.addStretch(1)
+    #OLD#
+    #OLD#     # ---- row 2: status line, and (burst modes) the list of decoded bursts ----
+    #OLD#     self.dec_status = QtWidgets.QLabel("")
+    #OLD#     self.dec_status.setFont(QtGui.QFont("Consolas", 9))
+    #OLD#     self.dec_status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+    #OLD#     self.dec_status.setMinimumWidth(0)
+    #OLD#     vbox.addWidget(self.dec_status)
+    #OLD#     self.dec_signals.status.connect(self.dec_status.setText)
+    #OLD#     self.dec_log = QtWidgets.QPlainTextEdit()
+    #OLD#     self.dec_log.setReadOnly(True)
+    #OLD#     self.dec_log.setFont(QtGui.QFont("Consolas", 9))
+    #OLD#     self.dec_log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+    #OLD#     self.dec_log.setMaximumBlockCount(1000)
+    #OLD#     self.dec_log.setFixedHeight(8 * self.dec_log.fontMetrics().lineSpacing() + 10)
+    #OLD#     vbox.addWidget(self.dec_log)
+    #OLD#
+    #OLD#     # marker for the frequency being decoded on the spectrum
+    #OLD#     self._dec_line = pg.InfiniteLine(pos=0, angle=90, movable=False,
+    #OLD#                                      pen=pg.mkPen("#e08a00", width=1, style=QtCore.Qt.DashLine))
+    #OLD#     self.plot.addItem(self._dec_line, ignoreBounds=True)
+    #OLD#     self._dec_line.setVisible(False)
+    #OLD#
+    #OLD#     pos = left_layout.indexOf(self.single_panel)
+    #OLD#     left_layout.insertWidget(pos + 1 if pos >= 0 else left_layout.count(), self.decoder_panel)
+    #OLD#     self.decoder_panel.setVisible(False)
+    #OLD#     self.decoder_show_controls()
+
+    def decoder_show_controls(self):
+        """Show only the controls that belong to the selected decoder."""
+        audio = self.dec_mode in ("WFM", "NFM", "AM")
+        burst = self.dec_mode in ("OOK", "FSK")
+        for w in self.dec_audio_widgets:
+            w.setVisible(audio)
+        for w in self.dec_burst_widgets:
+            w.setVisible(burst)
+        self.dec_chk_offset.setVisible(audio or burst)
+        self.dec_log.setVisible(burst)
+        self.dec_status.setVisible(audio or burst)
+
+    # ---- front-panel events (GUI thread) ----
+
+    def decoder_on_mode(self, index):
+        mode = self.DEC_MODES[index][1]
+        if mode is None:
+            self.decoder_stop(resume=True)
+            return
+        if not getattr(self, "single_mode", False):
+            self.log("Decoder: select Single Frequency mode first")
+            self.decoder_reset_combo()
+            return
+        if mode in ("WFM", "NFM", "AM") and QtMultimedia is None:
+            self.log("Decoder: audio is not available (PyQt5.QtMultimedia could not be imported) - burst decoding still works")
+            self.decoder_reset_combo()
+            return
+        self.dec_mode = mode
+        self.decoder_show_controls()
+        if self.dec_active:
+            # only the type of decoder changed: the running thread rebuilds its demodulator; just open / close the audio device
+            if mode in ("WFM", "NFM", "AM"):
+                if self._dec_out is None:
+                    self.decoder_audio_open()
+            else:
+                self.decoder_audio_close()
+            self.log(f"Decoder: {mode}")
+            return
+        self.decoder_start()
+
+    def decoder_reset_combo(self):
+        self.dec_combo.blockSignals(True)
+        self.dec_combo.setCurrentIndex(0)
+        self.dec_combo.blockSignals(False)
+
+    def decoder_set_lock(self, locked):
+        """While the decoder owns the SDR, the buttons that would start a sweep or the scope are disabled."""
+        for name in ("btn_start", "btn_cont", "btn_survey", "btn_scope"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setEnabled(not locked)
+
+    def decoder_start(self):
+        if self._survey is not None or getattr(self, "scope_active", False) or self._stitch is not None:
+            self.log("Decoder: not available while a survey, the scope or a stitch check is running")
+            self.decoder_reset_combo()
+            self.dec_mode = None
+            self.decoder_show_controls()
+            return
+        # stop the single-frequency sweep first so two threads never share the SDR
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            self.stop_flag.set()
+            self.sweep_thread.join(timeout=3.0)
+            if self.sweep_thread.is_alive():
+                self.log("Decoder: ERROR - the sweep thread did not stop; try again")
+                self.decoder_reset_combo()
+                self.dec_mode = None
+                self.decoder_show_controls()
+                return
+        self.stop_flag.clear()
+        try:
+            self.init_sdr()
+        except Exception as e:
+            self.log(f"Decoder: error opening the SDR: {e}")
+            self.decoder_reset_combo()
+            self.dec_mode = None
+            self.decoder_show_controls()
+            return
+        with self._single_lock:
+            self._pending_centre = None
+        self.START_FREQ = self.STOP_FREQ = float(self.single_centre_hz)
+        if self.dec_mode in ("WFM", "NFM", "AM"):
+            self.decoder_audio_open()
+        self._dec_session += 1
+        self.dec_active = True
+        self.decoder_set_lock(True)
+        self._dec_line.setVisible(True)
+        self.decoder_show_controls()
+        self.log(f"=== DECODER {self.dec_mode} at {self.START_FREQ / 1e6:.6f} MHz ===")
+        self.sweep_thread = threading.Thread(target=self.decoder_main, args=(self._dec_session,), daemon=True)
+        self.sweep_thread.start()
+
+    def decoder_stop(self, resume=True):
+        """Decoder switched off from the combo box: stop its thread, then resume the normal single-frequency spectrum."""
+        was = self.dec_active
+        self.decoder_cleanup()
+        self.stop_flag.set()
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            self.sweep_thread.join(timeout=3.0)
+        if was:
+            self.log("=== DECODER STOPPED ===")
+        if resume and was and getattr(self, "single_mode", False):
+            self.continuous_when_idle()
+
+    def decoder_cleanup(self):
+        """Idempotent: everything on the GUI side that has to be put back when the decoder is no longer running."""
+        self.dec_active = False
+        self.dec_mode = None
+        self.decoder_audio_close()
+        self.decoder_set_lock(False)
+        self.decoder_reset_combo()
+        self.decoder_show_controls()
+        try:
+            self._dec_line.setVisible(False)
+        except Exception:
+            pass
+        self.dec_status.setText("")
+
+    def decoder_on_thread_stopped(self, session):
+        """The decoder thread ended. If something else stopped it (a mode button, a read failure...) tidy the front panel up."""
+        if session == self._dec_session and self.dec_active:
+            self.decoder_cleanup()
+            self.log("=== DECODER STOPPED ===")
+
+    def decoder_on_marker(self, hz):
+        try:
+            self._dec_line.setValue(float(hz))
+        except Exception:
+            pass
+
+    # ---- audio output (GUI thread) ----
+
+    # ---- decoder_audio_open(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_audio_open(self):
+        """Open the sound device in its OWN thread. Everything that touches the sound card (queueing, pre-buffering, writing) happens
+        there, so a GUI redraw that takes 100 ms can no longer starve it. The decoder thread feeds it through a queued signal."""
+        if QtMultimedia is None:
+            return False
+        self.decoder_audio_close()
+        th = QtCore.QThread(self)
+        sink = DecoderAudioSink()
+        sink.moveToThread(th)
+        th.start()
+        QtCore.QMetaObject.invokeMethod(sink, "open", QtCore.Qt.BlockingQueuedConnection)
+        if not sink.ok:
+            self.log(f"Decoder: no sound - {sink.error}")
+            th.quit()
+            th.wait(2000)
+            return False
+        self._dec_thread = th
+        self._dec_out = sink
+        self.dec_signals.audio.connect(sink.push)
+        self.log(f"Decoder audio: {sink.name} (own audio thread, {int(DECODER_AUDIO_CUSHION_S * 1000)} ms cushion)")
+        return True
+
+    #OLD# def decoder_audio_open(self):
+    #OLD#     if QtMultimedia is None:
+    #OLD#         return False
+    #OLD#     self.decoder_audio_close()
+    #OLD#     info = QtMultimedia.QAudioDeviceInfo.defaultOutputDevice()
+    #OLD#     fmt = None
+    #OLD#     for ch in (1, 2):
+    #OLD#         f = QtMultimedia.QAudioFormat()
+    #OLD#         f.setSampleRate(AudioDemod.AUDIO_RATE)
+    #OLD#         f.setChannelCount(ch)
+    #OLD#         f.setSampleSize(16)
+    #OLD#         f.setCodec("audio/pcm")
+    #OLD#         f.setByteOrder(QtMultimedia.QAudioFormat.LittleEndian)
+    #OLD#         f.setSampleType(QtMultimedia.QAudioFormat.SignedInt)
+    #OLD#         if info.isFormatSupported(f):
+    #OLD#             fmt = f
+    #OLD#             self._dec_channels = ch
+    #OLD#             break
+    #OLD#     if fmt is None:
+    #OLD#         self.log("Decoder: the default audio output does not accept 48 kHz 16-bit audio - no sound")
+    #OLD#         return False
+    #OLD#     out = QtMultimedia.QAudioOutput(info, fmt, self)
+    #OLD#     out.setBufferSize(int(AudioDemod.AUDIO_RATE * 2 * self._dec_channels * 0.5))
+    #OLD#     self._dec_dev = out.start()
+    #OLD#     self._dec_out = out
+    #OLD#     self._dec_prime_bytes = int(AudioDemod.AUDIO_RATE * 2 * self._dec_channels * 0.15)    # 150 ms pre-buffer
+    #OLD#     self._dec_prebuf = bytearray()
+    #OLD#     self._dec_primed = False
+    #OLD#     self._dec_dropped = 0
+    #OLD#     self.log(f"Decoder audio: {info.deviceName()}")
+    #OLD#     return True
+
+    # ---- decoder_audio_close(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_audio_close(self):
+        sink = getattr(self, "_dec_out", None)
+        th = getattr(self, "_dec_thread", None)
+        self._dec_out = None
+        self._dec_thread = None
+        if sink is None:
+            return
+        try:
+            self.dec_signals.audio.disconnect(sink.push)
+        except Exception:
+            pass
+        try:
+            if th is not None and th.isRunning():
+                QtCore.QMetaObject.invokeMethod(sink, "close", QtCore.Qt.BlockingQueuedConnection)
+                th.quit()
+                th.wait(2000)
+        except Exception:
+            pass
+
+    #OLD# def decoder_audio_close(self):
+    #OLD#     out = getattr(self, "_dec_out", None)
+    #OLD#     self._dec_out = None
+    #OLD#     self._dec_dev = None
+    #OLD#     self._dec_primed = False
+    #OLD#     self._dec_prebuf = bytearray()
+    #OLD#     if out is not None:
+    #OLD#         try:
+    #OLD#             out.stop()
+    #OLD#             out.deleteLater()
+    #OLD#         except Exception:
+    #OLD#             pass
+
+    # ---- decoder_on_audio(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_on_audio(self, data):
+        pass                                       # audio no longer passes through the GUI thread - see decoder_audio_open()
+
+    # ---- burst list (GUI thread) ----
+
+    #OLD# def decoder_on_audio(self, data):
+    #OLD#     """GUI thread: queue 48 kHz mono int16 into the sound device. 150 ms is collected before playing starts (and again after an
+    #OLD#     under-run); if the device is full the chunk is dropped, which only happens if the sound card clock runs slower than the SDR's."""
+    #OLD#     out, dev = self._dec_out, self._dec_dev
+    #OLD#     if out is None or dev is None:
+    #OLD#         return
+    #OLD#     if self._dec_channels == 2:
+    #OLD#         data = np.repeat(np.frombuffer(data, dtype=np.int16), 2).tobytes()
+    #OLD#     if self._dec_primed and out.state() == QtMultimedia.QAudio.IdleState:
+    #OLD#         self._dec_primed = False                              # under-run: build the cushion up again
+    #OLD#         self._dec_prebuf = bytearray()
+    #OLD#     if not self._dec_primed:
+    #OLD#         self._dec_prebuf += data
+    #OLD#         if len(self._dec_prebuf) >= self._dec_prime_bytes:
+    #OLD#             n = min(out.bytesFree(), len(self._dec_prebuf))
+    #OLD#             dev.write(bytes(self._dec_prebuf[:n]))
+    #OLD#             self._dec_prebuf = bytearray()
+    #OLD#             self._dec_primed = True
+    #OLD#         return
+    #OLD#     if out.bytesFree() >= len(data):
+    #OLD#         dev.write(data)
+    #OLD#     else:
+    #OLD#         self._dec_dropped += 1
+    #OLD#
+    #OLD# # ---- burst list (GUI thread) ----
+
+    # ---- decoder_on_burst(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_on_burst(self, r):
+        import datetime
+        now = time.time()
+        if r.get("dump_text"):
+            self._dec_entries.append({"text": r["dump_text"], "r": {"mode": r.get("mode", "")}, "ts": "", "n": 1,
+                                      "t_first": now, "t_last": now, "agree": 0, "frames": 0})
+            self.decoder_render_log()
+            return
+        hx = r.get("hex") or ""
+        last = self._dec_entries[-1] if self._dec_entries else None
+        if (last is not None and hx and last["r"].get("hex") == hx and last["r"]["mode"] == r["mode"]
+                and now - last["t_last"] < 3.0):
+            # the same code again (a held button repeats it): one list entry, with a count
+            last["n"] += 1
+            last["t_last"] = now
+            if r.get("frames") is not None:
+                last["agree"] += r.get("agree", 0)
+                last["frames"] += r.get("frames", 0)
+        else:
+            ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self._dec_entries.append({"r": r, "ts": ts, "n": 1, "t_first": now, "t_last": now,
+                                      "agree": r.get("agree", 0), "frames": r.get("frames", 0)})
+            del self._dec_entries[:-300]
+        self.decoder_render_log()
+
+    #OLD# def decoder_on_burst(self, r):
+    #OLD#     import datetime
+    #OLD#     now = time.time()
+    #OLD#     hx = r.get("hex") or ""
+    #OLD#     repeat = bool(hx) and hx == self._dec_last_hex and (now - self._dec_last_t) < 1.5
+    #OLD#     self._dec_last_hex, self._dec_last_t = hx, now
+    #OLD#     ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    #OLD#     if r.get("baud") and r.get("nbits"):
+    #OLD#         line = f"{ts}  {r['mode']}  {r['dur_ms']:6.1f} ms  {r['baud']:7.0f} baud  {r['nbits']:3d} bits  {hx}"
+    #OLD#         if r.get("dev_khz") is not None:
+    #OLD#             line += f"   dev +/-{r['dev_khz']:.1f} kHz"
+    #OLD#         if repeat:
+    #OLD#             line += "   (repeat)"
+    #OLD#         extra = f"          {r['coding']}"
+    #OLD#         if r.get("notes"):
+    #OLD#             extra += f";  {r['notes']}"
+    #OLD#         if r.get("hex_alt"):
+    #OLD#             extra += f";  alt: {r['hex_alt']}"
+    #OLD#         self.dec_log.appendPlainText(line)
+    #OLD#         self.dec_log.appendPlainText(extra)
+    #OLD#     else:
+    #OLD#         w = ", ".join(f"{c:.0f}" for c in r.get("centres_us", [])[:6])
+    #OLD#         self.dec_log.appendPlainText(f"{ts}  {r['mode']}  {r['dur_ms']:6.1f} ms  no regular coding found "
+    #OLD#                                      f"({r.get('runs', 0)} runs, widths about {w} us)")
+    #OLD#
+    #OLD# # ---- the decoder thread ----
+
+    # ---- decoder_main(): version 2. The version 1 code is kept, commented out, just below ----
+    def decoder_clear_list(self):
+        self._dec_entries = []
+        self.dec_log.clear()
+        self.dec_reset_profile = True              # the decoder thread forgets the learned timing at its next block
+
+    @staticmethod
+    def _dec_entry_lines(e):
+        if e.get("text"):
+            return e["text"].split("\n")
+        r = e["r"]
+        hx = r.get("hex") or ""
+        if r.get("baud") and r.get("nbits"):
+            line = f"{e['ts']}  {r['mode']}  {r['baud']:6.0f} baud  {r['nbits']:3d} bits  {hx}"
+            if r.get("frames") is not None:
+                line += f"   {e['agree']}/{e['frames']} frames agree"
+            else:
+                line += f"   {r['dur_ms']:.1f} ms"
+            if r.get("dev_khz") is not None:
+                line += f"   dev +/-{r['dev_khz']:.1f} kHz"
+            if e["n"] > 1:
+                line += f"   (x{e['n']} over {e['t_last'] - e['t_first']:.1f} s)"
+            parts = []
+            if r.get("bin"):
+                b = r["bin"]
+                parts.append("bin " + " ".join(b[i:i + 4] for i in range(0, len(b), 4)))
+            if "?" in (r.get("bin") or ""):
+                parts.append("? = bit the frames disagree on")
+            parts.append(r["coding"])
+            if r.get("notes"):
+                parts.append(r["notes"])
+            if r.get("hex_alt"):
+                parts.append(f"alt: {r['hex_alt']}")
+            if r.get("locked"):
+                parts.append("timing locked from earlier press")
+            return [line, "          " + ";  ".join(parts)]
+        w = ", ".join(f"{c:.0f}" for c in r.get("centres_us", [])[:6])
+        return [f"{e['ts']}  {r['mode']}  {r.get('dur_ms', 0):6.1f} ms  no regular coding found "
+                f"({r.get('runs', 0)} runs, widths about {w} us)"]
+
+    def decoder_render_log(self):
+        lines = []
+        for e in self._dec_entries:
+            lines.extend(self._dec_entry_lines(e))
+        sb = self.dec_log.verticalScrollBar()
+        at_end = sb.value() >= sb.maximum() - 2
+        self.dec_log.setPlainText("\n".join(lines))
+        if at_end:
+            sb.setValue(sb.maximum())
+
+    # ---- the decoder thread ----
+
+    def decoder_main(self, session):
+        """Worker thread entry: settle the radio, then run the decoder loop. Always stops the async stream and reports back."""
+        try:
+            rate = float(self.SAMPLE_RATE)
+            off = rate / DECODER_OFFSET_DIVISOR if self.dec_offset_tune else 0.0
+            try:
+                self.settle_radio(float(self.START_FREQ) + off)
+            except Exception as e:
+                print(f"decoder_main: settle_radio failed: {e!r}")
+            self.decoder_loop(session)
+        except Exception as e:
+            import traceback
+            print(f"decoder_main: unhandled error {e!r}")
+            traceback.print_exc()
+        finally:
+            st = getattr(self, "_dec_stream", None)
+            self._dec_stream = None
+            if st is not None:
+                st.stop()                                  # the sweep / scope threads that may follow use synchronous reads
+            self.dec_signals.stopped.emit(session)
+
+    #OLD# def decoder_main(self, session):
+    #OLD#     """Worker thread entry: settle the radio, then run the decoder loop. Always reports back when it ends."""
+    #OLD#     try:
+    #OLD#         rate = float(self.SAMPLE_RATE)
+    #OLD#         off = rate / DECODER_OFFSET_DIVISOR if self.dec_offset_tune else 0.0
+    #OLD#         try:
+    #OLD#             self.settle_radio(float(self.START_FREQ) + off)
+    #OLD#         except Exception as e:
+    #OLD#             print(f"decoder_main: settle_radio failed: {e!r}")
+    #OLD#         self.decoder_loop(session)
+    #OLD#     except Exception as e:
+    #OLD#         import traceback
+    #OLD#         print(f"decoder_main: unhandled error {e!r}")
+    #OLD#         traceback.print_exc()
+    #OLD#     finally:
+    #OLD#         self.dec_signals.stopped.emit(session)
+    #OLD#
+    #OLD# # ---- decoder_loop(): version 2. The version 1 code is kept, commented out, just below ----
+
+    def decoder_loop(self, session):
+        sig = self.dec_signals
+        window = np.hanning(NFFT).astype(np.float32)
+        applied_tune = None
+        need_settle = False
+        cur_mode = None
+        demod = None
+        burst = None
+        phase = 0.0
+        view_key = None
+        marker_sent = None
+        acc = None                  # spectrum accumulated since the last display update
+        acc_n = 0
+        wf_blocks = []              # waterfall frames (dB) since the last waterfall update
+        t_ui = 0.0
+        t_wf = 0.0
+        lvl_db = -120.0
+        sq_open = True
+        n_bursts = 0
+        errors = 0
+        stream = None
+        use_async = bool(DECODER_USE_ASYNC) and self.sdr is not None and hasattr(self.sdr, "read_bytes_async")
+        if use_async:
+            self.log("Decoder capture: asynchronous, gap-free (SdrStreamer)")
+        else:
+            self.log("Decoder capture: SYNCHRONOUS reads - samples arriving between reads are LOST (warble, truncated key frames). "
+                     "pyrtlsdr_local has no read_bytes_async, or DECODER_USE_ASYNC is False")
+        while (not self.stop_flag.is_set()) and self.dec_active and session == self._dec_session:
+            try:
+                if self.sdr is None:
+                    break
+                self._restart_pass = False                 # set by the sample-rate combo; meaningless here
+                self.single_apply_pending()                # a new centre chosen on the front panel
+                if getattr(self, "_applied_sample_rate", None) != self.SAMPLE_RATE:
+                    print(f"decoder_loop: applying sample-rate change -> {self.SAMPLE_RATE / 1e6:.3f} MS/s")
+                    if stream is not None:                 # a new sample rate always restarts the stream
+                        stream.stop()
+                        stream = None
+                    self.sdr.sample_rate = self.SAMPLE_RATE
+                    self._applied_sample_rate = self.SAMPLE_RATE
+                    need_settle = True
+                    cur_mode = None
+                if stream is not None and not DECODER_LIVE_RETUNE and self._applied_gain_db != self.gain_db:
+                    stream.stop()
+                    stream = None
+                self.apply_gain_if_changed()               # live RF Gain slider
+                rate = float(self._applied_sample_rate)
+                centre = float(self.START_FREQ)
+                off = rate / DECODER_OFFSET_DIVISOR if self.dec_offset_tune else 0.0
+                tune = centre + off
+                if applied_tune != tune:
+                    if stream is not None and not DECODER_LIVE_RETUNE:
+                        stream.stop()
+                        stream = None
+                    self.sdr.center_freq = tune
+                    applied_tune = tune
+                    need_settle = True
+                    cur_mode = None
+                    acc, acc_n, wf_blocks = None, 0, []
+                if use_async and stream is None:
+                    stream = SdrStreamer(self.sdr)
+                    stream.start()
+                    self._dec_stream = stream              # decoder_main() stops it when the thread ends
+                    need_settle = True
+                if need_settle:
+                    time.sleep(0.12)
+                    if stream is not None:
+                        stream.flush()                     # everything captured while the tuner settled is discarded
+                    else:
+                        _ = self.sdr.read_samples(512)
+                        _ = self.sdr.read_samples(512)
+                    need_settle = False
+                if marker_sent != centre:
+                    marker_sent = centre
+                    sig.marker.emit(centre)
+                if view_key != (tune, rate):                # keep the X axis on what the SDR is actually covering
+                    view_key = (tune, rate)
+                    try:
+                        self.view_signals.apply.emit(tune - rate / 2.0, tune + rate / 2.0, float("nan"), float("nan"))
+                    except Exception:
+                        pass
+                mode = self.dec_mode
+                if mode is None:
+                    break
+                if mode != cur_mode:
+                    demod = AudioDemod(rate, mode) if mode in ("WFM", "NFM", "AM") else None
+                    burst = (BurstDecoder(rate, mode, bw_hz=self.dec_burst_bw * 1e3) if mode == "OOK"
+                             else BurstDecoder(rate, mode) if mode == "FSK" else None)
+                    cur_mode = mode
+                    acc, acc_n = None, 0
+                    if demod is not None and rate > 2.1e6 and not self._dec_hinted:
+                        self._dec_hinted = True
+                        self.log("Decoder hint: for audio, 1.024 or 2.048 MS/s needs less CPU and USB bandwidth than "
+                                 "2.4 MS/s and above, and is less likely to glitch")
+                if burst is not None and burst.mode == "OOK" and abs(burst.bw_hz - self.dec_burst_bw * 1e3) > 1.0:
+                    old_b = burst                          # channel width changed on the front panel: rebuild, keep the learned timing
+                    burst = BurstDecoder(rate, "OOK", bw_hz=self.dec_burst_bw * 1e3)
+                    burst.profile, burst.last_nbits = old_b.profile, old_b.last_nbits
+                lite = bool(self.dec_lite) and demod is not None      # audio: spend as little time as possible on the display
+                stride = 4 if lite else 1
+
+                # raw IQ (no DC removal / IQ balance: they would remove an AM carrier), continuous from the async stream
+                raw = stream.read(DECODER_BLOCK) if stream is not None else self._scope_read_iq(DECODER_BLOCK)
+                errors = 0
+                n = raw.size
+                if off != 0.0:                             # mix the offset-tuned signal back down to 0 Hz
+                    w = 2.0 * math.pi * off / rate
+                    iq = (raw * np.exp(1j * (phase + w * np.arange(n))).astype(np.complex64)).astype(np.complex64)
+                    phase = (phase + w * n) % (2.0 * math.pi)
+                else:
+                    iq = raw
+                    phase = 0.0
+
+                # ---- decode ----
+                if demod is not None:
+                    audio, level = demod.process(iq)
+                    lvl_db = 20.0 * math.log10(level + 1e-9)
+                    sq_open = not (self.dec_squelch_db > -79.5 and lvl_db < self.dec_squelch_db)
+                    if not sq_open:
+                        audio = np.zeros_like(audio)
+                    gain = (self.dec_volume ** 2) * 2.0
+                    pcm = (np.clip(audio * gain, -1.0, 1.0) * 32767.0).astype(np.int16)
+                    if pcm.size:
+                        sig.audio.emit(pcm.tobytes())
+                else:
+                    if self.dec_reset_profile:
+                        burst.profile = None
+                        burst.last_nbits = None
+                        self.dec_reset_profile = False
+                    if self.dec_dump_request:
+                        self.dec_dump_request = False
+                        sig.burst.emit({"dump_text": burst.dump_text(), "mode": burst.mode})
+                    burst.sens = float(self.dec_burst_sens)
+                    burst.strip_sync = bool(self.dec_strip_sync)
+                    for r in burst.process(iq):
+                        n_bursts += 1
+                        sig.burst.emit(r)
+                    lvl_db = 20.0 * math.log10((burst.noise or 1e-6) + 1e-9)
+
+                # ---- spectrum (from the raw capture, so it shows what the SDR really covers) ----
+                m = (n // NFFT) * NFFT
+                if m >= NFFT:
+                    seg = raw[:m].reshape(-1, NFFT)[::stride] * window[None, :]     # light display: every 4th frame only
+                    spec = np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1) / NFFT
+                    pw = spec.real ** 2 + spec.imag ** 2
+                    if burst is not None:                  # bursts are short: keep the peak, not the average
+                        bp = pw.max(axis=0)
+                        acc = bp if acc is None else np.maximum(acc, bp)
+                    else:
+                        bp = pw.mean(axis=0)
+                        acc = bp if acc is None else acc + bp
+                    acc_n += 1
+                    if self.wf_enabled:
+                        wf_blocks.append(10.0 * np.log10(pw + 1e-12) + self._psd_to_dbuv_const + self.cal_total_offset_db())
+
+                now = time.time()
+                if now - t_ui >= (0.30 if lite else DECODER_UI_INTERVAL_S) and acc is not None:
+                    t_ui = now
+                    mean_pw = acc if burst is not None else acc / float(max(acc_n, 1))
+                    psd = 10.0 * np.log10(mean_pw + 1e-12) + self._psd_to_dbuv_const
+                    freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / rate)) + tune
+                    self.freq_axis = freqs.astype(np.float64)
+                    self.power_axis = psd.astype(np.float64)
+                    self.update_plot()
+                    acc, acc_n = None, 0
+                    if not self.wf_enabled:
+                        wf_blocks = []
+                    elif wf_blocks and ((not lite) or now - t_wf >= 0.6):
+                        t_wf = now
+                        newest_first = np.concatenate([b[::-1] for b in wf_blocks[::-1]], axis=0)
+                        f_r, rows = self.wf_reduce(freqs, newest_first)
+                        self.wf_signals.rows.emit(f_r, np.asarray(rows, dtype=np.float32), f"fast:{tune:.0f}",
+                                                  float(NFFT * stride) / rate)
+                        wf_blocks = []
+                    cap = (f"stream OK, overruns {stream.overruns}" if stream is not None else "SYNC reads (samples lost!)")
+                    if demod is not None:
+                        txt = (f"{cur_mode}  {centre / 1e6:.6f} MHz   channel level {lvl_db:6.1f} dBFS   "
+                               f"squelch {'open' if sq_open else 'CLOSED'}   volume {int(self.dec_volume * 100)}%   {cap}")
+                    else:
+                        txt = (f"{cur_mode} burst decoder  {centre / 1e6:.6f} MHz   noise floor {lvl_db:6.1f} dBFS   "
+                               f"threshold x{self.dec_burst_sens:.1f}   reports: {n_bursts}   {cap}")
+                    sig.status.emit(txt)
+            except OSError as e:
+                errors += 1
+                print(f"decoder_loop: read error: {e}")
+                if errors > 30 or self.stop_flag.is_set():
+                    break
+                try:
+                    if stream is not None:
+                        stream.stop()
+                        stream = None
+                    self.init_sdr()                        # reopen the device and carry on
+                    applied_tune = None
+                    need_settle = True
+                    cur_mode = None
+                except Exception as e2:
+                    print(f"decoder_loop: could not reopen the SDR: {e2}")
+                    time.sleep(0.5)
+            except Exception as e:
+                import traceback
+                errors += 1
+                print(f"decoder_loop: error {e!r}")
+                traceback.print_exc()
+                if errors > 30:
+                    break
+                time.sleep(0.1)
+
+    #OLD# def decoder_loop(self, session):
+    #OLD#     sig = self.dec_signals
+    #OLD#     window = np.hanning(NFFT).astype(np.float32)
+    #OLD#     applied_tune = None
+    #OLD#     need_settle = False
+    #OLD#     cur_mode = None
+    #OLD#     demod = None
+    #OLD#     burst = None
+    #OLD#     phase = 0.0
+    #OLD#     view_key = None
+    #OLD#     marker_sent = None
+    #OLD#     acc = None                  # spectrum accumulated since the last display update
+    #OLD#     acc_n = 0
+    #OLD#     wf_blocks = []              # waterfall frames (dB) since the last display update
+    #OLD#     t_ui = 0.0
+    #OLD#     lvl_db = -120.0
+    #OLD#     sq_open = True
+    #OLD#     n_bursts = 0
+    #OLD#     errors = 0
+    #OLD#     while (not self.stop_flag.is_set()) and self.dec_active and session == self._dec_session:
+    #OLD#         try:
+    #OLD#             if self.sdr is None:
+    #OLD#                 break
+    #OLD#             self._restart_pass = False                 # set by the sample-rate combo; meaningless here
+    #OLD#             self.single_apply_pending()                # a new centre chosen on the front panel
+    #OLD#             if getattr(self, "_applied_sample_rate", None) != self.SAMPLE_RATE:
+    #OLD#                 print(f"decoder_loop: applying sample-rate change -> {self.SAMPLE_RATE / 1e6:.3f} MS/s")
+    #OLD#                 self.sdr.sample_rate = self.SAMPLE_RATE
+    #OLD#                 self._applied_sample_rate = self.SAMPLE_RATE
+    #OLD#                 need_settle = True
+    #OLD#                 cur_mode = None
+    #OLD#             self.apply_gain_if_changed()               # live RF Gain slider
+    #OLD#             rate = float(self._applied_sample_rate)
+    #OLD#             centre = float(self.START_FREQ)
+    #OLD#             off = rate / DECODER_OFFSET_DIVISOR if self.dec_offset_tune else 0.0
+    #OLD#             tune = centre + off
+    #OLD#             if applied_tune != tune:
+    #OLD#                 self.sdr.center_freq = tune
+    #OLD#                 applied_tune = tune
+    #OLD#                 need_settle = True
+    #OLD#                 cur_mode = None
+    #OLD#                 acc, acc_n, wf_blocks = None, 0, []
+    #OLD#             if need_settle:
+    #OLD#                 time.sleep(0.12)
+    #OLD#                 _ = self.sdr.read_samples(512)
+    #OLD#                 _ = self.sdr.read_samples(512)
+    #OLD#                 need_settle = False
+    #OLD#             if marker_sent != centre:
+    #OLD#                 marker_sent = centre
+    #OLD#                 sig.marker.emit(centre)
+    #OLD#             if view_key != (tune, rate):                # keep the X axis on what the SDR is actually covering
+    #OLD#                 view_key = (tune, rate)
+    #OLD#                 try:
+    #OLD#                     self.view_signals.apply.emit(tune - rate / 2.0, tune + rate / 2.0, float("nan"), float("nan"))
+    #OLD#                 except Exception:
+    #OLD#                     pass
+    #OLD#             mode = self.dec_mode
+    #OLD#             if mode is None:
+    #OLD#                 break
+    #OLD#             if mode != cur_mode:
+    #OLD#                 demod = AudioDemod(rate, mode) if mode in ("WFM", "NFM", "AM") else None
+    #OLD#                 burst = BurstDecoder(rate, mode) if mode in ("OOK", "FSK") else None
+    #OLD#                 cur_mode = mode
+    #OLD#                 acc, acc_n = None, 0
+    #OLD#
+    #OLD#             raw = self._scope_read_iq(DECODER_BLOCK)   # raw IQ: no DC removal / IQ balance (they would remove an AM carrier)
+    #OLD#             errors = 0
+    #OLD#             n = raw.size
+    #OLD#             if off != 0.0:                             # mix the offset-tuned signal back down to 0 Hz
+    #OLD#                 w = 2.0 * math.pi * off / rate
+    #OLD#                 iq = (raw * np.exp(1j * (phase + w * np.arange(n))).astype(np.complex64)).astype(np.complex64)
+    #OLD#                 phase = (phase + w * n) % (2.0 * math.pi)
+    #OLD#             else:
+    #OLD#                 iq = raw
+    #OLD#                 phase = 0.0
+    #OLD#
+    #OLD#             # ---- decode ----
+    #OLD#             if demod is not None:
+    #OLD#                 audio, level = demod.process(iq)
+    #OLD#                 lvl_db = 20.0 * math.log10(level + 1e-9)
+    #OLD#                 sq_open = not (self.dec_squelch_db > -79.5 and lvl_db < self.dec_squelch_db)
+    #OLD#                 if not sq_open:
+    #OLD#                     audio = np.zeros_like(audio)
+    #OLD#                 gain = (self.dec_volume ** 2) * 2.0
+    #OLD#                 pcm = (np.clip(audio * gain, -1.0, 1.0) * 32767.0).astype(np.int16)
+    #OLD#                 if pcm.size:
+    #OLD#                     sig.audio.emit(pcm.tobytes())
+    #OLD#             else:
+    #OLD#                 burst.sens = float(self.dec_burst_sens)
+    #OLD#                 for r in burst.process(iq):
+    #OLD#                     n_bursts += 1
+    #OLD#                     sig.burst.emit(r)
+    #OLD#                 lvl_db = 20.0 * math.log10((burst.noise or 1e-6) + 1e-9)
+    #OLD#
+    #OLD#             # ---- spectrum (from the raw capture, so it shows what the SDR really covers) ----
+    #OLD#             m = (n // NFFT) * NFFT
+    #OLD#             if m >= NFFT:
+    #OLD#                 seg = raw[:m].reshape(-1, NFFT) * window[None, :]
+    #OLD#                 spec = np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1) / NFFT
+    #OLD#                 pw = spec.real ** 2 + spec.imag ** 2
+    #OLD#                 if burst is not None:                  # bursts are short: keep the peak, not the average
+    #OLD#                     bp = pw.max(axis=0)
+    #OLD#                     acc = bp if acc is None else np.maximum(acc, bp)
+    #OLD#                 else:
+    #OLD#                     bp = pw.mean(axis=0)
+    #OLD#                     acc = bp if acc is None else acc + bp
+    #OLD#                 acc_n += 1
+    #OLD#                 if self.wf_enabled:
+    #OLD#                     wf_blocks.append(10.0 * np.log10(pw + 1e-12) + self._psd_to_dbuv_const + self.cal_total_offset_db())
+    #OLD#
+    #OLD#             now = time.time()
+    #OLD#             if now - t_ui >= DECODER_UI_INTERVAL_S and acc is not None:
+    #OLD#                 t_ui = now
+    #OLD#                 mean_pw = acc if burst is not None else acc / float(max(acc_n, 1))
+    #OLD#                 psd = 10.0 * np.log10(mean_pw + 1e-12) + self._psd_to_dbuv_const
+    #OLD#                 freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / rate)) + tune
+    #OLD#                 self.freq_axis = freqs.astype(np.float64)
+    #OLD#                 self.power_axis = psd.astype(np.float64)
+    #OLD#                 self.update_plot()
+    #OLD#                 acc, acc_n = None, 0
+    #OLD#                 if wf_blocks and self.wf_enabled:
+    #OLD#                     newest_first = np.concatenate([b[::-1] for b in wf_blocks[::-1]], axis=0)
+    #OLD#                     f_r, rows = self.wf_reduce(freqs, newest_first)
+    #OLD#                     self.wf_signals.rows.emit(f_r, np.asarray(rows, dtype=np.float32), f"fast:{tune:.0f}", float(NFFT) / rate)
+    #OLD#                 wf_blocks = []
+    #OLD#                 if demod is not None:
+    #OLD#                     txt = (f"{cur_mode}  {centre / 1e6:.6f} MHz   channel level {lvl_db:6.1f} dBFS   "
+    #OLD#                            f"squelch {'open' if sq_open else 'CLOSED'}   volume {int(self.dec_volume * 100)}%")
+    #OLD#                 else:
+    #OLD#                     txt = (f"{cur_mode} burst decoder  {centre / 1e6:.6f} MHz   noise floor {lvl_db:6.1f} dBFS   "
+    #OLD#                            f"threshold x{self.dec_burst_sens:.1f}   bursts found: {n_bursts}")
+    #OLD#                 sig.status.emit(txt)
+    #OLD#         except OSError as e:
+    #OLD#             errors += 1
+    #OLD#             print(f"decoder_loop: read error: {e}")
+    #OLD#             if errors > 30 or self.stop_flag.is_set():
+    #OLD#                 break
+    #OLD#             try:
+    #OLD#                 self.init_sdr()                        # reopen the device and carry on
+    #OLD#                 applied_tune = None
+    #OLD#                 need_settle = True
+    #OLD#                 cur_mode = None
+    #OLD#             except Exception as e2:
+    #OLD#                 print(f"decoder_loop: could not reopen the SDR: {e2}")
+    #OLD#                 time.sleep(0.5)
+    #OLD#         except Exception as e:
+    #OLD#             import traceback
+    #OLD#             errors += 1
+    #OLD#             print(f"decoder_loop: error {e!r}")
+    #OLD#             traceback.print_exc()
+    #OLD#             if errors > 30:
+    #OLD#                 break
+    #OLD#             time.sleep(0.1)
 
     # ------------------------------------------------------------------------------------
     # CAL SURVEY: how does the displayed level of a KNOWN tone vary with sample rate and RF gain?
@@ -7828,7 +9966,10 @@ class EmcScanner(QtWidgets.QMainWindow):
                 fh.write(f"{a},{b},{c},{d}\n")
         self.log(f"Saved live ({len(f)} pts) + reference ({len(rf)} pts) trace to {path}")
 
+    # ---- closeEvent(): the version before the decoder was added is kept, commented out, just below the new one ----
     def closeEvent(self, event):
+        self.dec_active = False
+        self.decoder_audio_close()
         self.stop_flag.set()
         if self.sweep_thread and self.sweep_thread.is_alive():
             self.sweep_thread.join(timeout=1.0)
@@ -7839,6 +9980,16 @@ class EmcScanner(QtWidgets.QMainWindow):
                 pass
         event.accept()
 
+    #OLD# def closeEvent(self, event):
+    #OLD#     self.stop_flag.set()
+    #OLD#     if self.sweep_thread and self.sweep_thread.is_alive():
+    #OLD#         self.sweep_thread.join(timeout=1.0)
+    #OLD#     if self.sdr is not None:
+    #OLD#         try:
+    #OLD#             self.sdr.close()
+    #OLD#         except Exception:
+    #OLD#             pass
+    #OLD#     event.accept()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
