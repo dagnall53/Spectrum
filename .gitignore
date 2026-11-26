@@ -1,1 +1,32 @@
-/dlls safe/*.* , /drivers/*.*, /ms64/*.*
+# Build output
+build/
+dist/
+
+# Local libraries and drivers
+dlls safe/
+drivers/
+ms64/
+pyrtlsdr_local/
+
+# Old code archive
+OLD/
+
+# Generated files
+*.spec
+*.csv
+*.bak
+*.lnk
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
