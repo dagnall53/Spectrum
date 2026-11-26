@@ -1,6 +1,9 @@
 # Build output
 build/
 dist/
+!dist/
+dist/*
+!dist/EMC_Sweep.zip
 
 # Local libraries and drivers
 dlls safe/
