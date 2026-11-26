@@ -2205,6 +2205,1170 @@ class SdrStreamer:
         return x[:n]
 
 
+import base64
+import struct
+
+WHITEN = [255, 254, 252, 248, 240, 225, 194, 133, 11, 23, 47, 94, 188, 120, 241, 227, 198, 141, 26, 52, 104, 208, 160, 64, 128, 1, 2, 4, 8, 17, 35, 71, 142, 28, 56, 113, 226, 196, 137, 18, 37, 75, 151, 46, 92, 184, 112, 224, 192, 129, 3, 6, 12, 25, 50, 100, 201, 146, 36, 73, 147, 38, 77, 155, 55, 110, 220, 185, 114, 228, 200, 144, 32, 65, 130, 5, 10, 21, 43, 86, 173, 91, 182, 109, 218, 181, 107, 214, 172, 89, 178, 101, 203, 150, 44, 88, 176, 97, 195, 135, 15, 31, 62, 125, 251, 246, 237, 219, 183, 111, 222, 189, 122, 245, 235, 215, 174, 93, 186, 116, 232, 209, 162, 68, 136, 16, 33, 67, 134, 13, 27, 54, 108, 216, 177, 99, 199, 143, 30, 60, 121, 243, 231, 206, 156, 57, 115, 230, 204, 152, 49, 98, 197, 139, 22, 45, 90, 180, 105, 210, 164, 72, 145, 34, 69, 138, 20, 41, 82, 165, 74, 149, 42, 84, 169, 83, 167, 78, 157, 59, 119, 238, 221, 187, 118, 236, 217, 179, 103, 207, 158, 61, 123, 247, 239, 223, 191, 126, 253, 250, 244, 233, 211, 166, 76, 153, 51, 102, 205, 154, 53, 106, 212, 168, 81, 163, 70, 140, 24, 48, 96, 193, 131, 7, 14, 29, 58, 117, 234, 213, 170, 85, 171, 87, 175, 95, 190, 124, 249, 242, 229, 202, 148, 40, 80, 161, 66, 132, 9, 19, 39, 79, 159, 63, 127]
+HDR_MATRIX = [[1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1], [0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0], [0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1], [0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1]]
+
+def _lbit(w, k):            # MATLAB bitget(w,k), k 1-based
+    return (int(w) >> (k - 1)) & 1
+
+def calc_crc_bits(data_bytes):
+    """CRC-16 poly 0x1021, init 0, MSB first, over the given bytes."""
+    crc = 0
+    for b in data_bytes:
+        crc ^= (b << 8)
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+def lora_crc(data):
+    """LoRaPHY.calc_crc -> [b1, b2] (the two bytes that follow the payload on air)."""
+    n = len(data)
+    if n == 0: return [0, 0]
+    if n == 1: return [data[-1], 0]
+    if n == 2: return [data[-1], data[-2]]
+    c = calc_crc_bits(data[:-2])
+    return [(c & 0xFF) ^ data[-1], ((c >> 8) & 0xFF) ^ data[-2]]
+
+def header_checksum(n1, n2, n3):
+    bits = []
+    for n in (n1, n2, n3):
+        bits += [(n >> 3) & 1, (n >> 2) & 1, (n >> 1) & 1, n & 1]
+    return [sum(r * b for r, b in zip(row, bits)) & 1 for row in HDR_MATRIX]
+
+def diag_deinterleave(symbols, ppm):
+    rdd = len(symbols)
+    # rows of bits, MSB first
+    b = [[(s >> (ppm - 1 - c)) & 1 for c in range(ppm)] for s in symbols]
+    cw = [0] * ppm
+    for j in range(rdd):
+        t = [b[j][(c + j) % ppm] for c in range(ppm)]       # circular left shift by j
+        for r in range(ppm):
+            cw[r] |= t[r] << j
+    return cw[::-1]                                          # flipud
+
+def hamming_decode(cws, rdd):
+    out = []
+    for w in cws:
+        if rdd in (5, 6):
+            out.append(w & 15)
+        else:
+            p2 = _lbit(w,7)^_lbit(w,4)^_lbit(w,2)^_lbit(w,1)
+            p3 = _lbit(w,5)^_lbit(w,3)^_lbit(w,2)^_lbit(w,1)
+            p5 = _lbit(w,6)^_lbit(w,4)^_lbit(w,3)^_lbit(w,2)
+            pf = {3: 4, 5: 8, 6: 1, 7: 2}.get(p2 * 4 + p3 * 2 + p5, 0)
+            out.append((w ^ pf) & 15)
+    return out
+
+def gray_coding(din, sf, ldr):
+    d = list(din)
+    out = []
+    for i, v in enumerate(d):
+        if i < 8 or ldr:
+            s = int(v) // 4
+        else:
+            s = (int(v) - 1) % (1 << sf)
+        out.append(s ^ (s >> 1))
+    return out
+
+def calc_sym_num(plen, sf, cr, crc, has_header, ldr):
+    return 8 + max((4 + cr) * math.ceil((2 * plen - sf + 7 + 4 * crc - 5 * (1 - has_header)) / (sf - 2 * ldr)), 0)
+
+def lora_whiten(data):
+    return [b ^ WHITEN[i] for i, b in enumerate(data)]
+
+def lora_decode(symbols, sf, ldr, has_header=1, cr=None, crc=None, plen=None):
+    """symbols: demodulated values (after CFO/drift compensation). Returns dict."""
+    g = gray_coding(symbols, sf, ldr)
+    cws = diag_deinterleave(g[:8], sf - 2)
+    nibs = hamming_decode(cws, 8)
+    info = {}
+    if has_header:
+        plen = nibs[0] * 16 + nibs[1]; crc = nibs[2] & 1; cr = nibs[2] >> 1
+        chk = [nibs[3] & 1] + [(nibs[4] >> s) & 1 for s in (3, 2, 1, 0)]
+        calc = header_checksum(nibs[0], nibs[1], nibs[2])
+        info["header_ok"] = (chk == calc)
+        nibs = nibs[5:]
+    rdd = cr + 4
+    ii = 8
+    while ii + rdd <= len(g):
+        cw = diag_deinterleave(g[ii:ii + rdd], sf - 2 * ldr)
+        nibs += hamming_decode(cw, rdd)
+        ii += rdd
+    nb = len(nibs) // 2                       # (the MATLAB reference caps this at 255 bytes, cutting off the CRC of a 255-byte payload)
+    by = [nibs[2 * k] | (nibs[2 * k + 1] << 4) for k in range(nb)]
+    if crc:
+        data = lora_whiten(by[:plen])
+        rx_crc = by[plen:plen + 2]
+        info["crc_ok"] = (lora_crc(data) == rx_crc)
+        info["rx_crc"] = rx_crc
+    else:
+        data = lora_whiten(by[:plen])
+    info.update(payload=data, plen=plen, cr=cr, crc=crc)
+    return info
+
+
+class FracResampler:
+    """Streaming windowed-sinc resampler fs_in -> fs_out (any ratio), with anti-alias cut-off just below fs_out/2."""
+    def __init__(self, fs_in, fs_out, zeros=6, phases=512, cutoff_frac=0.46):
+        self.ratio = fs_in / float(fs_out)
+        fc = cutoff_frac * min(fs_out, fs_in) / fs_in                    # cycles per input sample
+        self.hw = max(4, int(math.ceil(zeros / (2 * fc))))
+        self.P = phases
+        offs = np.arange(-self.hw + 1, self.hw + 1)
+        tab = np.empty((phases, offs.size), np.float32)
+        win = np.kaiser(2 * self.hw + 1, 8.0)
+        for p in range(phases):
+            x = offs - p / phases
+            h = 2 * fc * np.sinc(2 * fc * x)
+            w = np.interp(x, np.arange(-self.hw, self.hw + 1), win)
+            k = h * w
+            tab[p] = k / k.sum()
+        self.tab, self.offs = tab, offs
+        self.tail = np.zeros(0, np.complex64)
+        self.t = 0.0                                                       # next output time, in input samples relative to tail[0]
+
+    def process(self, x):
+        xa = np.concatenate([self.tail, x.astype(np.complex64)])
+        if xa.size < 2 * self.hw + 2:
+            self.tail = xa
+            return np.zeros(0, np.complex64)
+        n_out = int((xa.size - self.hw - 1 - self.t) // self.ratio) + 1
+        if n_out <= 0:
+            self.tail = xa
+            return np.zeros(0, np.complex64)
+        tk = self.t + np.arange(n_out) * self.ratio
+        i0 = np.floor(tk).astype(np.int64)
+        ph = np.rint((tk - i0) * self.P).astype(np.int64)
+        i0 += ph // self.P
+        ph %= self.P
+        # the first outputs need samples before xa[0] when t < hw: they were not computable earlier; pad with zeros at start
+        idx = i0[:, None] + self.offs[None, :]
+        idx = np.clip(idx, 0, xa.size - 1)
+        y = (xa[idx] * self.tab[ph]).sum(axis=1).astype(np.complex64)
+        t_next = self.t + n_out * self.ratio
+        keep_from = max(0, int(math.floor(t_next)) - self.hw)
+        self.tail = xa[keep_from:].copy()
+        self.t = t_next - keep_from
+        return y
+
+
+class NeedMore(Exception):
+    def __init__(self, upto):
+        self.upto = upto
+
+
+class LoraRx:
+    OSR = 2
+
+    def __init__(self, sf, bw, fs_in, rf_freq=868e6, sync_word=None, zp=4, pdet=5, ldr=None, min_snr_peak=2.0, ref_resample=True,
+                 cutoff_frac=0.44):
+        self.sf, self.bw, self.fs_in = int(sf), float(bw), float(fs_in)
+        self.N = 1 << self.sf
+        self.W = self.OSR * self.N
+        self.zp = int(zp)
+        self.rf_freq = float(rf_freq)
+        self.sync_word = sync_word
+        self.pdet = int(pdet)
+        self.min_peak = min_snr_peak
+        self.ldr = (1 if self.N / self.bw > 16e-3 else 0) if ldr is None else int(ldr)
+        n = np.arange(self.W)
+        f = ((n / self.OSR) / self.N - 0.5)                                   # cycles per (1/BW) -> fraction of BW
+        ph = 2 * np.pi * np.cumsum(f * self.bw / (self.OSR * self.bw))          # fs = OSR*bw
+        ph = np.concatenate([[0], ph[:-1]])
+        up = np.exp(1j * ph).astype(np.complex64)
+        self.up = up
+        self.dn = np.conj(up)
+        self.cutoff_frac = float(cutoff_frac)          # front-end cut-off as a fraction of fs_out (= 0.8 BW for 0.40 at OSR 2)
+        self.fe = FracResampler(self.fs_in, self.OSR * self.bw, cutoff_frac=cutoff_frac) if ref_resample else None
+        self.buf = np.zeros(0, np.complex64)
+        self.base = 0                                                           # absolute index of buf[0]
+        self.scan = 0                                                           # absolute index of the next search window
+        self.run = []                                                           # current run of equal preamble bins [(bin, abs_start)]
+        self.ctx = None                                                         # frame in progress
+        self.frames_seen = 0
+        self.detections = 0
+        self.hdr_fail = 0                      # preamble + SFD found, but the header did not check out (wrong SF/BW, or too weak)
+        self.sync_fail = 0                     # preamble found, but no start-of-frame delimiter followed
+        self.runs3 = 0                         # near-misses: 3 equal chirps in a row (a weak or mismatched preamble)
+        self.noise_floor = 0.0
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _fold(F1, F2):
+        """Combine the two partial tones of a wrapped chirp (bins k and k+N of the full-rate FFT) COHERENTLY. Their relative phase is
+        exp(-j*pi*tau) for a window offset of tau samples (+-1 when aligned to the 1/BW grid, anything otherwise), so try 1, j, -1, -j
+        and keep the strongest: within 0.7 dB of knowing the phase, ~4 dB better than adding the two magnitudes."""
+        a = np.abs(F1 + F2)
+        b = np.abs(F1 - F2)
+        c = np.abs(F1 + 1j * F2)
+        d = np.abs(F1 - 1j * F2)
+        return np.maximum(np.maximum(a, b), np.maximum(c, d)) * 0.5
+    def _seg(self, a, n=None):
+        n = self.W if n is None else n
+        i = a - self.base
+        if i < 0:
+            raise ValueError("data no longer in buffer")
+        if i + n > self.buf.size:
+            raise NeedMore(a + n)
+        return self.buf[i:i + n]
+
+    def _dechirp(self, a, up=True, zp=None):
+        """peak (magnitude, bin in 1/zp units 0-based, folded) of the dechirped window starting at absolute index a."""
+        zp = self.zp if zp is None else zp
+        seg = self._seg(a)
+        ref = self.dn if up else self.up
+        F = np.fft.fft(seg * ref, n=self.W * zp)
+        mag = self._fold(F[:self.N * zp], F[self.N * zp:])
+        k = int(np.argmax(mag))
+        return float(mag[k]), k, mag
+
+    # ---------------------------------------------------------------- streaming interface
+    def process(self, iq):
+        x = self.fe.process(iq) if self.fe is not None else iq
+        return self.feed_bb(x)
+
+    def feed_bb(self, x):
+        self.buf = np.concatenate([self.buf, x.astype(np.complex64)]) if x.size else self.buf
+        frames = []
+        for _ in range(10000):
+            if self.ctx is not None:
+                try:
+                    r = self._advance_frame()
+                except NeedMore:
+                    break
+                if r is not None:
+                    frames.append(r)
+                continue
+            if not self._search():
+                break
+        self._trim()
+        return frames
+
+    def _trim(self):
+        if self.ctx is None:
+            keep_from = max(self.base, self.scan - (self.pdet + 4) * self.W)
+        else:
+            keep_from = max(self.base, self.ctx["det_end"] - (self.pdet + 8) * self.W)
+        cut = keep_from - self.base
+        if cut > 0:
+            self.buf = self.buf[cut:]
+            self.base += cut
+
+    def _end_run(self):
+        """A run of equal chirps just ended without becoming a detection: count it if it was a near-miss (3 or 4 in a row)."""
+        if 3 <= len(self.run) < self.pdet:
+            self.runs3 += 1
+        self.run = []
+
+    def _search(self):
+        """Vectorised scan of whole windows for >= pdet consecutive equal up-chirp peaks. Returns True if it made progress."""
+        W, N = self.W, self.N
+        i0 = self.scan - self.base
+        nwin = (self.buf.size - i0) // W
+        if nwin <= 0:
+            return False
+        seg = self.buf[i0:i0 + nwin * W].reshape(nwin, W)
+        F = np.fft.fft(seg * self.dn[None, :], axis=1)
+        mag = self._fold(F[:, :N], F[:, N:])
+        bins = mag.argmax(axis=1)
+        peak = mag.max(axis=1)
+        med = np.median(mag, axis=1)
+        good = peak > self.min_peak * med
+        if self.run == [] and nwin:
+            self.noise_floor = float(np.median(med))
+        for j in range(nwin):
+            a = self.scan + j * W
+            if not good[j]:
+                self._end_run()
+                continue
+            b = int(bins[j])
+            if self.run:
+                d = (b - self.run[-1][0]) % N
+                d = min(d, N - d)
+                if d <= 1:
+                    self.run.append((b, a))
+                else:
+                    self._end_run()
+                    self.run = [(b, a)]
+            else:
+                self.run = [(b, a)]
+            if len(self.run) >= self.pdet:
+                det_end = a + W
+                self.detections += 1
+                self.ctx = {"stage": "sync", "det_end": det_end, "bin0": b, "run0": self.run[0][1]}
+                self.run = []
+                self.scan = det_end
+                return True
+        self.scan += nwin * W
+        return True
+
+    # ---------------------------------------------------------------- frame state machine
+    def _fail(self, skip_windows):
+        self.scan = self.ctx["det_end"] + skip_windows * self.W
+        self.ctx = None
+        self.run = []
+        return None
+
+    def _advance_frame(self):
+        c = self.ctx
+        W, N, zp = self.W, self.N, self.zp
+        if c["stage"] == "sync":
+            try:
+                self._sync(c)
+            except ValueError:
+                self.sync_fail += 1
+                return self._fail(2)
+            c["stage"] = "header"
+        if c["stage"] == "header":
+            x = c["x"]
+            syms = []
+            for ii in range(8):
+                pk, k, _ = self._dechirp(x + ii * W)
+                syms.append(((k - c["pre_bin"]) / zp) % N)
+            valid, plen, cr, crc, info = self._parse_header(syms, c)
+            if not valid:
+                self.hdr_fail += 1
+                return self._fail(9)
+            c.update(plen=plen, cr=cr, crc=crc, hdr_syms=syms)
+            c["sym_num"] = calc_sym_num(plen, self.sf, cr, crc, 1, self.ldr)
+            c["stage"] = "payload"
+        if c["stage"] == "payload":
+            x = c["x"]
+            self._seg(x + (c["sym_num"] - 1) * W)                 # raises NeedMore until the whole frame is in the buffer
+            syms = list(c["hdr_syms"])
+            peaks = []
+            for ii in range(8, c["sym_num"]):
+                pk, k, _ = self._dechirp(x + ii * W)
+                syms.append(((k - c["pre_bin"]) / zp) % N)
+            comp = self._dynamic_compensation(syms, c)
+            sym_i = [int(round(s)) % N for s in comp]
+            r = lora_decode(sym_i, self.sf, self.ldr, has_header=1)
+            frame = dict(sf=self.sf, bw=self.bw, cr=r["cr"], has_crc=bool(r["crc"]), payload=bytes(r["payload"]),
+                         length=r["plen"], crc_ok=(r.get("crc_ok") if r["crc"] else None), header_ok=r.get("header_ok", True),
+                         cfo_hz=c["cfo"], snr_db=c["snr_db"], sync=c.get("netid"), n_symbols=c["sym_num"],
+                         t_start=(c["run0"]) / (self.OSR * self.bw), t_end=(x + c["sym_num"] * W) / (self.OSR * self.bw),
+                         ldro=self.ldr, rx_crc=r.get("rx_crc"))
+            self.scan = x + c["sym_num"] * W
+            self.ctx = None
+            self.run = []
+            self.frames_seen += 1
+            return frame
+        return None
+
+    def _sync(self, c):
+        """Port of LoRaPHY.sync(): find the SFD, align up/down, derive CFO and the first data symbol."""
+        W, N, zp = self.W, self.N, self.zp
+        nb = N * zp
+        # coarse alignment from the preamble bin ("shift the up peak to position 0")
+        b = c["bin0"]
+        x = c["det_end"] - int(round(b * self.OSR))
+        # find the first window dominated by a down-chirp
+        found = False
+        for _ in range(self.pdet + 40):
+            up_pk = self._dechirp(x, True)[0]
+            dn_pk = self._dechirp(x, False)[0]
+            x += W
+            if dn_pk > up_pk:
+                found = True
+                break
+        if not found:
+            raise ValueError("no SFD")
+        pkd = self._dechirp(x, False)
+        kd = pkd[1]
+        to = round((kd - nb) / zp) if kd > nb / 2 else round(kd / zp)
+        x += int(to)
+        pku = self._dechirp(x - 4 * W)
+        pre_bin = pku[1]
+        c["pre_bin"] = pre_bin
+        cfo_bins = (pre_bin - nb) / zp if pre_bin > nb / 2 else pre_bin / zp
+        c["cfo"] = cfo_bins * self.bw / N
+        pu = self._dechirp(x - W)[0]
+        pd = self._dechirp(x - W, False)[0]
+        x_sync = x + int(round(2.25 * W)) if pu > pd else x + int(round(1.25 * W))
+        c["x"] = x_sync
+        # sync word (netid) chirps, relative to the preamble bin
+        n1 = self._dechirp(int(round(x_sync - 4.25 * W)))[1]
+        n2 = self._dechirp(int(round(x_sync - 3.25 * W)))[1]
+        v1 = ((n1 + nb - pre_bin) / zp) % N
+        v2 = ((n2 + nb - pre_bin) / zp) % N
+        c["netid"] = (int(round(v1 / 8)) % 16) << 4 | (int(round(v2 / 8)) % 16)
+        # SNR estimate from the aligned last preamble window
+        pk, k, mag = self._dechirp(x - 4 * W)
+        m2 = mag.astype(np.float64) ** 2
+        k0 = int(k)
+        mask = np.ones(m2.size, bool)
+        for d in range(-2 * zp, 2 * zp + 1):
+            mask[(k0 + d) % m2.size] = False
+        noise = float(np.mean(m2[mask])) if mask.any() else 1e-12
+        c["snr_db"] = 10 * math.log10(max(pk ** 2 / max(noise, 1e-20), 1e-3) / N * (2 * self.cutoff_frac * self.OSR))   # noise bandwidth correction
+
+    def _dynamic_compensation(self, data, c):
+        """Port of LoRaPHY.dynamic_compensation: sampling-frequency-offset drift + LDRO bin tracking."""
+        N = self.N
+        out = []
+        for i, v in enumerate(data):
+            drift = (1 + (i + 1)) * N * c["cfo"] / self.rf_freq if self.rf_freq else 0.0
+            out.append((v - drift) % N)
+        if self.ldr:
+            bin_offset, v_last = 0.0, 1.0
+            res = []
+            for v in out:
+                d = (v - v_last) % 4
+                bin_offset += (-d if d < 2 else (-d + 4))
+                v_last = v
+                res.append((v + bin_offset) % N)
+            out = res
+        return out
+
+    def _parse_header(self, syms, c):
+        sf = self.sf
+        comp = self._dynamic_compensation(syms, c)
+        comp = [int(round(s)) % self.N for s in comp]
+        g = gray_coding(comp, sf, self.ldr)
+        cws = diag_deinterleave(g[:8], sf - 2)
+        nibs = hamming_decode(cws, 8)
+        plen = nibs[0] * 16 + nibs[1]
+        crc = nibs[2] & 1
+        cr = nibs[2] >> 1
+        chk = [nibs[3] & 1] + [(nibs[4] >> s) & 1 for s in (3, 2, 1, 0)]
+        ok = chk == header_checksum(nibs[0], nibs[1], nibs[2]) and 1 <= cr <= 4 and plen > 0
+        return ok, plen, cr, crc, {}
+
+
+class FFTChannelizer:
+    """Cheap extraction of several narrow channels from one wideband stream (overlap-save, frequency domain).
+    One FFT of M input samples is shared by all channels; per channel the bins around its centre are weighted by a smooth mask
+    (flat to 0.8 BW, raised-cosine to 0 at BW) and inverse-transformed at size B, giving that channel at EXACTLY 2*BW samples/s:
+    B/M = 2*BW/fs_in is matched as an exact fraction, so the symbol clock is not disturbed. A per-block phase term keeps the output
+    phase-continuous across blocks. Cost: ~one big FFT per block + a small IFFT per channel (vs ~25 % CPU per channel when resampling)."""
+    def __init__(self, fs_in, centre, freqs, bw, m_lo=8192, m_hi=65536):
+        from fractions import Fraction
+        r = Fraction(float(2 * bw)) / Fraction(float(fs_in))
+        p, q = r.numerator, r.denominator
+        best = None
+        for m in range(1, 100000):
+            M = q * m
+            if M > m_hi:
+                break
+            if M < m_lo:
+                continue
+            x, big = M, 1
+            for f in (2, 3, 5, 7):
+                while x % f == 0:
+                    x //= f
+            cost = M * (1.0 if x == 1 else 4.0)                     # a size with a big prime factor is much slower
+            if best is None or cost < best[0]:
+                best = (cost, m)
+        if best is None:
+            raise ValueError("no exact rational FFT size for this sample rate / bandwidth")
+        m = best[1]
+        self.M, self.B = q * m, p * m
+        self.fs_in, self.bw = float(fs_in), float(bw)
+        h = max(1, int(math.ceil(self.M / 16.0 / q)))
+        self.H = q * h                                              # samples discarded at each end of a block (circular-wrap region)
+        self.L = self.M - 2 * self.H                                # hop
+        self.Ho = self.H * self.B // self.M
+        self.Lo = self.L * self.B // self.M
+        assert (self.H * self.B) % self.M == 0 and (self.L * self.B) % self.M == 0
+        self.k0 = [int(round((f - centre) * self.M / self.fs_in)) for f in freqs]
+        self.ksel = np.rint(np.fft.fftfreq(self.B, 1.0 / self.B)).astype(np.int64)      # bin offsets in the order ifft() expects: 0, +1.., -1
+        f = np.abs(self.ksel) * self.fs_in / self.M
+        t = np.clip((f - 0.8 * self.bw) / (0.2 * self.bw), 0.0, 1.0)
+        self.mask = (0.5 * (1.0 + np.cos(np.pi * t))).astype(np.float64)
+        self.buf = np.zeros(0, np.complex64)
+        self.nblk = 0
+
+    def process(self, x):
+        self.buf = np.concatenate([self.buf, x.astype(np.complex64)]) if x.size else self.buf
+        outs = [[] for _ in self.k0]
+        while self.buf.size >= self.M:
+            X = np.fft.fft(self.buf[:self.M])
+            for i, k0 in enumerate(self.k0):
+                sel = X[(k0 + self.ksel) % self.M] * self.mask
+                y = np.fft.ifft(sel) * (self.B / self.M)
+                ph = np.exp(-2j * np.pi * (((k0 * self.nblk * self.L) % self.M) / self.M))
+                outs[i].append((y[self.Ho:self.Ho + self.Lo] * ph).astype(np.complex64))
+            self.nblk += 1
+            self.buf = self.buf[self.L:]
+        return [np.concatenate(o) if o else np.zeros(0, np.complex64) for o in outs]
+
+
+class LoraMultiRx:
+    """Several LoRa channels (same SF / BW) from ONE wideband stream.
+    Shared front end: a single decimating low-pass for the whole span wanted (so the cost scales with the span, not with the SDR rate);
+    then per channel: mix to 0 Hz and run a LoraRx. Frames come back tagged with the channel frequency ('freq_hz')."""
+    def __init__(self, sf, bw, fs_in, centre_hz, freqs_hz, rf_freq=None, **kw):
+        self.sf, self.bw, self.fs_in = int(sf), float(bw), float(fs_in)
+        self.centre = float(centre_hz)
+        lim = 0.45 * self.fs_in - 0.6 * self.bw                      # channels further out than this are not usable in this SDR band
+        self.chs, self.skipped = [], []
+        for f in sorted(set(float(x) for x in freqs_hz)):
+            (self.chs if abs(f - self.centre) <= lim else self.skipped).append(f)
+        self.chan = None
+        try:
+            if self.chs:
+                self.chan = FFTChannelizer(self.fs_in, self.centre, self.chs, self.bw)
+        except Exception:
+            self.chan = None
+        if self.chan is not None:                                    # fast path: frequency-domain channelizer, receivers run at 2*BW
+            self.D, self.r1, self.dec = 1, self.fs_in, None
+            self.rx = [LoraRx(sf, bw, 2.0 * self.bw, rf_freq=(f if rf_freq is None else rf_freq), ref_resample=False, **kw) for f in self.chs]
+            self.phase = [0.0] * len(self.chs)
+            return
+        offs = [f - self.centre for f in self.chs] or [0.0]
+        half = max(abs(o) for o in offs) + 0.6 * self.bw
+        tw = max(0.15 * half, 0.2 * self.bw)                         # transition width of the shared filter
+        self.D = max(1, int(self.fs_in // (2.0 * (half + tw))))
+        self.r1 = self.fs_in / self.D
+        self.dec = None
+        if self.D > 1:
+            self.dec = Decimator(self.fs_in, self.D, half + tw / 2, ntaps=int(min(401, max(31, 3.3 * self.fs_in / tw))) | 1)
+        self.rx = []
+        self.phase = []
+        for f in self.chs:
+            self.rx.append(LoraRx(sf, bw, self.r1, rf_freq=(f if rf_freq is None else rf_freq), **kw))
+            self.phase.append(0.0)
+
+    @property
+    def detections(self): return sum(r.detections for r in self.rx)
+    @property
+    def hdr_fail(self): return sum(r.hdr_fail for r in self.rx)
+    @property
+    def sync_fail(self): return sum(r.sync_fail for r in self.rx)
+    @property
+    def runs3(self): return sum(r.runs3 for r in self.rx)
+    @property
+    def frames_seen(self): return sum(r.frames_seen for r in self.rx)
+
+    def process(self, iq):
+        out = []
+        if self.chan is not None:
+            for i, y in enumerate(self.chan.process(iq)):
+                if y.size:
+                    for fr in self.rx[i].feed_bb(y):
+                        fr["freq_hz"] = self.chs[i]
+                        out.append(fr)
+            return out
+        z = self.dec.process(iq.astype(np.complex64)) if self.dec is not None else iq.astype(np.complex64)
+        n = z.size
+        if n == 0:
+            return out
+        k = np.arange(n)
+        for i, f in enumerate(self.chs):
+            off = f - self.centre
+            if off != 0.0:
+                w = -2.0 * math.pi * off / self.r1
+                lo = np.exp(1j * (self.phase[i] + w * k)).astype(np.complex64)
+                self.phase[i] = (self.phase[i] + w * n) % (2.0 * math.pi)
+                y = z * lo
+            else:
+                y = z
+            for fr in self.rx[i].process(y):
+                fr["freq_hz"] = f
+                out.append(fr)
+        return out
+
+
+# Generated from the official meshtastic protobuf definitions (meshtastic python package).
+MT_MSG = {'Data': {1: ('portnum', 'enum:PortNum', False), 2: ('payload', 'bytes', False), 3: ('want_response', 'bool', False), 4: ('dest', 'fixed32', False), 5: ('source', 'fixed32', False), 6: ('request_id', 'fixed32', False), 7: ('reply_id', 'fixed32', False), 8: ('emoji', 'fixed32', False), 9: ('bitfield', 'uint', False)}, 'Position': {1: ('latitude_i', 'sfixed32', False), 2: ('longitude_i', 'sfixed32', False), 3: ('altitude', 'int', False), 4: ('time', 'fixed32', False), 5: ('location_source', 'enum:LocSource', False), 6: ('altitude_source', 'enum:AltSource', False), 7: ('timestamp', 'fixed32', False), 8: ('timestamp_millis_adjust', 'int', False), 9: ('altitude_hae', 'sint', False), 10: ('altitude_geoidal_separation', 'sint', False), 11: ('PDOP', 'uint', False), 12: ('HDOP', 'uint', False), 13: ('VDOP', 'uint', False), 14: ('gps_accuracy', 'uint', False), 15: ('ground_speed', 'uint', False), 16: ('ground_track', 'uint', False), 17: ('fix_quality', 'uint', False), 18: ('fix_type', 'uint', False), 19: ('sats_in_view', 'uint', False), 20: ('sensor_id', 'uint', False), 21: ('next_update', 'uint', False), 22: ('seq_number', 'uint', False), 23: ('precision_bits', 'uint', False)}, 'User': {1: ('id', 'string', False), 2: ('long_name', 'string', False), 3: ('short_name', 'string', False), 4: ('macaddr', 'bytes', False), 5: ('hw_model', 'enum:HardwareModel', False), 6: ('is_licensed', 'bool', False), 7: ('role', 'enum:Role', False), 8: ('public_key', 'bytes', False), 9: ('is_unmessagable', 'bool', False)}, 'DeviceMetrics': {1: ('battery_level', 'uint', False), 2: ('voltage', 'float', False), 3: ('channel_utilization', 'float', False), 4: ('air_util_tx', 'float', False), 5: ('uptime_seconds', 'uint', False)}, 'EnvironmentMetrics': {1: ('temperature', 'float', False), 2: ('relative_humidity', 'float', False), 3: ('barometric_pressure', 'float', False), 4: ('gas_resistance', 'float', False), 5: ('voltage', 'float', False), 6: ('current', 'float', False), 7: ('iaq', 'uint', False), 8: ('distance', 'float', False), 9: ('lux', 'float', False), 10: ('white_lux', 'float', False), 11: ('ir_lux', 'float', False), 12: ('uv_lux', 'float', False), 13: ('wind_direction', 'uint', False), 14: ('wind_speed', 'float', False), 15: ('weight', 'float', False), 16: ('wind_gust', 'float', False), 17: ('wind_lull', 'float', False), 18: ('radiation', 'float', False), 19: ('rainfall_1h', 'float', False), 20: ('rainfall_24h', 'float', False), 21: ('soil_moisture', 'uint', False), 22: ('soil_temperature', 'float', False), 23: ('one_wire_temperature', 'float', True)}, 'AirQualityMetrics': {1: ('pm10_standard', 'uint', False), 2: ('pm25_standard', 'uint', False), 3: ('pm100_standard', 'uint', False), 4: ('pm10_environmental', 'uint', False), 5: ('pm25_environmental', 'uint', False), 6: ('pm100_environmental', 'uint', False), 7: ('particles_03um', 'uint', False), 8: ('particles_05um', 'uint', False), 9: ('particles_10um', 'uint', False), 10: ('particles_25um', 'uint', False), 11: ('particles_50um', 'uint', False), 12: ('particles_100um', 'uint', False), 13: ('co2', 'uint', False), 14: ('co2_temperature', 'float', False), 15: ('co2_humidity', 'float', False), 16: ('form_formaldehyde', 'float', False), 17: ('form_humidity', 'float', False), 18: ('form_temperature', 'float', False), 19: ('pm40_standard', 'uint', False), 20: ('particles_40um', 'uint', False), 21: ('pm_temperature', 'float', False), 22: ('pm_humidity', 'float', False), 23: ('pm_voc_idx', 'float', False), 24: ('pm_nox_idx', 'float', False), 25: ('particles_tps', 'float', False)}, 'PowerMetrics': {1: ('ch1_voltage', 'float', False), 2: ('ch1_current', 'float', False), 3: ('ch2_voltage', 'float', False), 4: ('ch2_current', 'float', False), 5: ('ch3_voltage', 'float', False), 6: ('ch3_current', 'float', False), 7: ('ch4_voltage', 'float', False), 8: ('ch4_current', 'float', False), 9: ('ch5_voltage', 'float', False), 10: ('ch5_current', 'float', False), 11: ('ch6_voltage', 'float', False), 12: ('ch6_current', 'float', False), 13: ('ch7_voltage', 'float', False), 14: ('ch7_current', 'float', False), 15: ('ch8_voltage', 'float', False), 16: ('ch8_current', 'float', False)}, 'LocalStats': {1: ('uptime_seconds', 'uint', False), 2: ('channel_utilization', 'float', False), 3: ('air_util_tx', 'float', False), 4: ('num_packets_tx', 'uint', False), 5: ('num_packets_rx', 'uint', False), 6: ('num_packets_rx_bad', 'uint', False), 7: ('num_online_nodes', 'uint', False), 8: ('num_total_nodes', 'uint', False), 9: ('num_rx_dupe', 'uint', False), 10: ('num_tx_relay', 'uint', False), 11: ('num_tx_relay_canceled', 'uint', False), 12: ('heap_total_bytes', 'uint', False), 13: ('heap_free_bytes', 'uint', False), 14: ('num_tx_dropped', 'uint', False), 15: ('noise_floor', 'int', False)}, 'HealthMetrics': {1: ('heart_bpm', 'uint', False), 2: ('spO2', 'uint', False), 3: ('temperature', 'float', False)}, 'HostMetrics': {1: ('uptime_seconds', 'uint', False), 2: ('freemem_bytes', 'uint', False), 3: ('diskfree1_bytes', 'uint', False), 4: ('diskfree2_bytes', 'uint', False), 5: ('diskfree3_bytes', 'uint', False), 6: ('load1', 'uint', False), 7: ('load5', 'uint', False), 8: ('load15', 'uint', False), 9: ('user_string', 'string', False)}, 'TrafficManagementStats': {1: ('packets_inspected', 'uint', False), 2: ('position_dedup_drops', 'uint', False), 3: ('nodeinfo_cache_hits', 'uint', False), 4: ('rate_limit_drops', 'uint', False), 5: ('unknown_packet_drops', 'uint', False), 6: ('hop_exhausted_packets', 'uint', False), 7: ('router_hops_preserved', 'uint', False)}, 'Telemetry': {1: ('time', 'fixed32', False), 2: ('device_metrics', 'msg:DeviceMetrics', False), 3: ('environment_metrics', 'msg:EnvironmentMetrics', False), 4: ('air_quality_metrics', 'msg:AirQualityMetrics', False), 5: ('power_metrics', 'msg:PowerMetrics', False), 6: ('local_stats', 'msg:LocalStats', False), 7: ('health_metrics', 'msg:HealthMetrics', False), 8: ('host_metrics', 'msg:HostMetrics', False), 9: ('traffic_management_stats', 'msg:TrafficManagementStats', False)}, 'RouteDiscovery': {1: ('route', 'fixed32', True), 2: ('snr_towards', 'int', True), 3: ('route_back', 'fixed32', True), 4: ('snr_back', 'int', True)}, 'Routing': {1: ('route_request', 'msg:RouteDiscovery', False), 2: ('route_reply', 'msg:RouteDiscovery', False), 3: ('error_reason', 'enum:Error', False)}, 'Waypoint': {1: ('id', 'uint', False), 2: ('latitude_i', 'sfixed32', False), 3: ('longitude_i', 'sfixed32', False), 4: ('expire', 'uint', False), 5: ('locked_to', 'uint', False), 6: ('name', 'string', False), 7: ('description', 'string', False), 8: ('icon', 'fixed32', False)}, 'Neighbor': {1: ('node_id', 'uint', False), 2: ('snr', 'float', False), 3: ('last_rx_time', 'fixed32', False), 4: ('node_broadcast_interval_secs', 'uint', False)}, 'NeighborInfo': {1: ('node_id', 'uint', False), 2: ('last_sent_by_id', 'uint', False), 3: ('node_broadcast_interval_secs', 'uint', False), 4: ('neighbors', 'msg:Neighbor', True)}}
+
+MT_ENUM = {'PortNum': {0: 'UNKNOWN_APP', 1: 'TEXT_MESSAGE_APP', 2: 'REMOTE_HARDWARE_APP', 3: 'POSITION_APP', 4: 'NODEINFO_APP', 5: 'ROUTING_APP', 6: 'ADMIN_APP', 7: 'TEXT_MESSAGE_COMPRESSED_APP', 8: 'WAYPOINT_APP', 9: 'AUDIO_APP', 10: 'DETECTION_SENSOR_APP', 11: 'ALERT_APP', 12: 'KEY_VERIFICATION_APP', 13: 'REMOTE_SHELL_APP', 32: 'REPLY_APP', 33: 'IP_TUNNEL_APP', 34: 'PAXCOUNTER_APP', 35: 'STORE_FORWARD_PLUSPLUS_APP', 36: 'NODE_STATUS_APP', 64: 'SERIAL_APP', 65: 'STORE_FORWARD_APP', 66: 'RANGE_TEST_APP', 67: 'TELEMETRY_APP', 68: 'ZPS_APP', 69: 'SIMULATOR_APP', 70: 'TRACEROUTE_APP', 71: 'NEIGHBORINFO_APP', 72: 'ATAK_PLUGIN', 73: 'MAP_REPORT_APP', 74: 'POWERSTRESS_APP', 75: 'LORAWAN_BRIDGE', 76: 'RETICULUM_TUNNEL_APP', 77: 'CAYENNE_APP', 78: 'ATAK_PLUGIN_V2', 112: 'GROUPALARM_APP', 256: 'PRIVATE_APP', 257: 'ATAK_FORWARDER', 511: 'MAX'}, 'LocSource': {0: 'LOC_UNSET', 1: 'LOC_MANUAL', 2: 'LOC_INTERNAL', 3: 'LOC_EXTERNAL'}, 'AltSource': {0: 'ALT_UNSET', 1: 'ALT_MANUAL', 2: 'ALT_INTERNAL', 3: 'ALT_EXTERNAL', 4: 'ALT_BAROMETRIC'}, 'HardwareModel': {0: 'UNSET', 1: 'TLORA_V2', 2: 'TLORA_V1', 3: 'TLORA_V2_1_1P6', 4: 'TBEAM', 5: 'HELTEC_V2_0', 6: 'TBEAM_V0P7', 7: 'T_ECHO', 8: 'TLORA_V1_1P3', 9: 'RAK4631', 10: 'HELTEC_V2_1', 11: 'HELTEC_V1', 12: 'LILYGO_TBEAM_S3_CORE', 13: 'RAK11200', 14: 'NANO_G1', 15: 'TLORA_V2_1_1P8', 16: 'TLORA_T3_S3', 17: 'NANO_G1_EXPLORER', 18: 'NANO_G2_ULTRA', 19: 'LORA_TYPE', 20: 'WIPHONE', 21: 'WIO_WM1110', 22: 'RAK2560', 23: 'HELTEC_HRU_3601', 24: 'HELTEC_WIRELESS_BRIDGE', 25: 'STATION_G1', 26: 'RAK11310', 27: 'SENSELORA_RP2040', 28: 'SENSELORA_S3', 29: 'CANARYONE', 30: 'RP2040_LORA', 31: 'STATION_G2', 32: 'LORA_RELAY_V1', 33: 'T_ECHO_PLUS', 34: 'PPR', 35: 'GENIEBLOCKS', 36: 'NRF52_UNKNOWN', 37: 'PORTDUINO', 38: 'ANDROID_SIM', 39: 'DIY_V1', 40: 'NRF52840_PCA10059', 41: 'DR_DEV', 42: 'M5STACK', 43: 'HELTEC_V3', 44: 'HELTEC_WSL_V3', 45: 'BETAFPV_2400_TX', 46: 'BETAFPV_900_NANO_TX', 47: 'RPI_PICO', 48: 'HELTEC_WIRELESS_TRACKER', 49: 'HELTEC_WIRELESS_PAPER', 50: 'T_DECK', 51: 'T_WATCH_S3', 52: 'PICOMPUTER_S3', 53: 'HELTEC_HT62', 54: 'EBYTE_ESP32_S3', 55: 'ESP32_S3_PICO', 56: 'CHATTER_2', 57: 'HELTEC_WIRELESS_PAPER_V1_0', 58: 'HELTEC_WIRELESS_TRACKER_V1_0', 59: 'UNPHONE', 60: 'TD_LORAC', 61: 'CDEBYTE_EORA_S3', 62: 'TWC_MESH_V4', 63: 'NRF52_PROMICRO_DIY', 64: 'RADIOMASTER_900_BANDIT_NANO', 65: 'HELTEC_CAPSULE_SENSOR_V3', 66: 'HELTEC_VISION_MASTER_T190', 67: 'HELTEC_VISION_MASTER_E213', 68: 'HELTEC_VISION_MASTER_E290', 69: 'HELTEC_MESH_NODE_T114', 70: 'SENSECAP_INDICATOR', 71: 'TRACKER_T1000_E', 72: 'RAK3172', 73: 'WIO_E5', 74: 'RADIOMASTER_900_BANDIT', 75: 'ME25LS01_4Y10TD', 76: 'RP2040_FEATHER_RFM95', 77: 'M5STACK_COREBASIC', 78: 'M5STACK_CORE2', 79: 'RPI_PICO2', 80: 'M5STACK_CORES3', 81: 'SEEED_XIAO_S3', 82: 'MS24SF1', 83: 'TLORA_C6', 84: 'WISMESH_TAP', 85: 'ROUTASTIC', 86: 'MESH_TAB', 87: 'MESHLINK', 88: 'XIAO_NRF52_KIT', 89: 'THINKNODE_M1', 90: 'THINKNODE_M2', 91: 'T_ETH_ELITE', 92: 'HELTEC_SENSOR_HUB', 93: 'MUZI_BASE', 94: 'HELTEC_MESH_POCKET', 95: 'SEEED_SOLAR_NODE', 96: 'NOMADSTAR_METEOR_PRO', 97: 'CROWPANEL', 98: 'LINK_32', 99: 'SEEED_WIO_TRACKER_L1', 100: 'SEEED_WIO_TRACKER_L1_EINK', 101: 'MUZI_R1_NEO', 102: 'T_DECK_PRO', 103: 'T_LORA_PAGER', 104: 'M5STACK_RESERVED', 105: 'WISMESH_TAG', 106: 'RAK3312', 107: 'THINKNODE_M5', 108: 'HELTEC_MESH_SOLAR', 109: 'T_ECHO_LITE', 110: 'HELTEC_V4', 111: 'M5STACK_C6L', 112: 'M5STACK_CARDPUTER_ADV', 113: 'HELTEC_WIRELESS_TRACKER_V2', 114: 'T_WATCH_ULTRA', 115: 'THINKNODE_M3', 116: 'WISMESH_TAP_V2', 117: 'RAK3401', 118: 'RAK6421', 119: 'THINKNODE_M4', 120: 'THINKNODE_M6', 121: 'MESHSTICK_1262', 122: 'TBEAM_1_WATT', 123: 'T5_S3_EPAPER_PRO', 124: 'TBEAM_BPF', 125: 'MINI_EPAPER_S3', 126: 'TDISPLAY_S3_PRO', 127: 'HELTEC_MESH_NODE_T096', 128: 'TRACKER_T1000_E_PRO', 129: 'THINKNODE_M7', 130: 'THINKNODE_M8', 131: 'THINKNODE_M9', 132: 'HELTEC_V4_R8', 133: 'HELTEC_MESH_NODE_T1', 134: 'STATION_G3', 135: 'T_IMPULSE_PLUS', 136: 'T_ECHO_CARD', 137: 'SEEED_WIO_TRACKER_L2', 138: 'CROWPANEL_P4', 139: 'HELTEC_MESH_TOWER_V2', 140: 'MESHNOLOGY_W10', 255: 'PRIVATE_HW'}, 'Role': {0: 'CLIENT', 1: 'CLIENT_MUTE', 2: 'ROUTER', 3: 'ROUTER_CLIENT', 4: 'REPEATER', 5: 'TRACKER', 6: 'SENSOR', 7: 'TAK', 8: 'CLIENT_HIDDEN', 9: 'LOST_AND_FOUND', 10: 'TAK_TRACKER', 11: 'ROUTER_LATE', 12: 'CLIENT_BASE'}, 'Error': {0: 'NONE', 1: 'NO_ROUTE', 2: 'GOT_NAK', 3: 'TIMEOUT', 4: 'NO_INTERFACE', 5: 'MAX_RETRANSMIT', 6: 'NO_CHANNEL', 7: 'TOO_LARGE', 8: 'NO_RESPONSE', 9: 'DUTY_CYCLE_LIMIT', 32: 'BAD_REQUEST', 33: 'NOT_AUTHORIZED', 34: 'PKI_FAILED', 35: 'PKI_UNKNOWN_PUBKEY', 36: 'ADMIN_BAD_SESSION_KEY', 37: 'ADMIN_PUBLIC_KEY_UNAUTHORIZED', 38: 'RATE_LIMIT_EXCEEDED', 39: 'PKI_SEND_FAIL_PUBLIC_KEY'}}
+
+
+# =====================================================================================================================
+# AES-128 / AES-256 (encrypt direction only - all the modes used here need nothing else), CTR, CMAC
+# =====================================================================================================================
+def _build_sbox():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)) & 0xFF            # p *= 3
+        q ^= (q << 1) & 0xFF
+        q ^= (q << 2) & 0xFF
+        q ^= (q << 4) & 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        q &= 0xFF
+        rot = lambda v, n: ((v << n) | (v >> (8 - n))) & 0xFF
+        sbox[p] = q ^ rot(q, 1) ^ rot(q, 2) ^ rot(q, 3) ^ rot(q, 4) ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return sbox
+
+_SBOX = _build_sbox()
+
+
+def _xt(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+class AES:
+    def __init__(self, key):
+        key = bytes(key)
+        if len(key) not in (16, 32):
+            raise ValueError("AES key must be 16 or 32 bytes")
+        nk = len(key) // 4
+        self.nr = nk + 6
+        w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+        rcon = 1
+        for i in range(nk, 4 * (self.nr + 1)):
+            t = list(w[i - 1])
+            if i % nk == 0:
+                t = t[1:] + t[:1]
+                t = [_SBOX[b] for b in t]
+                t[0] ^= rcon
+                rcon = _xt(rcon)
+            elif nk > 6 and i % nk == 4:
+                t = [_SBOX[b] for b in t]
+            w.append([a ^ b for a, b in zip(w[i - nk], t)])
+        self.rk = [sum((w[4 * r + c] for c in range(4)), []) for r in range(self.nr + 1)]
+
+    def encrypt(self, block):
+        s = [b ^ k for b, k in zip(block, self.rk[0])]
+        for r in range(1, self.nr + 1):
+            s = [_SBOX[b] for b in s]
+            s = [s[(i % 4) + 4 * (((i // 4) + (i % 4)) % 4)] for i in range(16)]       # ShiftRows
+            if r != self.nr:
+                out = []
+                for c in range(4):
+                    a0, a1, a2, a3 = s[4 * c:4 * c + 4]
+                    t = a0 ^ a1 ^ a2 ^ a3
+                    out += [a0 ^ t ^ _xt(a0 ^ a1), a1 ^ t ^ _xt(a1 ^ a2), a2 ^ t ^ _xt(a2 ^ a3), a3 ^ t ^ _xt(a3 ^ a0)]
+                s = out
+            s = [b ^ k for b, k in zip(s, self.rk[r])]
+        return bytes(s)
+
+
+def aes_ctr(key, counter_block, data):
+    """AES-CTR; the LAST 4 bytes of the counter block are a big-endian counter (what Meshtastic's firmware uses)."""
+    aes = AES(key)
+    ctr = bytearray(counter_block)
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        ks = aes.encrypt(bytes(ctr))
+        out += bytes(a ^ b for a, b in zip(data[i:i + 16], ks))
+        n = (int.from_bytes(ctr[12:], "big") + 1) & 0xFFFFFFFF
+        ctr[12:] = n.to_bytes(4, "big")
+    return bytes(out)
+
+
+def aes_cmac(key, msg):
+    aes = AES(key)
+    def dbl(b):
+        v = int.from_bytes(b, "big") << 1
+        v = (v ^ 0x87) if v >> 128 else v
+        return (v & ((1 << 128) - 1)).to_bytes(16, "big")
+    L = aes.encrypt(bytes(16))
+    k1 = dbl(L)
+    k2 = dbl(k1)
+    n = max(1, (len(msg) + 15) // 16)
+    complete = len(msg) > 0 and len(msg) % 16 == 0
+    last = msg[16 * (n - 1):]
+    if complete:
+        last = bytes(a ^ b for a, b in zip(last, k1))
+    else:
+        last = last + b"\x80" + bytes(15 - len(last))
+        last = bytes(a ^ b for a, b in zip(last, k2))
+    x = bytes(16)
+    for i in range(n - 1):
+        x = aes.encrypt(bytes(a ^ b for a, b in zip(x, msg[16 * i:16 * i + 16])))
+    return aes.encrypt(bytes(a ^ b for a, b in zip(x, last)))
+
+
+# =====================================================================================================================
+# protobuf wire decoder driven by the generated Meshtastic tables
+# =====================================================================================================================
+def pb_parse(data):
+    """-> list of (field_no, wire_type, value). Raises ValueError if malformed."""
+    i, n, out = 0, len(data), []
+    def varint():
+        nonlocal i
+        shift = v = 0
+        while True:
+            if i >= n or shift > 63:
+                raise ValueError("bad varint")
+            b = data[i]
+            i += 1
+            v |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return v
+            shift += 7
+    while i < n:
+        tag = varint()
+        fno, wt = tag >> 3, tag & 7
+        if fno == 0:
+            raise ValueError("field 0")
+        if wt == 0:
+            out.append((fno, 0, varint()))
+        elif wt == 1:
+            if i + 8 > n: raise ValueError("short fixed64")
+            out.append((fno, 1, data[i:i + 8])); i += 8
+        elif wt == 2:
+            ln = varint()
+            if i + ln > n: raise ValueError("short length-delimited")
+            out.append((fno, 2, data[i:i + ln])); i += ln
+        elif wt == 5:
+            if i + 4 > n: raise ValueError("short fixed32")
+            out.append((fno, 5, data[i:i + 4])); i += 4
+        else:
+            raise ValueError("unsupported wire type %d" % wt)
+    return out
+
+
+def _signed(v, bits):
+    v &= (1 << 64) - 1
+    if v >= (1 << 63):
+        v -= 1 << 64
+    return v
+
+
+def pb_value(ftype, wt, val):
+    """Convert a raw wire value to a Python value according to the declared field type."""
+    try:
+        if wt == 0:
+            if ftype == "bool": return bool(val)
+            if ftype == "sint": return (val >> 1) ^ -(val & 1)
+            if ftype == "int": return _signed(val, 64)
+            return val
+        if wt == 5:
+            if ftype == "float": return struct.unpack("<f", val)[0]
+            if ftype == "sfixed32": return struct.unpack("<i", val)[0]
+            return struct.unpack("<I", val)[0]
+        if wt == 1:
+            if ftype == "double": return struct.unpack("<d", val)[0]
+            if ftype == "sfixed64": return struct.unpack("<q", val)[0]
+            return struct.unpack("<Q", val)[0]
+    except Exception:
+        pass
+    return val
+
+
+def pb_decode_msg(name, data, depth=0):
+    """-> list of (field_name, python_value) with nested messages as ('name', [..]); unknown fields as ('field N', raw)."""
+    fields = MT_MSG.get(name, {})
+    out = []
+    for fno, wt, raw in pb_parse(data):
+        if fno in fields:
+            fname, ftype, rep = fields[fno]
+            if ftype.startswith("msg:") and wt == 2:
+                try:
+                    out.append((fname, pb_decode_msg(ftype[4:], raw, depth + 1)))
+                except ValueError:
+                    out.append((fname, raw))
+            elif ftype == "string" and wt == 2:
+                out.append((fname, raw.decode("utf-8", "replace")))
+            elif ftype == "bytes" and wt == 2:
+                out.append((fname, bytes(raw)))
+            elif ftype.startswith("enum:") and wt == 0:
+                out.append((fname, MT_ENUM.get(ftype[5:], {}).get(raw, f"{raw}")))
+            elif wt == 2:                                    # packed repeated scalars: leave raw
+                out.append((fname, bytes(raw)))
+            else:
+                out.append((fname, pb_value(ftype, wt, raw)))
+        else:
+            out.append((f"field {fno}", raw if wt in (2,) else pb_value("uint", wt, raw)))
+    return out
+
+
+def _fmt_val(v):
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex() if len(v) <= 24 else v[:24].hex() + f"...({len(v)} B)"
+    if isinstance(v, float):
+        return f"{v:.6g}"
+    return str(v)
+
+
+def pb_lines(items, indent=0):
+    pad = "  " * indent
+    scal = [(k, v) for k, v in items if not isinstance(v, list)]
+    nest = [(k, v) for k, v in items if isinstance(v, list)]
+    lines = []
+    if scal:
+        lines.append(pad + "  ".join(f"{k}={_fmt_val(v)}" for k, v in scal))
+    for k, v in nest:
+        lines.append(f"{pad}{k}:")
+        lines += pb_lines(v, indent + 1)
+    return lines
+
+
+# =====================================================================================================================
+# Meshtastic
+# =====================================================================================================================
+MT_DEFAULT_PSK = bytes([0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59, 0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01])
+MT_PRESET_NAMES = ["LongFast", "LongSlow", "LongModerate", "LongTurbo", "MediumFast", "MediumSlow", "ShortFast", "ShortSlow", "ShortTurbo",
+                   "VeryLongSlow"]
+
+
+def mt_expand_key(spec):
+    """Channel key as the user types it: base64 or hex. 1 byte = default-key index (AQ== = 1 = the public default key)."""
+    s = spec.strip()
+    if not s:
+        return None
+    try:
+        raw = bytes.fromhex(s.replace(" ", "").replace(":", "")) if all(c in "0123456789abcdefABCDEF :" for c in s) and len(s.replace(" ", "")) % 2 == 0 \
+            and len(s.replace(" ", "").replace(":", "")) in (2, 32, 64) else base64.b64decode(s + "=" * (-len(s) % 4))
+    except Exception:
+        return None
+    if len(raw) == 1:
+        if raw[0] == 0:
+            return None                                          # index 0 = no encryption
+        k = bytearray(MT_DEFAULT_PSK)
+        k[15] = (k[15] + raw[0] - 1) & 0xFF
+        return bytes(k)
+    if len(raw) < 16:
+        return raw + bytes(16 - len(raw))
+    if len(raw) in (16, 32):
+        return raw
+    if len(raw) < 32:
+        return raw + bytes(32 - len(raw))
+    return raw[:32]
+
+
+def mt_channel_hash(name, key):
+    h = 0
+    for b in name.encode():
+        h ^= b
+    for b in key:
+        h ^= b
+    return h
+
+
+def mt_hex_node(n):
+    return "^all" if n == 0xFFFFFFFF else f"!{n:08x}"
+
+
+def parse_meshtastic(payload, key_specs=("AQ==",), channel_names=()):
+    """Return dict(ok, header(dict), lines(list[str]), summary(str))."""
+    p = bytes(payload)
+    if len(p) < 16:
+        return {"ok": False, "summary": "too short for a Meshtastic header", "lines": []}
+    to, frm, pid = struct.unpack("<III", p[:12])
+    flags, ch, nh, rn = p[12], p[13], p[14], p[15]
+    hdr = {"to": to, "from": frm, "id": pid, "hop_limit": flags & 7, "want_ack": bool(flags & 8), "via_mqtt": bool(flags & 16),
+           "hop_start": flags >> 5, "channel": ch, "next_hop": nh, "relay_node": rn}
+    body = p[16:]
+    lines = [f"Meshtastic  to={mt_hex_node(to)}  from={mt_hex_node(frm)}  id=0x{pid:08x}  hops={hdr['hop_limit']}/{hdr['hop_start']}"
+             f"  want_ack={int(hdr['want_ack'])}  via_mqtt={int(hdr['via_mqtt'])}  channel_hash=0x{ch:02x}  next_hop=0x{nh:02x}  relay=0x{rn:02x}"]
+    keys = []
+    for spec in key_specs:
+        k = mt_expand_key(spec)
+        if k and k not in [x[1] for x in keys]:
+            keys.append((spec, k))
+    for idx in range(1, 11):                                       # the public default key and its nine documented variants
+        k = bytearray(MT_DEFAULT_PSK); k[15] = (k[15] + idx - 1) & 0xFF
+        if bytes(k) not in [x[1] for x in keys]:
+            keys.append((f"default#{idx}", bytes(k)))
+    names = list(channel_names) + MT_PRESET_NAMES
+    cand = []
+    for spec, k in keys:                                           # keys whose channel hash matches the packet come first
+        match = [n for n in names if mt_channel_hash(n, k) == ch]
+        cand.append((0 if match else 1, spec, k, match))
+    cand.sort(key=lambda c: c[0])
+    if ch == 0 and len(body) > 12:
+        lines.append("  channel hash 0 + 12 extra bytes: PKI direct message (Curve25519 + AES-CCM) - cannot be decrypted without the node keys")
+        lines.append("  encrypted: " + body.hex())
+        return {"ok": True, "header": hdr, "lines": lines, "summary": f"Meshtastic PKI DM {mt_hex_node(frm)}->{mt_hex_node(to)}"}
+    nonce = struct.pack("<Q", pid) + struct.pack("<I", frm) + bytes(4)
+    for _, spec, k, match in cand:
+        plain = aes_ctr(k, nonce, body)
+        try:
+            items = pb_parse(plain)
+        except ValueError:
+            continue
+        d = {f: (w, v) for f, w, v in items}
+        port = d.get(1, (0, None))[1]
+        if 1 not in d or d[1][0] != 0 or port is None or port not in MT_ENUM["PortNum"] and port > 511:
+            continue
+        data = pb_decode_msg("Data", plain)
+        pname = MT_ENUM["PortNum"].get(port, str(port))
+        hdr["port"] = pname
+        kdesc = (f"key {spec}" + (f" (hash matches channel '{match[0]}')" if match else ""))
+        lines.append(f"  decrypted with {kdesc}:  port={pname}")
+        pay = next((v for n_, v in data if n_ == "payload"), b"")
+        others = [(n_, v) for n_, v in data if n_ not in ("portnum", "payload")]
+        if others:
+            lines.append("  " + "  ".join(f"{n_}={_fmt_val(v)}" for n_, v in others))
+        summary = f"Meshtastic {pname}"
+        sub = {"POSITION_APP": "Position", "NODEINFO_APP": "User", "TELEMETRY_APP": "Telemetry", "ROUTING_APP": "Routing",
+               "WAYPOINT_APP": "Waypoint", "NEIGHBORINFO_APP": "NeighborInfo", "TRACEROUTE_APP": "RouteDiscovery"}.get(pname)
+        if pname in ("TEXT_MESSAGE_APP", "ALERT_APP"):
+            txt = pay.decode("utf-8", "replace")
+            lines.append(f"  text: {txt!r}")
+            summary += f" {txt!r}"
+        elif pname == "TEXT_MESSAGE_COMPRESSED_APP":
+            lines.append("  compressed text (Unishox2): " + pay.hex())
+        elif sub:
+            try:
+                dec = pb_decode_msg(sub, pay)
+                if sub == "Position":
+                    dec = _pos_friendly(dec)
+                lines += pb_lines(dec, 2)
+                if sub == "User":
+                    nm = next((v for n_, v in dec if n_ == "long_name"), None)
+                    if nm: summary += f" {nm!r}"
+            except ValueError:
+                lines.append("  payload (could not parse as " + sub + "): " + pay.hex())
+        else:
+            lines.append("  payload: " + (pay.hex() if len(pay) <= 64 else pay[:64].hex() + f"...({len(pay)} B)"))
+        return {"ok": True, "header": hdr, "lines": lines, "summary": summary}
+    lines.append(f"  payload {len(body)} B: could not decrypt with the available keys (hash 0x{ch:02x}) - add the channel key under Keys...")
+    lines.append("  encrypted: " + (body.hex() if len(body) <= 80 else body[:80].hex() + "..."))
+    return {"ok": True, "header": hdr, "lines": lines, "summary": f"Meshtastic {mt_hex_node(frm)} (encrypted)"}
+
+
+def _pos_friendly(items):
+    out = []
+    for n_, v in items:
+        if n_ == "latitude_i" and isinstance(v, int):
+            out.append(("latitude", round(v * 1e-7, 7)))
+        elif n_ == "longitude_i" and isinstance(v, int):
+            out.append(("longitude", round(v * 1e-7, 7)))
+        else:
+            out.append((n_, v))
+    return out
+
+
+# =====================================================================================================================
+# LoRaWAN
+# =====================================================================================================================
+LW_MTYPE = ["JoinRequest", "JoinAccept", "UnconfirmedDataUp", "UnconfirmedDataDown", "ConfirmedDataUp", "ConfirmedDataDown",
+            "RejoinRequest", "Proprietary"]
+LW_MAC_UP = {0x01: ("ResetInd", 1), 0x02: ("LinkCheckReq", 0), 0x03: ("LinkADRAns", 1), 0x04: ("DutyCycleAns", 0), 0x05: ("RXParamSetupAns", 1),
+             0x06: ("DevStatusAns", 2), 0x07: ("NewChannelAns", 1), 0x08: ("RXTimingSetupAns", 0), 0x09: ("TxParamSetupAns", 0),
+             0x0A: ("DlChannelAns", 1), 0x0B: ("RekeyInd", 1), 0x0C: ("ADRParamSetupAns", 0), 0x0D: ("DeviceTimeReq", 0),
+             0x0E: ("RejoinParamSetupAns", 1)}
+LW_MAC_DOWN = {0x01: ("ResetConf", 1), 0x02: ("LinkCheckAns", 2), 0x03: ("LinkADRReq", 4), 0x04: ("DutyCycleReq", 1), 0x05: ("RXParamSetupReq", 4),
+               0x06: ("DevStatusReq", 0), 0x07: ("NewChannelReq", 5), 0x08: ("RXTimingSetupReq", 1), 0x09: ("TxParamSetupReq", 1),
+               0x0A: ("DlChannelReq", 4), 0x0B: ("RekeyConf", 1), 0x0C: ("ADRParamSetupReq", 1), 0x0D: ("DeviceTimeAns", 5),
+               0x0E: ("ForceRejoinReq", 2), 0x0F: ("RejoinParamSetupReq", 1)}
+
+
+def _eui(b):
+    return bytes(reversed(b)).hex().upper()
+
+
+def lw_looks_valid(p):
+    if len(p) < 12:
+        return False
+    mhdr = p[0]
+    mt, major = mhdr >> 5, mhdr & 3
+    if major != 0:
+        return False
+    if mt == 0:
+        return len(p) == 23
+    if mt == 1:
+        return len(p) in (17, 33)
+    if mt in (2, 3, 4, 5):
+        fopts = p[5] & 0x0F
+        return 1 + 7 + fopts <= len(p) - 4 + 0
+    return mt in (6, 7)
+
+
+def _lw_mac(cmds, up):
+    table = LW_MAC_UP if up else LW_MAC_DOWN
+    out, i = [], 0
+    while i < len(cmds):
+        cid = cmds[i]
+        name, ln = table.get(cid, (f"CID 0x{cid:02X}", None))
+        if ln is None or i + 1 + ln > len(cmds):
+            out.append(f"{name}(+{cmds[i + 1:].hex()})")
+            break
+        out.append(f"{name}" + (f"[{cmds[i + 1:i + 1 + ln].hex()}]" if ln else ""))
+        i += 1 + ln
+    return out
+
+
+def parse_lorawan(payload, nwk_skey=None, app_skey=None, app_key=None):
+    p = bytes(payload)
+    if len(p) < 5:
+        return {"ok": False, "summary": "too short", "lines": []}
+    mhdr = p[0]
+    mt, major = mhdr >> 5, mhdr & 3
+    lines = [f"LoRaWAN  {LW_MTYPE[mt]}  major={major}  (MHDR 0x{mhdr:02x})"]
+    summary = f"LoRaWAN {LW_MTYPE[mt]}"
+    mic = p[-4:]
+    if mt == 0 and len(p) == 23:
+        app_eui, dev_eui, nonce = _eui(p[1:9]), _eui(p[9:17]), struct.unpack("<H", p[17:19])[0]
+        lines.append(f"  JoinEUI/AppEUI={app_eui}  DevEUI={dev_eui}  DevNonce=0x{nonce:04x}  MIC={mic.hex()}")
+        if app_key:
+            ok = aes_cmac(app_key, p[:-4])[:4] == mic
+            lines.append(f"  MIC {'VALID with the given AppKey' if ok else 'does not match the given AppKey'}")
+        summary += f" DevEUI {dev_eui}"
+    elif mt == 1:
+        lines.append(f"  encrypted JoinAccept ({len(p) - 1} B): {p[1:].hex()}")
+        if app_key:
+            aes = AES(app_key)
+            dec = b"".join(aes.encrypt(p[1 + i:17 + i]) for i in range(0, len(p) - 1, 16))
+            ok = aes_cmac(app_key, bytes([mhdr]) + dec[:-4])[:4] == dec[-4:]
+            lines.append(f"  decrypted: AppNonce={dec[0:3][::-1].hex()}  NetID={dec[3:6][::-1].hex()}  DevAddr={dec[6:10][::-1].hex().upper()}"
+                         f"  DLSettings=0x{dec[10]:02x}  RxDelay={dec[11] & 15}s" + (f"  CFList={dec[12:28].hex()}" if len(dec) == 32 else "")
+                         + f"  MIC {'VALID' if ok else 'INVALID'}")
+    elif mt in (2, 3, 4, 5) and len(p) >= 12:
+        up = mt in (2, 4)
+        dev_addr = struct.unpack("<I", p[1:5])[0]
+        fctrl = p[5]
+        fcnt = struct.unpack("<H", p[6:8])[0]
+        fopts_len = fctrl & 0x0F
+        fopts = p[8:8 + fopts_len]
+        rest = p[8 + fopts_len:-4]
+        fport = rest[0] if rest else None
+        frm = rest[1:] if rest else b""
+        if up:
+            fl = f"ADR={fctrl >> 7 & 1} ADRACKReq={fctrl >> 6 & 1} ACK={fctrl >> 5 & 1} ClassB={fctrl >> 4 & 1}"
+        else:
+            fl = f"ADR={fctrl >> 7 & 1} ACK={fctrl >> 5 & 1} FPending={fctrl >> 4 & 1}"
+        lines.append(f"  DevAddr={dev_addr:08X}  FCtrl=0x{fctrl:02x} ({fl} FOptsLen={fopts_len})  FCnt={fcnt}"
+                     f"  FPort={fport if fport is not None else '-'}  FRMPayload {len(frm)} B  MIC={mic.hex()}")
+        if fopts:
+            lines.append("  FOpts MAC commands: " + ", ".join(_lw_mac(fopts, up)))
+        if nwk_skey:
+            dirb = 0 if up else 1
+            b0 = b"\x49" + bytes(4) + bytes([dirb]) + struct.pack("<I", dev_addr) + struct.pack("<I", fcnt) + b"\x00" + bytes([len(p) - 4])
+            calc = aes_cmac(nwk_skey, b0 + p[:-4])[:4]
+            lines.append(f"  MIC {'VALID' if calc == mic else 'does not match'} with the given NwkSKey (FCnt assumed < 65536)")
+        key = (nwk_skey if fport == 0 else app_skey)
+        if frm and key:
+            dirb = 0 if up else 1
+            out = bytearray()
+            for i in range(0, len(frm), 16):
+                a = b"\x01" + bytes(4) + bytes([dirb]) + struct.pack("<I", dev_addr) + struct.pack("<I", fcnt) + b"\x00" + bytes([i // 16 + 1])
+                s = AES(key).encrypt(a)
+                out += bytes(x ^ y for x, y in zip(frm[i:i + 16], s))
+            dec = bytes(out)
+            if fport == 0:
+                lines.append("  MAC commands (FPort 0): " + ", ".join(_lw_mac(dec, up)))
+            else:
+                try:
+                    txt = dec.decode("ascii")
+                    printable = all(32 <= ord(c) < 127 for c in txt)
+                except UnicodeDecodeError:
+                    printable = False
+                lines.append(f"  decrypted payload: {dec.hex()}" + (f"  ({dec.decode('ascii')!r})" if printable else ""))
+        elif frm:
+            lines.append(f"  payload (encrypted): {frm.hex()}" + ("  - give the "
+                         + ("NwkSKey" if fport == 0 else "AppSKey") + " under Keys... to decrypt" if True else ""))
+        summary += f" DevAddr {dev_addr:08X} FCnt {fcnt}" + (f" port {fport}" if fport is not None else "")
+    elif mt == 6:
+        lines.append("  RejoinRequest: " + p[1:].hex())
+    else:
+        lines.append("  proprietary / unrecognised: " + p[1:].hex())
+    return {"ok": True, "lines": lines, "summary": summary}
+
+MT_REGIONS = {'US': (902.0, 928.0, 0.0), 'EU_433': (433.0, 434.0, 0.0), 'EU_868': (869.4, 869.65, 0.0), 'CN': (470.0, 510.0, 0.0), 'JP': (920.5, 923.5, 0.0), 'ANZ': (915.0, 928.0, 0.0), 'ANZ_433': (433.05, 434.79, 0.0), 'RU': (868.7, 869.2, 0.0), 'KR': (920.0, 923.0, 0.0), 'TW': (920.0, 925.0, 0.0), 'IN': (865.0, 867.0, 0.0), 'NZ_865': (864.0, 868.0, 0.0), 'TH': (920.0, 925.0, 0.0), 'UA_433': (433.0, 434.7, 0.0), 'UA_868': (868.0, 868.6, 0.0), 'MY_433': (433.0, 435.0, 0.0), 'MY_919': (919.0, 924.0, 0.0), 'SG_923': (917.0, 925.0, 0.0), 'PH_433': (433.0, 434.7, 0.0), 'PH_868': (868.0, 869.4, 0.0), 'PH_915': (915.0, 918.0, 0.0), 'KZ_433': (433.075, 434.775, 0.0), 'KZ_863': (863.0, 868.0, 0.0), 'NP_865': (865.0, 868.0, 0.0), 'BR_902': (902.0, 907.5, 0.0), 'LORA_24': (2400.0, 2483.5, 0.0), 'UNSET': (902.0, 928.0, 0.0)}
+
+
+# =====================================================================================================================
+# LoRa presets, Meshtastic default-frequency calculation (the firmware's own rule) and the frame describer
+# =====================================================================================================================
+# modem presets from the Meshtastic firmware (MeshRadio.h): display name -> (SF, bandwidth kHz, coding rate denominator)
+MT_MODEM_PRESETS = {"LongFast": (11, 250, 5), "LongSlow": (12, 125, 8), "LongModerate": (11, 125, 8), "LongTurbo": (11, 500, 8),
+                    "MediumFast": (9, 250, 5), "MediumSlow": (10, 250, 5), "ShortFast": (7, 250, 5), "ShortSlow": (8, 250, 5),
+                    "ShortTurbo": (7, 500, 5)}
+
+
+def mt_djb2(s):
+    h = 5381
+    for c in s.encode():
+        h = (h * 33 + c) & 0xFFFFFFFF
+    return h
+
+
+def mt_default_freq(region, preset_name, bw_khz=None):
+    """Default channel frequency in MHz for a Meshtastic modem preset in a region (firmware: numChannels = floor(span / bw),
+    slot = djb2(preset name) % numChannels, f = start + bw/2 + slot * bw). None if the region is unknown."""
+    if region not in MT_REGIONS or preset_name not in MT_MODEM_PRESETS:
+        return None
+    start, end, spacing = MT_REGIONS[region]
+    bw = float(bw_khz if bw_khz else MT_MODEM_PRESETS[preset_name][1])
+    n = int((end - start) // (spacing + bw / 1000.0))
+    if n < 1:
+        return None
+    slot = mt_djb2(preset_name) % n
+    return start + bw / 2000.0 + slot * bw / 1000.0
+
+
+# (label, settings) - settings: sf, bw (Hz), sync (None = any), parse, freq (MHz) or mt=<preset name> (frequency from the Region box), invert
+LORA_PRESETS = [("Custom - use the SF / BW / sync boxes", None)]
+for _n, (_sf, _bw, _cr) in MT_MODEM_PRESETS.items():
+    LORA_PRESETS.append((f"Meshtastic {_n}  SF{_sf} / {_bw} kHz / CR 4/{_cr}",
+                         dict(sf=_sf, bw=_bw * 1e3, sync=0x2B, parse="mesh", mt=_n)))
+LORA_PRESETS += [
+    ("LoRaWAN EU868  SF7 / 125 kHz   868.1 MHz", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", freq=868.1)),
+    ("LoRaWAN EU868  SF9 / 125 kHz   868.3 MHz", dict(sf=9, bw=125e3, sync=0x34, parse="lorawan", freq=868.3)),
+    ("LoRaWAN EU868  SF12 / 125 kHz  868.5 MHz", dict(sf=12, bw=125e3, sync=0x34, parse="lorawan", freq=868.5)),
+    ("LoRaWAN EU868  RX2 downlink SF12 / 125 kHz  869.525 MHz (inverted IQ)",
+     dict(sf=12, bw=125e3, sync=0x34, parse="lorawan", freq=869.525, invert=True)),
+    ("LoRaWAN EU433  SF7 / 125 kHz   433.175 MHz", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", freq=433.175)),
+    ("LoRaWAN US915  SF7 / 125 kHz   902.3 MHz", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", freq=902.3)),
+    ("LoRaWAN US915  SF8 / 500 kHz   903.0 MHz", dict(sf=8, bw=500e3, sync=0x34, parse="lorawan", freq=903.0)),
+    ("LoRaWAN AS923  SF7 / 125 kHz   923.2 MHz", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", freq=923.2)),
+    ("LoRaWAN IN865  SF7 / 125 kHz   865.0625 MHz", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", freq=865.0625)),
+    ("Generic LoRa, private sync 0x12  SF7 / 125 kHz", dict(sf=7, bw=125e3, sync=0x12, parse="raw")),
+    # several channels at once (one shared SDR stream; the centre frequency is set to the middle of the plan)
+    ("LoRaWAN EU868  3 default channels  868.1 / 868.3 / 868.5  (SF7)",
+     dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[868.1, 868.3, 868.5])),
+    ("LoRaWAN EU868  all 8 channels  867.1 ... 868.5  (SF7)",
+     dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[867.1, 867.3, 867.5, 867.7, 867.9, 868.1, 868.3, 868.5])),
+    ("LoRaWAN EU433  3 default channels  433.175 / 433.375 / 433.575  (SF7)",
+     dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[433.175, 433.375, 433.575])),
+    ("LoRaWAN US915  sub-band 1, 8 channels  902.3 ... 903.7  (SF7)",
+     dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[902.3, 902.5, 902.7, 902.9, 903.1, 903.3, 903.5, 903.7])),
+    ("LoRaWAN AS923  2 default channels  923.2 / 923.4  (SF7)", dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[923.2, 923.4])),
+    ("LoRaWAN IN865  3 default channels  865.0625 / 865.4025 / 865.985  (SF7)",
+     dict(sf=7, bw=125e3, sync=0x34, parse="lorawan", chans=[865.0625, 865.4025, 865.985])),
+]
+LORA_SYNC_CHOICES = [("Any sync word", None), ("0x2B  Meshtastic", 0x2B), ("0x34  LoRaWAN public", 0x34), ("0x12  private / default", 0x12)]
+LORA_PARSE_CHOICES = [("Auto", "auto"), ("Meshtastic", "mesh"), ("LoRaWAN", "lorawan"), ("Raw hex only", "raw")]
+
+
+def lora_hex_lines(b, per=32):
+    return ["  hex: " + b[i:i + per].hex(" ") if i == 0 else "       " + b[i:i + per].hex(" ") for i in range(0, max(len(b), 1), per)]
+
+
+def lora_describe(f, parse_mode="auto", cfg=None):
+    """Decoded PHY frame -> list of text lines. First line = physical layer; then hex; then the parsed protocol layer."""
+    cfg = cfg or {}
+    T = (1 << f["sf"]) / f["bw"]
+    crc = "CRC OK" if f["crc_ok"] else ("CRC FAIL" if f["crc_ok"] is False else "no CRC")
+    chan = f"{f['freq_hz'] / 1e6:.4f} MHz  " if (f.get("show_freq") and f.get("freq_hz")) else ""
+    lines = [f"LoRa {chan}SF{f['sf']}/BW{f['bw'] / 1e3:g} CR4/{4 + f['cr']}  len {f['length']}  {crc}  SNR {f['snr_db']:+.1f} dB  "
+             f"CFO {f['cfo_hz'] / 1e3:+.2f} kHz  sync " + (f"0x{f['sync']:02X}" if f.get("sync") is not None else "?")
+             + f"  header+payload {f['n_symbols']} sym = {f['n_symbols'] * T * 1e3:.0f} ms" + ("  LDRO" if f.get("ldro") else "")]
+    p = f["payload"]
+    lines += lora_hex_lines(p)
+    if f["crc_ok"] is False:
+        lines.append("  CRC failed: payload may be corrupt - not parsed")
+        return lines
+    mode = parse_mode
+    sync = f.get("sync")
+    if mode == "auto":
+        if sync == 0x2B:
+            mode = "mesh"
+        elif sync == 0x34 or (lw_looks_valid(p) and sync != 0x2B):
+            mode = "lorawan" if lw_looks_valid(p) else "mesh" if len(p) >= 17 else "raw"
+        else:
+            mode = "mesh" if len(p) >= 17 and not lw_looks_valid(p) else "raw"
+    try:
+        if mode == "mesh":
+            r = parse_meshtastic(p, key_specs=tuple(cfg.get("mt_keys") or ("AQ==",)), channel_names=tuple(cfg.get("mt_names") or ()))
+            lines += r["lines"]
+        elif mode == "lorawan":
+            r = parse_lorawan(p, cfg.get("nwk"), cfg.get("app"), cfg.get("appkey"))
+            lines += r["lines"] if r["lines"] else ["  not a valid LoRaWAN PHYPayload"]
+    except Exception as e:                                         # a parser must never take the decoder down
+        lines.append(f"  parser error: {e!r}")
+    return lines
+
+
+# near-misses (3-4 equal chirps in a row) that PURE NOISE produces per minute per channel at BW125 (measured; scales with bandwidth).
+# Low spreading factors have few bins, so chance coincidences are common there and the count means little; from SF9 up it should stay ~0.
+LORA_NOISE_NEARMISS = {7: 10, 8: 3, 9: 0, 10: 0, 11: 0, 12: 0}
+
+
 class SurveySignals(QtCore.QObject):
     # survey worker thread -> GUI thread: True if the survey was stopped early
     done = QtCore.pyqtSignal(object)
@@ -4905,7 +6069,8 @@ class EmcScanner(QtWidgets.QMainWindow):
                  ("NFM audio (marine VHF / PMR)", "NFM"),
                  ("AM audio", "AM"),
                  ("OOK bursts (433 MHz remotes)", "OOK"),
-                 ("FSK bursts", "FSK")]
+                 ("FSK bursts", "FSK"),
+                 ("LoRa (Meshtastic / LoRaWAN)", "LORA")]
 
     # ---- decoder_build_ui(): version 2. The version 1 code is kept, commented out, just below ----
     def decoder_build_ui(self, left_layout):
@@ -4920,6 +6085,17 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.dec_reset_profile = False
         self.dec_burst_bw = 200.0                  # OOK channel half-width in kHz: cheap transmitters drift and chirp, so it is wide
         self.dec_dump_request = False
+        self.dec_lora_sf = 11                      # LoRa decoder settings (defaults = Meshtastic LongFast)
+        self.dec_lora_bw = 250e3
+        self.dec_lora_sync = None                  # None = accept any sync word
+        self.dec_lora_parse = "auto"
+        self.dec_lora_invert = False               # LoRaWAN downlinks use inverted IQ
+        self.dec_lora_show_bad = True
+        self.dec_lora_region = "EU_868"
+        self.dec_lora_chans = []                   # extra channels (Hz): several channels from one stream; [] = just the centre frequency
+        self.dec_log_lines = 4                     # height of the list in text lines (0 = hidden)
+        self.dec_keys = {"mt": "AQ==", "mt_names": "", "nwk": "", "app": "", "appkey": ""}
+        self._lora_cfg = self.decoder_lora_cfg()
         self._dec_session = 0
         self._dec_out = None                       # (name kept from version 1) = the audio sink object that lives in its own thread
         self._dec_thread = None
@@ -5012,9 +6188,22 @@ class EmcScanner(QtWidgets.QMainWindow):
         btn_clear.clicked.connect(self.decoder_clear_list)
         btn_copy = QtWidgets.QPushButton("Copy")
         btn_copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.dec_log.toPlainText()))
-        for w in (lab3, self.dec_sens_spin, lab_bw, self.dec_bw_spin, self.dec_chk_sync, btn_dump, btn_clear, btn_copy):
+        for w in (lab3, self.dec_sens_spin, lab_bw, self.dec_bw_spin, self.dec_chk_sync, btn_dump):
             r1.addWidget(w)
             self.dec_burst_widgets.append(w)
+        self.dec_list_widgets = []
+        for w in (btn_clear, btn_copy):
+            r1.addWidget(w)
+            self.dec_list_widgets.append(w)
+        lab_ln = QtWidgets.QLabel("List lines")
+        self.dec_lines_spin = QtWidgets.QSpinBox()
+        self.dec_lines_spin.setRange(0, 40)
+        self.dec_lines_spin.setValue(self.dec_log_lines)
+        self.dec_lines_spin.setToolTip("Height of the list of decoded frames in text lines. Smaller = more room for the spectrum and waterfall; 0 hides it.")
+        self.dec_lines_spin.valueChanged.connect(self.decoder_set_log_lines)
+        for w in (lab_ln, self.dec_lines_spin):
+            r1.addWidget(w)
+            self.dec_list_widgets.append(w)
 
         self.dec_chk_offset = QtWidgets.QCheckBox("Offset tune")
         self.dec_chk_offset.setChecked(True)
@@ -5024,6 +6213,69 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.dec_chk_offset.toggled.connect(lambda c: setattr(self, "dec_offset_tune", bool(c)))
         r1.addWidget(self.dec_chk_offset)
         r1.addStretch(1)
+
+        # ---- row 1b: LoRa controls (only visible for the LoRa decoder) ----
+        r2 = QtWidgets.QHBoxLayout()
+        vbox.addLayout(r2)
+        self.dec_lora_widgets = []
+        def _lw(w):
+            r2.addWidget(w)
+            self.dec_lora_widgets.append(w)
+            return w
+        _lw(QtWidgets.QLabel("Preset"))
+        self.dec_lora_preset = _lw(QtWidgets.QComboBox())
+        for label, _p in LORA_PRESETS:
+            self.dec_lora_preset.addItem(label)
+        self.dec_lora_preset.setToolTip("Picks SF, bandwidth, sync word, parser and the centre frequency (Meshtastic: from the Region box using the\n"
+                                        "firmware's own slot rule; LoRaWAN: the default channel).")
+        self.dec_lora_preset.currentIndexChanged.connect(self.decoder_lora_preset)
+        _lw(QtWidgets.QLabel("Region"))
+        self.dec_lora_region_combo = _lw(QtWidgets.QComboBox())
+        for rname in MT_REGIONS:
+            if rname not in ("UNSET", "LORA_24"):
+                self.dec_lora_region_combo.addItem(rname)
+        self.dec_lora_region_combo.setCurrentText(self.dec_lora_region)
+        self.dec_lora_region_combo.setToolTip("Meshtastic region: sets the default channel frequency for a Meshtastic preset (EU_868 = UK / Europe).")
+        self.dec_lora_region_combo.currentTextChanged.connect(self.decoder_lora_region_changed)
+        _lw(QtWidgets.QLabel("SF"))
+        self.dec_lora_sf_spin = _lw(QtWidgets.QSpinBox())
+        self.dec_lora_sf_spin.setRange(7, 12)
+        self.dec_lora_sf_spin.setValue(self.dec_lora_sf)
+        self.dec_lora_sf_spin.valueChanged.connect(lambda v: self.decoder_lora_manual("sf", v))
+        _lw(QtWidgets.QLabel("BW"))
+        self.dec_lora_bw_combo = _lw(QtWidgets.QComboBox())
+        for kh in (62.5, 125.0, 250.0, 500.0):
+            self.dec_lora_bw_combo.addItem(f"{kh:g} kHz", kh * 1e3)
+        self.dec_lora_bw_combo.setCurrentIndex(2)
+        self.dec_lora_bw_combo.currentIndexChanged.connect(lambda i: self.decoder_lora_manual("bw", self.dec_lora_bw_combo.itemData(i)))
+        self.dec_lora_sync_combo = _lw(QtWidgets.QComboBox())
+        for label, val in LORA_SYNC_CHOICES:
+            self.dec_lora_sync_combo.addItem(label, val)
+        self.dec_lora_sync_combo.setToolTip("Only show frames with this sync word (Any = show everything; the sync word is listed per frame).")
+        self.dec_lora_sync_combo.currentIndexChanged.connect(lambda i: self.decoder_lora_manual("sync", self.dec_lora_sync_combo.itemData(i)))
+        _lw(QtWidgets.QLabel("Parse"))
+        self.dec_lora_parse_combo = _lw(QtWidgets.QComboBox())
+        for label, val in LORA_PARSE_CHOICES:
+            self.dec_lora_parse_combo.addItem(label, val)
+        self.dec_lora_parse_combo.currentIndexChanged.connect(lambda i: setattr(self, "dec_lora_parse", self.dec_lora_parse_combo.itemData(i)))
+        self.dec_lora_inv_chk = _lw(QtWidgets.QCheckBox("Invert IQ"))
+        self.dec_lora_inv_chk.setToolTip("LoRaWAN gateway DOWNLINKS are sent with inverted IQ; tick this to receive them (uplinks need it off).")
+        self.dec_lora_inv_chk.toggled.connect(lambda c: setattr(self, "dec_lora_invert", bool(c)))
+        self.dec_lora_bad_chk = _lw(QtWidgets.QCheckBox("Show CRC errors"))
+        self.dec_lora_bad_chk.setChecked(True)
+        self.dec_lora_bad_chk.setToolTip("Also list frames whose header decoded but whose payload CRC failed (marked CRC FAIL, not parsed).")
+        self.dec_lora_bad_chk.toggled.connect(lambda c: setattr(self, "dec_lora_show_bad", bool(c)))
+        _lw(QtWidgets.QLabel("Channels"))
+        self.dec_lora_chan_edit = _lw(QtWidgets.QLineEdit())
+        self.dec_lora_chan_edit.setPlaceholderText("MHz, comma separated, e.g. 868.1, 868.3, 868.5  (empty = the centre frequency only)")
+        self.dec_lora_chan_edit.setMinimumWidth(230)
+        self.dec_lora_chan_edit.setToolTip("Monitor several LoRa channels at once (same SF / BW / sync). Type the frequencies in MHz and press Enter: the centre\n"
+                                           "frequency moves to the middle of them. All must fit inside the SDR's sample-rate span; the cost is small (a shared FFT).")
+        self.dec_lora_chan_edit.editingFinished.connect(self.decoder_lora_channels_apply)
+        btn_keys = _lw(QtWidgets.QPushButton("Keys..."))
+        btn_keys.setToolTip("Meshtastic channel keys and LoRaWAN session keys (optional): needed to read encrypted payloads / check MICs.")
+        btn_keys.clicked.connect(self.decoder_lora_keys)
+        r2.addStretch(1)
 
         # ---- row 2: status line, and (burst modes) the list of decoded bursts ----
         self.dec_status = QtWidgets.QLabel("")
@@ -5036,7 +6288,7 @@ class EmcScanner(QtWidgets.QMainWindow):
         self.dec_log.setReadOnly(True)
         self.dec_log.setFont(QtGui.QFont("Consolas", 9))
         self.dec_log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        self.dec_log.setFixedHeight(8 * self.dec_log.fontMetrics().lineSpacing() + 10)
+        self.dec_log.setFixedHeight(self.dec_log_lines * self.dec_log.fontMetrics().lineSpacing() + 10)
         vbox.addWidget(self.dec_log)
 
         # marker for the frequency being decoded on the spectrum
@@ -5166,19 +6418,39 @@ class EmcScanner(QtWidgets.QMainWindow):
     #OLD#     self.decoder_panel.setVisible(False)
     #OLD#     self.decoder_show_controls()
 
+    # ---- decoder_show_controls(): version 2. The version 1 code is kept, commented out, just below ----
     def decoder_show_controls(self):
         """Show only the controls that belong to the selected decoder."""
         audio = self.dec_mode in ("WFM", "NFM", "AM")
         burst = self.dec_mode in ("OOK", "FSK")
+        lora = self.dec_mode == "LORA"
         for w in self.dec_audio_widgets:
             w.setVisible(audio)
         for w in self.dec_burst_widgets:
             w.setVisible(burst)
-        self.dec_chk_offset.setVisible(audio or burst)
-        self.dec_log.setVisible(burst)
-        self.dec_status.setVisible(audio or burst)
+        for w in self.dec_lora_widgets:
+            w.setVisible(lora)
+        for w in self.dec_list_widgets:
+            w.setVisible(burst or lora)
+        self.dec_chk_offset.setVisible(audio or burst or lora)
+        self.dec_log.setVisible((burst or lora) and self.dec_log_lines > 0)
+        self.dec_status.setVisible(audio or burst or lora)
 
-    # ---- front-panel events (GUI thread) ----
+    # ---- LoRa decoder front-panel handling ----
+
+    #OLD# def decoder_show_controls(self):
+    #OLD#     """Show only the controls that belong to the selected decoder."""
+    #OLD#     audio = self.dec_mode in ("WFM", "NFM", "AM")
+    #OLD#     burst = self.dec_mode in ("OOK", "FSK")
+    #OLD#     for w in self.dec_audio_widgets:
+    #OLD#         w.setVisible(audio)
+    #OLD#     for w in self.dec_burst_widgets:
+    #OLD#         w.setVisible(burst)
+    #OLD#     self.dec_chk_offset.setVisible(audio or burst)
+    #OLD#     self.dec_log.setVisible(burst)
+    #OLD#     self.dec_status.setVisible(audio or burst)
+    #OLD#
+    #OLD# # ---- front-panel events (GUI thread) ----
 
     def decoder_on_mode(self, index):
         mode = self.DEC_MODES[index][1]
@@ -5429,7 +6701,7 @@ class EmcScanner(QtWidgets.QMainWindow):
             return
         hx = r.get("hex") or ""
         last = self._dec_entries[-1] if self._dec_entries else None
-        if (last is not None and hx and last["r"].get("hex") == hx and last["r"]["mode"] == r["mode"]
+        if (last is not None and hx and not r.get("lines") and last["r"].get("hex") == hx and last["r"]["mode"] == r["mode"]
                 and now - last["t_last"] < 3.0):
             # the same code again (a held button repeats it): one list entry, with a count
             last["n"] += 1
@@ -5482,6 +6754,8 @@ class EmcScanner(QtWidgets.QMainWindow):
         if e.get("text"):
             return e["text"].split("\n")
         r = e["r"]
+        if r.get("lines"):                                  # a LoRa frame: physical layer line, hex, parsed protocol layer
+            return [f"{e['ts']}  " + r["lines"][0]] + ["          " + ln for ln in r["lines"][1:]]
         hx = r.get("hex") or ""
         if r.get("baud") and r.get("nbits"):
             line = f"{e['ts']}  {r['mode']}  {r['baud']:6.0f} baud  {r['nbits']:3d} bits  {hx}"
@@ -5522,6 +6796,143 @@ class EmcScanner(QtWidgets.QMainWindow):
             sb.setValue(sb.maximum())
 
     # ---- the decoder thread ----
+
+    def decoder_lora_cfg(self):
+        """Parse the Keys... dialog texts into what lora_describe() needs."""
+        k = self.dec_keys
+        def hx(t):
+            t = "".join(c for c in t if c in "0123456789abcdefABCDEF")
+            return bytes.fromhex(t) if len(t) == 32 else None
+        return {"mt_keys": [x.strip() for x in k["mt"].split(",") if x.strip()] or ["AQ=="],
+                "mt_names": [x.strip() for x in k["mt_names"].split(",") if x.strip()],
+                "nwk": hx(k["nwk"]), "app": hx(k["app"]), "appkey": hx(k["appkey"])}
+
+    def decoder_lora_set(self, sf=None, bw=None, sync="keep", parse=None, invert=None):
+        """Set the LoRa widgets (without re-triggering the 'manual change' handlers) and the attributes the decoder thread reads."""
+        if sf is not None:
+            self.dec_lora_sf_spin.blockSignals(True)
+            self.dec_lora_sf_spin.setValue(int(sf))
+            self.dec_lora_sf_spin.blockSignals(False)
+            self.dec_lora_sf = int(sf)
+        if bw is not None:
+            i = self.dec_lora_bw_combo.findData(float(bw))
+            if i >= 0:
+                self.dec_lora_bw_combo.blockSignals(True)
+                self.dec_lora_bw_combo.setCurrentIndex(i)
+                self.dec_lora_bw_combo.blockSignals(False)
+                self.dec_lora_bw = float(bw)
+        if sync != "keep":
+            i = self.dec_lora_sync_combo.findData(sync)
+            self.dec_lora_sync_combo.blockSignals(True)
+            self.dec_lora_sync_combo.setCurrentIndex(max(i, 0))
+            self.dec_lora_sync_combo.blockSignals(False)
+            self.dec_lora_sync = sync
+        if parse is not None:
+            i = self.dec_lora_parse_combo.findData(parse)
+            self.dec_lora_parse_combo.blockSignals(True)
+            self.dec_lora_parse_combo.setCurrentIndex(max(i, 0))
+            self.dec_lora_parse_combo.blockSignals(False)
+            self.dec_lora_parse = parse
+        if invert is not None:
+            self.dec_lora_inv_chk.blockSignals(True)
+            self.dec_lora_inv_chk.setChecked(bool(invert))
+            self.dec_lora_inv_chk.blockSignals(False)
+            self.dec_lora_invert = bool(invert)
+
+    def decoder_lora_manual(self, what, value):
+        """A box was changed by hand: apply it and mark the preset as 'Custom'."""
+        if what == "sf":
+            self.dec_lora_sf = int(value)
+        elif what == "bw":
+            self.dec_lora_bw = float(value)
+        elif what == "sync":
+            self.dec_lora_sync = value
+        self.dec_lora_preset.blockSignals(True)
+        self.dec_lora_preset.setCurrentIndex(0)
+        self.dec_lora_preset.blockSignals(False)
+
+    def decoder_lora_preset(self, idx):
+        label, p = LORA_PRESETS[idx]
+        if not p:
+            return
+        self.decoder_lora_set(sf=p["sf"], bw=p["bw"], sync=p.get("sync"), parse=p.get("parse", "auto"), invert=p.get("invert", False))
+        if p.get("chans"):
+            self.dec_lora_chan_edit.setText(", ".join(f"{c:g}" for c in p["chans"]))
+            self.decoder_lora_channels_apply(preset_label=label)
+            return
+        self.dec_lora_chan_edit.clear()
+        self.dec_lora_chans = []
+        freq = p.get("freq")
+        if p.get("mt"):
+            freq = mt_default_freq(self.dec_lora_region, p["mt"], p["bw"] / 1e3)
+        if freq:
+            self.freq_selector.setValue(int(round(freq * 1e6)), emit_signal=True)
+            self.log(f"LoRa preset: {label.strip()} -> {freq:.4f} MHz")
+
+    def decoder_lora_region_changed(self, name):
+        self.dec_lora_region = name
+        idx = self.dec_lora_preset.currentIndex()
+        if idx > 0 and LORA_PRESETS[idx][1] and LORA_PRESETS[idx][1].get("mt"):
+            self.decoder_lora_preset(idx)                      # re-apply: the default slot depends on the region
+
+    def decoder_lora_keys(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("LoRa decoder keys")
+        form = QtWidgets.QFormLayout(dlg)
+        spec = [("mt", "Meshtastic channel key(s)", "base64 or hex, comma separated. AQ== (the public default key) is always tried as well."),
+                ("mt_names", "Meshtastic channel name(s)", "optional, comma separated: lets the channel hash byte identify the channel"),
+                ("nwk", "LoRaWAN NwkSKey", "32 hex digits: checks the MIC and decrypts MAC commands (FPort 0)"),
+                ("app", "LoRaWAN AppSKey", "32 hex digits: decrypts the application payload (FPort 1..223)"),
+                ("appkey", "LoRaWAN AppKey", "32 hex digits (OTAA): checks a join-request MIC and decrypts a join-accept")]
+        edits = {}
+        for key, label, tip in spec:
+            e = QtWidgets.QLineEdit(self.dec_keys.get(key, ""))
+            e.setToolTip(tip)
+            e.setMinimumWidth(420)
+            form.addRow(label, e)
+            edits[key] = e
+        form.addRow(QtWidgets.QLabel("Keys stay in this program's memory only (they are not saved)."))
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            for key in edits:
+                self.dec_keys[key] = edits[key].text().strip()
+            self._lora_cfg = self.decoder_lora_cfg()
+
+    def decoder_set_log_lines(self, n):
+        self.dec_log_lines = int(n)
+        self.dec_log.setFixedHeight(max(1, self.dec_log_lines) * self.dec_log.fontMetrics().lineSpacing() + 10)
+        self.dec_log.setVisible(self.dec_mode in ("OOK", "FSK", "LORA") and self.dec_log_lines > 0)
+
+    def decoder_lora_channels_apply(self, preset_label=None):
+        """Parse the Channels box (MHz list), keep them as Hz and move the centre frequency to the middle of them."""
+        import re as _re
+        txt = self.dec_lora_chan_edit.text().strip()
+        if not txt:
+            self.dec_lora_chans = []
+            return
+        vals = []
+        for tok in _re.split(r"[,;\s]+", txt):
+            if not tok:
+                continue
+            try:
+                v = float(tok)
+            except ValueError:
+                self.log(f"LoRa channels: cannot read '{tok}' (use MHz, e.g. 868.1, 868.3)")
+                return
+            vals.append(v * 1e6 if v < 100000 else v)            # MHz normally; a value of 100000 or more is taken as Hz
+        vals = sorted(set(vals))[:16]
+        self.dec_lora_chans = vals
+        if len(vals) > 1 or True:
+            mid = round((vals[0] + vals[-1]) / 2.0 / 1e3) * 1e3
+            self.freq_selector.setValue(int(mid), emit_signal=True)
+        if preset_label is None:                                  # typed by hand: the preset no longer describes the setup
+            self.dec_lora_preset.blockSignals(True)
+            self.dec_lora_preset.setCurrentIndex(0)
+            self.dec_lora_preset.blockSignals(False)
+        self.log(f"LoRa channels: {', '.join(f'{v / 1e6:.4f}' for v in vals)} MHz; centre {int(mid) / 1e6:.4f} MHz")
 
     def decoder_main(self, session):
         """Worker thread entry: settle the radio, then run the decoder loop. Always stops the async stream and reports back."""
@@ -5571,6 +6982,11 @@ class EmcScanner(QtWidgets.QMainWindow):
         cur_mode = None
         demod = None
         burst = None
+        lora = None
+        lora_params = None
+        n_lora = 0
+        n_lora_ok = 0
+        lora_t0 = time.time()
         phase = 0.0
         view_key = None
         marker_sent = None
@@ -5652,6 +7068,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                     burst = (BurstDecoder(rate, mode, bw_hz=self.dec_burst_bw * 1e3) if mode == "OOK"
                              else BurstDecoder(rate, mode) if mode == "FSK" else None)
                     cur_mode = mode
+                    lora = None
                     acc, acc_n = None, 0
                     if demod is not None and rate > 2.1e6 and not self._dec_hinted:
                         self._dec_hinted = True
@@ -5661,7 +7078,9 @@ class EmcScanner(QtWidgets.QMainWindow):
                     old_b = burst                          # channel width changed on the front panel: rebuild, keep the learned timing
                     burst = BurstDecoder(rate, "OOK", bw_hz=self.dec_burst_bw * 1e3)
                     burst.profile, burst.last_nbits = old_b.profile, old_b.last_nbits
-                lite = bool(self.dec_lite) and demod is not None      # audio: spend as little time as possible on the display
+                # audio: spend as little time as possible on the display. LoRa always does too: a frame lasts up to seconds and one
+                # dropped block (queue overrun) ruins it, while 1.6 ms waterfall rows are of no use for 8-32 ms chirps anyway
+                lite = (bool(self.dec_lite) and demod is not None) or mode == "LORA"
                 stride = 4 if lite else 1
 
                 # raw IQ (no DC removal / IQ balance: they would remove an AM carrier), continuous from the async stream
@@ -5687,6 +7106,29 @@ class EmcScanner(QtWidgets.QMainWindow):
                     pcm = (np.clip(audio * gain, -1.0, 1.0) * 32767.0).astype(np.int16)
                     if pcm.size:
                         sig.audio.emit(pcm.tobytes())
+                elif mode == "LORA":
+                    sync_sel = self.dec_lora_sync
+                    chans = tuple(self.dec_lora_chans) or (centre,)
+                    params = (int(self.dec_lora_sf), float(self.dec_lora_bw), rate, centre, chans)
+                    if lora is None or params != lora_params:
+                        # (re)build when SF / BW / rate / frequency / channel list change. One shared FFT front end serves all channels.
+                        lora = LoraMultiRx(params[0], params[1], rate, centre, list(chans))
+                        lora_params = params
+                        lora_t0 = time.time()
+                        if lora.skipped:
+                            self.log("LoRa: channels outside the SDR's span ignored: " + ", ".join(f"{f / 1e6:.4f}" for f in lora.skipped)
+                                     + " MHz (raise the sample rate or move the centre frequency)")
+                    x_in = np.conj(iq) if self.dec_lora_invert else iq
+                    for fr in lora.process(x_in):
+                        n_lora += 1
+                        n_lora_ok += 1 if fr["crc_ok"] is not False else 0
+                        fr["show_freq"] = len(chans) > 1
+                        if sync_sel is not None and fr.get("sync") != sync_sel:
+                            continue
+                        if fr["crc_ok"] is False and not self.dec_lora_show_bad:
+                            continue
+                        sig.burst.emit({"mode": "LORA", "hex": "", "lines": lora_describe(fr, self.dec_lora_parse, self._lora_cfg)})
+                    lvl_db = 20.0 * math.log10(float(np.mean(np.abs(iq))) + 1e-12)
                 else:
                     if self.dec_reset_profile:
                         burst.profile = None
@@ -5708,7 +7150,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                     seg = raw[:m].reshape(-1, NFFT)[::stride] * window[None, :]     # light display: every 4th frame only
                     spec = np.fft.fftshift(np.fft.fft(seg, axis=1), axes=1) / NFFT
                     pw = spec.real ** 2 + spec.imag ** 2
-                    if burst is not None:                  # bursts are short: keep the peak, not the average
+                    if burst is not None or lora is not None:      # bursts are short: keep the peak, not the average
                         bp = pw.max(axis=0)
                         acc = bp if acc is None else np.maximum(acc, bp)
                     else:
@@ -5721,7 +7163,7 @@ class EmcScanner(QtWidgets.QMainWindow):
                 now = time.time()
                 if now - t_ui >= (0.30 if lite else DECODER_UI_INTERVAL_S) and acc is not None:
                     t_ui = now
-                    mean_pw = acc if burst is not None else acc / float(max(acc_n, 1))
+                    mean_pw = acc if (burst is not None or lora is not None) else acc / float(max(acc_n, 1))
                     psd = 10.0 * np.log10(mean_pw + 1e-12) + self._psd_to_dbuv_const
                     freqs = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1.0 / rate)) + tune
                     self.freq_axis = freqs.astype(np.float64)
@@ -5738,7 +7180,17 @@ class EmcScanner(QtWidgets.QMainWindow):
                                                   float(NFFT * stride) / rate)
                         wf_blocks = []
                     cap = (f"stream OK, overruns {stream.overruns}" if stream is not None else "SYNC reads (samples lost!)")
-                    if demod is not None:
+                    if mode == "LORA":
+                        sy = "any" if self.dec_lora_sync is None else f"0x{self.dec_lora_sync:02X}"
+                        nch = len(lora.chs) if lora else 1
+                        txt = (f"LoRa SF{int(self.dec_lora_sf)}/BW{self.dec_lora_bw / 1e3:g}  sync {sy}  {centre / 1e6:.6f} MHz"
+                               + (f" x {nch} channels" if nch > 1 else "") + "   "
+                               f"level {lvl_db:6.1f} dBFS   preambles {lora.detections if lora else 0} (header bad {lora.hdr_fail if lora else 0}, "
+                               f"no SFD {lora.sync_fail if lora else 0})  near-misses {lora.runs3 if lora else 0} "
+                               f"({(lora.runs3 if lora else 0) / max(time.time() - lora_t0, 5.0) * 60:.0f}/min; noise alone "
+                               f"~{LORA_NOISE_NEARMISS.get(int(self.dec_lora_sf), 0) * self.dec_lora_bw / 125e3 * nch:.0f}/min)   "
+                               f"frames {n_lora} (CRC ok {n_lora_ok})   {cap}")
+                    elif demod is not None:
                         txt = (f"{cur_mode}  {centre / 1e6:.6f} MHz   channel level {lvl_db:6.1f} dBFS   "
                                f"squelch {'open' if sq_open else 'CLOSED'}   volume {int(self.dec_volume * 100)}%   {cap}")
                     else:
